@@ -70,6 +70,13 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_data(data)
     await update.message.reply_text("♻️ Настройки сброшен!")
 
+async def get_eth_price():
+    url = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            price = await response.json()
+            return price["ethereum"]["usd"]
+
 async def check_price(app):
     print("[check_price] Функция стартовала")
     await app.bot.initialize()
