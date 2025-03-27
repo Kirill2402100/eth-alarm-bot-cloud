@@ -100,5 +100,10 @@ app.add_handler(CommandHandler("step", set_step))
 app.add_handler(CommandHandler("status", status))
 app.add_handler(CommandHandler("reset", reset))
 
-asyncio.create_task(check_price(app))
-app.run_polling()
+async def polling():
+    await asyncio.gather(
+        check_price(app),
+        app.run_polling()
+    )
+
+asyncio.run(polling())
