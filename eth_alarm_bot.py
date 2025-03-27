@@ -101,7 +101,7 @@ async def check_price(app):
 
         await asyncio.sleep(60)
 
-def run_bot():
+async def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -110,8 +110,12 @@ def run_bot():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("reset", reset))
 
-    async def on_startup(app):
-        asyncio.create_task(check_price(app))
+    # Запускаем check_price в фоне
+    asyncio.create_task(check_price(app))
 
-    app.post_init = on_startup
-    app.run_polling()
+    # Запускаем бота
+    await app.run_polling()
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
