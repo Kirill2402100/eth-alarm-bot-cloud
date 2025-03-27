@@ -1,2 +1,3 @@
 #!/bin/bash
-python3 eth_alarm_bot.ру
+python3 /app/eth_alarm_bot.pу
+
