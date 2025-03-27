@@ -92,18 +92,17 @@ async def check_price(app):
                         pass
         await asyncio.sleep(60)
 
-# Запуск бота
-app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("set", set_price))
-app.add_handler(CommandHandler("step", set_step))
-app.add_handler(CommandHandler("status", status))
-app.add_handler(CommandHandler("reset", reset))
+def run_bot():
+    app = ApplicationBuilder().token(TOKEN).build()
 
-async def polling():
-    await asyncio.gather(
-        check_price(app),
-        app.run_polling()
-    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("set", set_price))
+    app.add_handler(CommandHandler("step", set_step))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("reset", reset))
 
-asyncio.run(polling())
+    async def on_startup(app):
+        asyncio.create_task(check_price(app))
+
+    app.post_init = on_startup
+    app.run_polling()
