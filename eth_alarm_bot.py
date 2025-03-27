@@ -71,26 +71,34 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("♻️ Настройки сброшен!")
 
 async def check_price(app):
+    print("[check_price] Функция стартовала")
     await app.bot.initialize()
     while True:
-        price = await get_eth_price()
-        print(f"[check_price] Current ETH price: {price}")
-        base = data.get("base_price")
-        step = data.get("step", 5)
-        if base:
-            change_percent = abs(price - base) / base * 100
-            step_count = int(change_percent // step)
-            if step_count not in data["notified_steps"]:
-                data["notified_steps"].append(step_count)
-                save_data(data)
-                for user_id in app.user_data:
-                    try:
-                        await app.bot.send_message(
-                            chat_id=user_id,
-                            text=f"💸 ETH изменился на {step * step_count}%: {price} $"
-                        )
-                    except:
-                        pass
+        try:
+            price = await get_eth_price()
+            print(f"[check_price] ETH сейчас: {price}")
+            base = data.get("base_price")
+            step = data.get("step", 5)
+
+            if base:
+                change_percent = abs(price - base) / base * 100
+                step_count = int(change_percent // step)
+                print(f"[check_price] base={base}, шаг={step}%, изменение={change_percent:.2f}% → step_count={step_count}")
+
+                if step_count not in data["notified_steps"]:
+                    data["notified_steps"].append(step_count)
+                    save_data(data)
+                    for user_id in app.user_data:
+                        try:
+                            print(f"[check_price] Уведомляем {user_id}")
+                            await app.bot.send_message(chat_id=user_id, text=f"💸 ETH изменился на {step * step_count}%: {price} $")
+                        except Exception as e:
+                            print(f"[check_price] ❌ Ошибка при отправке сообщения: {e}")
+            else:
+                print("[check_price] ❗ Базовая цена не установлена")
+        except Exception as e:
+            print(f"[check_price] ❗ Ошибка во время проверки цены: {e}")
+
         await asyncio.sleep(60)
 
 def run_bot():
