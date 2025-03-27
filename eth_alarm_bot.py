@@ -67,7 +67,29 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data["step"] = None
     data["notified_steps"] = []
     save_data(data)
-    await update.message.reply_text("♻️ Настройки сброшены!")
+    await update.message.reply_text("♻️ Настройки сброшены!)
+
+async def check_price(app):
+    await app.bot.initialize()
+    while True:
+        price = await get_eth_price()
+        base = data.get("base_price")
+        step = data.get("step", 5)
+        if base:
+            change_percent = abs(price - base) / base * 100
+            step_count = int(change_percent // step)
+            if step_count not in data["notified_steps"]:
+                data["notified_steps"].append(step_count)
+                save_data(data)
+                for user_id in app.user_data:
+                    try:
+                        await app.bot.send_message(
+                            chat_id=user_id,
+                            text=f"💸 ETH изменился на {step * step_count}%: {price} $"
+                        )
+                    except:
+                        pass
+        await asyncio.sleep(60)
 
 # Запуск бота
 app = ApplicationBuilder().token(TOKEN).build()
