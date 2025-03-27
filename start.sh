@@ -1,4 +1,2 @@
 #!/bin/bash
-python eth_alarm_bot.py
-#!/bin/bash
-python eth_alarm_bot.py
+python3 eth_alarm_bot.ру
