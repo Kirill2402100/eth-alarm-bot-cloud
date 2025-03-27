@@ -67,7 +67,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data["step"] = None
     data["notified_steps"] = []
     save_data(data)
-    await update.message.reply_text("♻️ Настройки сброшены!)
+    await update.message.reply_text("♻️ Настройки сброшен!")
 
 async def check_price(app):
     await app.bot.initialize()
