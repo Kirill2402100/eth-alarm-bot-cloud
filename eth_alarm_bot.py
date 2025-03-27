@@ -74,6 +74,7 @@ async def check_price(app):
     await app.bot.initialize()
     while True:
         price = await get_eth_price()
+print(f"[check_price] Current ETH price: {price}")
         base = data.get("base_price")
         step = data.get("step", 5)
         if base:
