@@ -73,7 +73,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data["chat_ids"].append(chat_id)
         save_data(data)
     await update.message.reply_text(
-        "👋 Привет! Ты добавлен в список пользователей.
+        "👋 Привет! Ты добавлен в список пользователей.")
 
 Команды:
 /set <цена>
