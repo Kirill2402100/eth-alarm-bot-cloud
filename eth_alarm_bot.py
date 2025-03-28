@@ -31,7 +31,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id not in data["chat_ids"]:
         data["chat_ids"].append(chat_id)
         save_data(data)
-    await update.message.reply_text("👋 Бот запущен. Используй /set <цена>, /step <процент>, /status")
+    await update.message.reply_text(
+        "👋 Бот запущен. Используй:\n/set <цена>\n/step <процент>\n/status\n/reset"
+    )
 
 # Команда /set
 async def set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
