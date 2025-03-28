@@ -40,13 +40,12 @@ async def set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         price = float(context.args[0])
         data["base_price"] = price
-        data["last_notified_price"] = price  # ⬅️ вот эта строка важна!
+        data["last_notified_price"] = price  # 🔥 Устанавливаем начальную точку отсчёта
         data["notified_steps"] = []
         save_data(data)
         await update.message.reply_text(f"✅ Базовая цена установлена: {price} $")
     except:
         await update.message.reply_text("⚠️ Используй: /set 1000")
-
 # Команда /step
 async def set_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -85,32 +84,32 @@ async def check_price(app):
     print("[check_price] Функция стартовала")
     await app.bot.initialize()
 
-    # Загружаем последнее уведомлённое значение
-    last_notified_price = data.get("last_notified_price", data.get("base_price"))
-
     while True:
         try:
             price = await get_eth_price()
             print(f"[check_price] ETH сейчас: {price}")
             base = data.get("base_price")
-            step = data.get("step", 1)
+            step = data.get("step", 5)
+            last = data.get("last_notified_price")
 
-            if base and last_notified_price:
-                change_percent = abs(price - last_notified_price) / last_notified_price * 100
-                print(f"[check_price] Последнее уведомление: {last_notified_price}, изменение: {change_percent:.2f}%")
+            if base is not None and last is not None:
+                change_percent = (price - last) / last * 100
+                if abs(change_percent) >= step:
+                    direction = "вырос" if change_percent > 0 else "упал"
+                    rounded_percent = step * int(change_percent / step)
+                    message = f"💸 ETH {direction} на {abs(rounded_percent):.1f}%: {price} $"
 
-                if change_percent >= step:
-                    data["last_notified_price"] = price
-                    save_data(data)
                     for user_id in data.get("chat_ids", []):
                         try:
-                            print(f"[check_price] 🔔 Уведомляем {user_id}")
-                            await app.bot.send_message(
-                                chat_id=user_id,
-                                text=f"💸 ETH изменился на {change_percent:.2f}%: {price} $"
-                            )
+                            print(f"[check_price] Уведомляем {user_id}")
+                            await app.bot.send_message(chat_id=user_id, text=message)
                         except Exception as e:
                             print(f"[check_price] ❌ Ошибка при отправке: {e}")
+
+                    data["last_notified_price"] = price
+                    save_data(data)
+                else:
+                    print(f"[check_price] Изменение {change_percent:.2f}% < {step}% — без уведомления")
             else:
                 print("[check_price] ❗ Базовая цена или последнее уведомление не установлены")
         except Exception as e:
