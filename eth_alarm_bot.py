@@ -40,11 +40,12 @@ async def set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         price = float(context.args[0])
         data["base_price"] = price
+        data["last_notified_price"] = price  # 🆕 Устанавливаем начальную точку
         data["notified_steps"] = []
         save_data(data)
         await update.message.reply_text(f"✅ Базовая цена установлена: {price} $")
     except:
-        await update.message.reply_text("⚠️ Используй: /set 3100")
+        await update.message.reply_text("⚠️ Используй команду так: /set 1000")
 
 # Команда /step
 async def set_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
