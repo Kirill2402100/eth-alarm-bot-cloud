@@ -83,29 +83,35 @@ async def get_eth_price():
 async def check_price(app):
     print("[check_price] Функция стартовала")
     await app.bot.initialize()
+
+    # Загружаем последнее уведомлённое значение
+    last_notified_price = data.get("last_notified_price", data.get("base_price"))
+
     while True:
         try:
             price = await get_eth_price()
             print(f"[check_price] ETH сейчас: {price}")
             base = data.get("base_price")
-            step = data.get("step", 5)
+            step = data.get("step", 1)
 
-            if base:
-                change_percent = abs(price - base) / base * 100
-                step_count = int(change_percent // step)
-                print(f"[check_price] base={base}, шаг={step}%, изменение={change_percent:.2f}% → step_count={step_count}")
+            if base and last_notified_price:
+                change_percent = abs(price - last_notified_price) / last_notified_price * 100
+                print(f"[check_price] Последнее уведомление: {last_notified_price}, изменение: {change_percent:.2f}%")
 
-                if step_count not in data["notified_steps"]:
-                    data["notified_steps"].append(step_count)
+                if change_percent >= step:
+                    data["last_notified_price"] = price
                     save_data(data)
                     for user_id in data.get("chat_ids", []):
                         try:
-                            print(f"[check_price] Уведомляем {user_id}")
-                            await app.bot.send_message(chat_id=user_id, text=f"💸 ETH изменился на {step * step_count}%: {price} $")
+                            print(f"[check_price] 🔔 Уведомляем {user_id}")
+                            await app.bot.send_message(
+                                chat_id=user_id,
+                                text=f"💸 ETH изменился на {change_percent:.2f}%: {price} $"
+                            )
                         except Exception as e:
-                            print(f"[check_price] ❌ Ошибка при отправке сообщения: {e}")
+                            print(f"[check_price] ❌ Ошибка при отправке: {e}")
             else:
-                print("[check_price] ❗ Базовая цена не установлена")
+                print("[check_price] ❗ Базовая цена или последнее уведомление не установлены")
         except Exception as e:
             print(f"[check_price] ❗ Ошибка во время проверки цены: {e}")
 
