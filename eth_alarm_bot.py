@@ -3,6 +3,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import json
 import os
 import asyncio
+import aiohttp
 
 # Загружаем токен бота из переменной окружения
 TOKEN = os.getenv("BOT_TOKEN")
