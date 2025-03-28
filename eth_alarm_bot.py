@@ -40,7 +40,7 @@ async def set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         price = float(context.args[0])
         data["base_price"] = price
-        data["last_notified_price"] = price  # <== ОБЯЗАТЕЛЬНО!
+        data["last_notified_price"] = price  # ⬅️ вот эта строка важна!
         data["notified_steps"] = []
         save_data(data)
         await update.message.reply_text(f"✅ Базовая цена установлена: {price} $")
