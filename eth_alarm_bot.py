@@ -25,13 +25,13 @@ data = load_data()
 
 # Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Я ETH-бот. Вот мои команды:\n\n"
-        "/set <цена> — установить базовую цену\n"
-        "/step <процент> — установить процент отклонения\n"
-        "/status — текущие настройки\n"
-        "/reset — сбросить настройки"
-    )
+    chat_id = update.effective_chat.id
+    if "chat_ids" not in data:
+        data["chat_ids"] = []
+    if chat_id not in data["chat_ids"]:
+        data["chat_ids"].append(chat_id)
+        save_data(data)
+    await update.message.reply_text("👋 Бот запущен. Используй /set <цена>, /step <процент>, /status")
 
 # Команда /set
 async def set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -96,7 +96,7 @@ async def check_price(app):
                 if step_count not in data["notified_steps"]:
                     data["notified_steps"].append(step_count)
                     save_data(data)
-                    for user_id in app.user_data:
+                    for user_id in data.get("chat_ids", []):
                         try:
                             print(f"[check_price] Уведомляем {user_id}")
                             await app.bot.send_message(chat_id=user_id, text=f"💸 ETH изменился на {step * step_count}%: {price} $")
