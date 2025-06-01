@@ -5,48 +5,54 @@ import os
 import asyncio
 import aiohttp
 
-# Загружаем токен бота из переменной окружения
-TOKEN = os.getenv("BOT_TOKEN")
+# ── НАСТРОЙКИ ──────────────────────────────────────────────────────────────
+TOKEN = os.getenv("BOT_TOKEN")                 # TG-токен бота
+DATA_FILE = "data.json"                       # хранение базовой цены
+COINGECKO_ID = "usd-coin"                     # 👉 пара с экрана: USDC/EUR
+VS_CURRENCY  = "eur"                          #              └── 0,88 EUR
+CHECK_INTERVAL = 60                           # секунд между проверками
+# ────────────────────────────────────────────────────────────────────────────
 
-DATA_FILE = "data.json"
-
-# Функции для сохранения и загрузки данных
+# ── UTILS: работа с файлом данных ──────────────────────────────────────────
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
             return json.load(f)
-    return {"base_price": None, "notified_steps": []}
+    return {"base_price": None, "notified_steps": [], "chat_ids": []}
 
 def save_data(data):
     with open(DATA_FILE, "w") as f:
-        json.dump(data, f)
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 data = load_data()
 
-# Команда /start
+# ── TG-КОМАНДЫ ─────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if "chat_ids" not in data:
-        data["chat_ids"] = []
     if chat_id not in data["chat_ids"]:
         data["chat_ids"].append(chat_id)
         save_data(data)
+
     await update.message.reply_text(
-        "👋 Бот запущен. Используй:\n/set <цена>\n/step <процент>\n/status\n/reset"
+        "👋 Бот запущен.\n"
+        "Команды:\n"
+        "• /set <цена>   — задать базовую EUR-цену (пример 0.8821)\n"
+        "• /step <%>      — отклонение для тревоги\n"
+        "• /status        — текущие настройки\n"
+        "• /reset         — сброс"
     )
 
-# Команда /set
 async def set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         price = float(context.args[0])
         data["base_price"] = price
-        data["last_notified_price"] = price  # 🔥 Устанавливаем начальную точку отсчёта
+        data["last_notified_price"] = price
         data["notified_steps"] = []
         save_data(data)
-        await update.message.reply_text(f"✅ Базовая цена установлена: {price} $")
+        await update.message.reply_text(f"✅ Базовая цена установлена: {price} EUR")
     except:
-        await update.message.reply_text("⚠️ Используй: /set 1000")
-# Команда /step
+        await update.message.reply_text("⚠️ Используй: /set 0.8821")
+
 async def set_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         step = float(context.args[0])
@@ -56,71 +62,76 @@ async def set_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("⚠️ Используй: /step 3")
 
-# Команда /status
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     base = data.get("base_price")
     step = data.get("step")
     await update.message.reply_text(
-        f"ℹ️ Базовая цена: {base}\n"
+        f"ℹ️ Базовая цена: {base} EUR\n"
         f"📉 Отклонение: {step}%"
     )
 
-# Команда /reset
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data["base_price"] = None
-    data["step"] = None
-    data["notified_steps"] = []
+    for k in ("base_price", "step", "notified_steps", "last_notified_price"):
+        data[k] = None if k != "notified_steps" else []
     save_data(data)
-    await update.message.reply_text("♻️ Настройки сброшен!")
+    await update.message.reply_text("♻️ Настройки сброшены!")
 
-async def get_eth_price():
-    url = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"
+# ── КУРС С COINGECKO ───────────────────────────────────────────────────────
+async def get_token_price():
+    url = (
+        "https://api.coingecko.com/api/v3/simple/price"
+        f"?ids={COINGECKO_ID}&vs_currencies={VS_CURRENCY}"
+    )  # id=usd-coin, vs=eur → USDC/EUR  [oai_citation:0‡CoinGecko](https://www.coingecko.com/en/coins/usdc?utm_source=chatgpt.com)
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
+        async with session.get(url, timeout=15) as response:
             price = await response.json()
-            return price["ethereum"]["usd"]
+            return price[COINGECKO_ID][VS_CURRENCY]
 
+# ── ФОНОВЫЙ МОНИТОР ────────────────────────────────────────────────────────
 async def check_price(app):
-    print("[check_price] Функция стартовала")
     await app.bot.initialize()
     while True:
         try:
-            price = await get_eth_price()
-            print(f"[check_price] ETH сейчас: {price}")
+            price = await get_token_price()
 
             base = data.get("base_price")
-            step = data.get("step", 5)
+            step = data.get("step", 5)            # по умолчанию 5 %
             last_notified = data.get("last_notified_price")
 
             if base is None:
-                print("[check_price] ❗ Базовая цена не установлена")
-            else:
-                percent_change = ((price - base) / base) * 100
-                abs_change = abs(percent_change)
-                print(f"[check_price] base={base}, изменение={percent_change:.2f}%")
+                # пользователь ещё не задал /set
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
 
-                if last_notified is None or abs(((price - base) / base) * 100 - ((last_notified - base) / base) * 100) >= step:
-                    print(f"[check_price] ✅ Уведомляем пользователей (base={base}, current={price}, last={last_notified})")
-                    data["last_notified_price"] = price
-                    save_data(data)
-                    for user_id in data.get("chat_ids", []):
-                        try:
-                            await app.bot.send_message(
-                                chat_id=user_id,
-                                text=f"💸 ETH изменился на {percent_change:.2f}% от базовой: {price} $"
+            percent_change = ((price - base) / base) * 100
+            abs_change = abs(percent_change)
+
+            # тревожим, если превысили step со времени последней тревоги
+            if (last_notified is None or
+                abs(((price - base) / base) * 100 -
+                    ((last_notified - base) / base) * 100) >= step):
+
+                data["last_notified_price"] = price
+                save_data(data)
+
+                for user_id in data.get("chat_ids", []):
+                    try:
+                        await app.bot.send_message(
+                            chat_id=user_id,
+                            text=(
+                                f"💸 EURC изменился на {percent_change:.2f}% "
+                                f"от базовой: {price:.4f} EUR"
                             )
-                        except Exception as e:
-                            print(f"[check_price] ❌ Ошибка при отправке: {e}")
-                else:
-                    print(f"[check_price] Изменение {abs_change:.2f}% < {step}% — без уведомления")
+                        )
+                    except Exception as e:
+                        print(f"[check_price] ❌ Ошибка отправки: {e}")
         except Exception as e:
-            print(f"[check_price] ❗ Ошибка: {e}")
+            print(f"[check_price] ❗ Ошибка в check_price: {e}")
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(CHECK_INTERVAL)
 
+# ── ЗАПУСК ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import asyncio
-
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -130,7 +141,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("reset", reset))
 
     async def on_startup(app):
-        print("[check_price] Функция стартовала")
         asyncio.create_task(check_price(app))
 
     app.post_init = on_startup
