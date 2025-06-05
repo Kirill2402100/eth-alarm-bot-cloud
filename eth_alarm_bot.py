@@ -1,29 +1,51 @@
 """
 Alarm-bot  •  EURC/USDC  (Coinbase)
 ────────────────────────────────────────────────────────────────────────────
-Команды: /start  /set <цена>  /step <0.01>  /status  /reset
+Команды:
+/start
+/set  <цена>                – установить базовую цену
+/step <u> [d]               – пороги, % (u – вверх, d – вниз, d опционально)
+/status                     – текущие настройки
+/reset                      – сброс
 """
 
 import asyncio, json, os, aiohttp
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ── конфиг ────────────────────────────────────────────────────────────────
-TOKEN           = os.getenv("BOT_TOKEN")                                      # TG-токен
-TICKER_URL      = "https://api.exchange.coinbase.com/products/EURC-USDC/ticker"
-CHECK_INTERVAL  = 60            # сек
-DEFAULT_STEP    = 0.01          # %
-DECIMALS_SHOW   = 6
-DATA_FILE       = "data.json"
+TOKEN              = os.getenv("BOT_TOKEN")                        # TG-токен
+TICKER_URL         = "https://api.exchange.coinbase.com/products/EURC-USDC/ticker"
+CHECK_INTERVAL     = 60            # сек
+DEFAULT_STEP_UP    = 0.01          # % вверх от базы
+DEFAULT_STEP_DOWN  = 0.01          # % вниз от базы
+DECIMALS_SHOW      = 6
+DATA_FILE          = "data.json"
 # ──────────────────────────────────────────────────────────────────────────
 
 
+# ── работа с файлом состояния ────────────────────────────────────────────
 def load() -> Dict[str, Any]:
+    """Читает JSON или создаёт структуру по умолчанию"""
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE) as f:
-            return json.load(f)
-    return {"base": None, "last": None, "step": DEFAULT_STEP, "chats": []}
+            d = json.load(f)
+            # миграция старого формата
+            if "step_up" not in d:
+                val = d.pop("step", DEFAULT_STEP_UP)
+                d["step_up"] = d["step_down"] = val
+            if "last_diff" not in d:
+                d["last_diff"] = None
+            return d
+    return {
+        "base": None,
+        "last": None,         # цена последней отправки
+        "last_diff": None,    # %-отклонение последней отправки
+        "step_up":    DEFAULT_STEP_UP,
+        "step_down":  DEFAULT_STEP_DOWN,
+        "chats": []
+    }
 
 
 def save(d: Dict[str, Any]):                                  # pylint: disable=invalid-name
@@ -32,10 +54,10 @@ def save(d: Dict[str, Any]):                                  # pylint: disable=
 
 
 data = load()
-watcher_task: asyncio.Task | None = None
+watcher_task: Optional[asyncio.Task] = None
 
 
-# ── цена с Coinbase ───────────────────────────────────────────────────────
+# ── получение цены с Coinbase ────────────────────────────────────────────
 async def fetch_price() -> float:
     async with aiohttp.ClientSession() as s:
         async with s.get(TICKER_URL, timeout=15,
@@ -44,7 +66,7 @@ async def fetch_price() -> float:
             return float(js["price"])
 
 
-# ── фоновый цикл ──────────────────────────────────────────────────────────
+# ── фоновый цикл наблюдателя ─────────────────────────────────────────────
 async def watcher(app):
     print("[watcher] started")
     while True:
@@ -54,24 +76,35 @@ async def watcher(app):
 
             base = data["base"]
             if base is not None:
-                step = data.get("step", DEFAULT_STEP)
-                last = data.get("last")
+                step_up   = data.get("step_up",   DEFAULT_STEP_UP)
+                step_down = data.get("step_down", DEFAULT_STEP_DOWN)
+                last_diff = data.get("last_diff")
 
-                diff_now  = (price - base) / base * 100          # %
-                diff_last = (last  - base) / base * 100 if last else 0
+                diff_now = (price - base) / base * 100  # текущее отклонение, %
 
-                # алёрт, если цена ушла от базы ≥ step
-                #  и дополнительно сдвинулась ≥ step от предыдущего алёрта
-                if abs(diff_now) >= step and abs(diff_now - diff_last) >= step:
-                    data["last"] = price; save(data)
+                triggered = False
+                # вверх
+                if diff_now >= step_up:
+                    cond = (last_diff is None) or (last_diff < step_up) \
+                           or ((diff_now - last_diff) >= step_up)
+                    triggered = cond
+                # вниз
+                elif diff_now <= -step_down:
+                    cond = (last_diff is None) or (last_diff > -step_down) \
+                           or ((last_diff - diff_now) >= step_down)
+                    triggered = cond
 
+                if triggered:
+                    data.update({"last": price, "last_diff": diff_now}); save(data)
                     text = (
-                        f"EURC/USDC изменилась на {diff_now:+.4f}%\n"
+                        f"❗ EURC/USDC изменилась на {diff_now:+.4f}%\n"
                         f"Текущая цена: {price:.{DECIMALS_SHOW}f}"
                     )
                     for cid in data["chats"]:
-                        try: await app.bot.send_message(cid, text)
-                        except Exception as e: print(f"[send] {e}")
+                        try:
+                            await app.bot.send_message(cid, text)
+                        except Exception as e:
+                            print(f"[send] {e}")
 
         except Exception as e:
             print(f"[watcher] {e}")
@@ -94,34 +127,66 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "👋 Бот следит за EURC/USDC (Coinbase).\n"
-        "• /set <цена>  – базовая точка\n"
-        "• /step <процент> – порог\n"
-        "• /status – статус"
+        "• /set <цена>            – установить базу\n"
+        "• /step <u> [d]          – пороги вверх/вниз, %\n"
+        "   · /step 0.05          – одинаковые\n"
+        "   · /step 0.05 0.15     – 0.05% вверх и 0.15% вниз\n"
+        "• /status                – показать статус\n"
+        "• /reset                 – сбросить всё"
     )
+
 
 async def set_base(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ensure_watcher(ctx)
-    try:  base = float(ctx.args[0])
+    try:
+        base = float(ctx.args[0])
     except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ /set 1.142000"); return
-    data.update({"base": base, "last": None}); save(data)
+        await update.message.reply_text("⚠️ /set 1.142000")
+        return
+    data.update({"base": base, "last": None, "last_diff": None}); save(data)
     await update.message.reply_text(f"✅ База: {base:.{DECIMALS_SHOW}f}")
 
+
 async def set_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:  step = float(ctx.args[0])
-    except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ /step 0.01"); return
-    data["step"] = step; save(data)
-    await update.message.reply_text(f"✅ Порог: {step} %")
+    """ /step <up> [down]  – установить пороги """
+    try:
+        if len(ctx.args) == 1:
+            up = down = float(ctx.args[0])
+        elif len(ctx.args) == 2:
+            up, down = map(float, ctx.args)
+        else:
+            raise ValueError
+        if up <= 0 or down <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Пример: /step 0.05 0.15")
+        return
+
+    data["step_up"]   = up
+    data["step_down"] = down
+    data["last"] = None; data["last_diff"] = None  # сбросить историю алёртов
+    save(data)
+    await update.message.reply_text(f"✅ Порог вверх: {up}%  |  вниз: {down}%")
+
 
 async def status(update: Update, _):
     await update.message.reply_text(
-        f"ℹ️ База: {data['base']}\n📉 Порог: {data['step']} %"
+        "ℹ️ Текущий статус:\n"
+        f"• База: {data['base']}\n"
+        f"• Порог вверх: {data['step_up']} %\n"
+        f"• Порог вниз:  {data['step_down']} %"
     )
 
+
 async def reset(update: Update, _):
-    data.update({"base": None, "last": None, "step": DEFAULT_STEP}); save(data)
-    await update.message.reply_text("♻️ Настройки сброшены.")
+    data.update({
+        "base": None,
+        "last": None,
+        "last_diff": None,
+        "step_up":   DEFAULT_STEP_UP,
+        "step_down": DEFAULT_STEP_DOWN
+    }); save(data)
+    await update.message.reply_text("♻️ Всё сброшено к настройкам по умолчанию.")
 
 
 # ── bootstrap ─────────────────────────────────────────────────────────────
