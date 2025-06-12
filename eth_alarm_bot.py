@@ -35,13 +35,16 @@ async def fetch_ssl_signal():
     df['hlv'] = (df['close'] > df['SMA_13']).astype(int)
     df['ssl_down'] = df['low'].rolling(13).min()
     df['ssl_up'] = df['high'].rolling(13).max()
-    df['ssl_channel'] = df['hlv'].map(lambda x: 'green' if x else 'red')
 
-    last = df.iloc[-1]
-    if last['ssl_channel'] == 'green':
-        return 'LONG', last['close']
+    prev = df.iloc[-2]
+    curr = df.iloc[-1]
+
+    if prev['ssl_up'] < prev['ssl_down'] and curr['ssl_up'] > curr['ssl_down']:
+        return 'LONG', curr['close']
+    elif prev['ssl_up'] > prev['ssl_down'] and curr['ssl_up'] < curr['ssl_down']:
+        return 'SHORT', curr['close']
     else:
-        return 'SHORT', last['close']
+        return None, curr['close']
 
 
 async def monitor_signal(app):
@@ -49,14 +52,11 @@ async def monitor_signal(app):
     while monitoring:
         try:
             signal, price = await fetch_ssl_signal()
-            if signal != current_signal:
+            if signal and signal != current_signal:
                 current_signal = signal
                 last_cross = datetime.utcnow()
                 for chat_id in app.chat_ids:
-                    await app.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"[Сигнал] {signal}\n[Цена] {price:.4f}\n[Время] {last_cross.strftime('%H:%M UTC')}"
-                    )
+                    await app.bot.send_message(chat_id=chat_id, text=f"📡 Сигнал: {signal}\n💰 Цена: {price:.4f}\n⏰ Время: {last_cross.strftime('%H:%M UTC')}")
         except Exception as e:
             print("[error]", e)
         await asyncio.sleep(30)
@@ -118,7 +118,7 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         position = None
 
         await update.message.reply_text(
-            f"\u2705 Сделка закрыта\nP&L: {pnl:.2f} USDT\nAPR: {apr:.2f}%\nВремя в позиции: {minutes} мин"
+            f"\u2705 Сделка закрыта\n\ud83d\udcc8 P&L: {pnl:.2f} USDT\n\ud83d\udcca APR: {apr:.2f}%\n⏰ Время в позиции: {minutes} мин"
         )
     except:
         await update.message.reply_text("\u26a0\ufe0f Использование: /exit <цена> <депозит>")
@@ -126,9 +126,7 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if position:
-        await update.message.reply_text(
-            f"Позиция: {position['direction']} от {position['entry_price']}\nБаланс: {position['entry_deposit']}$"
-        )
+        await update.message.reply_text(f"\ud83d\udd0d Позиция: {position['direction']} от {position['entry_price']}\nБаланс: {position['entry_deposit']}$")
     else:
         await update.message.reply_text("\u274c Позиция не открыта.")
 
@@ -137,7 +135,7 @@ async def cmd_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not log:
         await update.message.reply_text("\u26a0\ufe0f Сделок пока нет.")
         return
-    text = "История сделок:\n"
+    text = "\ud83d\udcca История сделок:\n"
     for i, trade in enumerate(log[-5:], 1):
         text += f"{i}. {trade['entry']['direction']} | P&L: {trade['pnl']:.2f}$ | APR: {trade['apr']:.2f}% | {trade['duration_min']} мин\n"
     await update.message.reply_text(text)
