@@ -1,203 +1,160 @@
-"""
-Alarm-bot  •  EURC/USDC  (Coinbase)
-────────────────────────────────────────────────────────────────────────────
-Команды:
-/start
-/set  <цена>                – установить базовую цену
-/step <u> [d]               – пороги, % (u – вверх, d – вниз, d опционально)
-/status                     – текущие настройки
-/reset                      – сброс
-"""
+import os
+import asyncio
+from datetime import datetime
+from typing import Optional
 
-import asyncio, json, os, aiohttp
-from typing import Dict, Any, Optional
+import ccxt
+import pandas as pd
+import pandas_ta as ta
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ── конфиг ────────────────────────────────────────────────────────────────
-TOKEN              = os.getenv("BOT_TOKEN")                        # TG-токен
-TICKER_URL         = "https://api.exchange.coinbase.com/products/EURC-USDC/ticker"
-CHECK_INTERVAL     = 60            # сек
-DEFAULT_STEP_UP    = 0.01          # % вверх от базы
-DEFAULT_STEP_DOWN  = 0.01          # % вниз от базы
-DECIMALS_SHOW      = 6
-DATA_FILE          = "data.json"
-# ──────────────────────────────────────────────────────────────────────────
+# === ENV ===
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+LEVERAGE = int(os.getenv("LEVERAGE", 50))
+PAIR = os.getenv("PAIR", "EUR/USDT")
+
+# === STATE ===
+current_signal = None
+last_cross = None
+position = None  # dict: entry_price, entry_deposit, entry_time, direction
+log = []
+monitoring = False
+
+# === EXCHANGE ===
+exchange = ccxt.mexc()
 
 
-# ── работа с файлом состояния ────────────────────────────────────────────
-def load() -> Dict[str, Any]:
-    """Читает JSON или создаёт структуру по умолчанию"""
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE) as f:
-            d = json.load(f)
-            # миграция старого формата
-            if "step_up" not in d:
-                val = d.pop("step", DEFAULT_STEP_UP)
-                d["step_up"] = d["step_down"] = val
-            if "last_diff" not in d:
-                d["last_diff"] = None
-            return d
-    return {
-        "base": None,
-        "last": None,         # цена последней отправки
-        "last_diff": None,    # %-отклонение последней отправки
-        "step_up":    DEFAULT_STEP_UP,
-        "step_down":  DEFAULT_STEP_DOWN,
-        "chats": []
-    }
+async def fetch_ssl_signal():
+    ohlcv = exchange.fetch_ohlcv(PAIR, timeframe='5m', limit=100)
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    
+    df.ta.sma(length=13, append=True)
+    df['hlv'] = (df['close'] > df['SMA_13']).astype(int)
+    df['ssl_down'] = df['low'].rolling(13).min()
+    df['ssl_up'] = df['high'].rolling(13).max()
+    df['ssl_channel'] = df['hlv'].map(lambda x: 'green' if x else 'red')
+
+    last = df.iloc[-1]
+    if last['ssl_channel'] == 'green':
+        return 'LONG', last['close']
+    else:
+        return 'SHORT', last['close']
 
 
-def save(d: Dict[str, Any]):                                  # pylint: disable=invalid-name
-    with open(DATA_FILE, "w") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-
-
-data = load()
-watcher_task: Optional[asyncio.Task] = None
-
-
-# ── получение цены с Coinbase ────────────────────────────────────────────
-async def fetch_price() -> float:
-    async with aiohttp.ClientSession() as s:
-        async with s.get(TICKER_URL, timeout=15,
-                         headers={"Accept": "application/json"}) as r:
-            js = await r.json()
-            return float(js["price"])
-
-
-# ── фоновый цикл наблюдателя ─────────────────────────────────────────────
-async def watcher(app):
-    print("[watcher] started")
-    while True:
+async def monitor_signal(app):
+    global current_signal, last_cross
+    while monitoring:
         try:
-            price = await fetch_price()
-            print(f"[watcher] price {price:.{DECIMALS_SHOW}f}")
-
-            base = data["base"]
-            if base is not None:
-                step_up   = data.get("step_up",   DEFAULT_STEP_UP)
-                step_down = data.get("step_down", DEFAULT_STEP_DOWN)
-                last_diff = data.get("last_diff")
-
-                diff_now = (price - base) / base * 100  # текущее отклонение, %
-
-                triggered = False
-                # вверх
-                if diff_now >= step_up:
-                    cond = (last_diff is None) or (last_diff < step_up) \
-                           or ((diff_now - last_diff) >= step_up)
-                    triggered = cond
-                # вниз
-                elif diff_now <= -step_down:
-                    cond = (last_diff is None) or (last_diff > -step_down) \
-                           or ((last_diff - diff_now) >= step_down)
-                    triggered = cond
-
-                if triggered:
-                    data.update({"last": price, "last_diff": diff_now}); save(data)
-                    text = (
-                        f"❗ EURC/USDC изменилась на {diff_now:+.4f}%\n"
-                        f"Текущая цена: {price:.{DECIMALS_SHOW}f}"
-                    )
-                    for cid in data["chats"]:
-                        try:
-                            await app.bot.send_message(cid, text)
-                        except Exception as e:
-                            print(f"[send] {e}")
-
+            signal, price = await fetch_ssl_signal()
+            if signal != current_signal:
+                current_signal = signal
+                last_cross = datetime.utcnow()
+                for chat_id in app.chat_ids:
+                    await app.bot.send_message(chat_id=chat_id, text=f"\ud83d\udce1 Сигнал: {signal}\n\ud83d\udcb0 Цена: {price:.4f}\n\u23f0 Время: {last_cross.strftime('%H:%M UTC')}")
         except Exception as e:
-            print(f"[watcher] {e}")
-
-        await asyncio.sleep(CHECK_INTERVAL)
-
-
-async def ensure_watcher(ctx: ContextTypes.DEFAULT_TYPE):
-    global watcher_task
-    if watcher_task is None or watcher_task.done():
-        watcher_task = asyncio.create_task(watcher(ctx.application))
+            print("[error]", e)
+        await asyncio.sleep(30)
 
 
-# ── команды ───────────────────────────────────────────────────────────────
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    if cid not in data["chats"]:
-        data["chats"].append(cid); save(data)
-    await ensure_watcher(ctx)
-
-    await update.message.reply_text(
-        "👋 Бот следит за EURC/USDC (Coinbase).\n"
-        "• /set <цена>            – установить базу\n"
-        "• /step <u> [d]          – пороги вверх/вниз, %\n"
-        "   · /step 0.05          – одинаковые\n"
-        "   · /step 0.05 0.15     – 0.05% вверх и 0.15% вниз\n"
-        "• /status                – показать статус\n"
-        "• /reset                 – сбросить всё"
-    )
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global monitoring
+    chat_id = update.effective_chat.id
+    ctx.application.chat_ids.add(chat_id)
+    monitoring = True
+    await update.message.reply_text("\u2705 Мониторинг запущен.")
+    asyncio.create_task(monitor_signal(ctx.application))
 
 
-async def set_base(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await ensure_watcher(ctx)
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global monitoring
+    monitoring = False
+    await update.message.reply_text("\u274c Мониторинг остановлен.")
+
+
+async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global position
     try:
-        base = float(ctx.args[0])
-    except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ /set 1.142000")
-        return
-    data.update({"base": base, "last": None, "last_diff": None}); save(data)
-    await update.message.reply_text(f"✅ База: {base:.{DECIMALS_SHOW}f}")
+        price = float(ctx.args[0])
+        deposit = float(ctx.args[1])
+        position = {
+            "entry_price": price,
+            "entry_deposit": deposit,
+            "entry_time": datetime.utcnow(),
+            "direction": current_signal
+        }
+        await update.message.reply_text(f"\u2705 Вход зафиксирован: {current_signal} @ {price:.4f} | Баланс: {deposit}$")
+    except:
+        await update.message.reply_text("\u26a0\ufe0f Использование: /entry <цена> <депозит>")
 
 
-async def set_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """ /step <up> [down]  – установить пороги """
+async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global position
     try:
-        if len(ctx.args) == 1:
-            up = down = float(ctx.args[0])
-        elif len(ctx.args) == 2:
-            up, down = map(float, ctx.args)
-        else:
-            raise ValueError
-        if up <= 0 or down <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("⚠️ Пример: /step 0.05 0.15")
+        exit_price = float(ctx.args[0])
+        exit_deposit = float(ctx.args[1])
+        if position is None:
+            await update.message.reply_text("\u26a0\ufe0f Позиция не открыта.")
+            return
+
+        pnl = exit_deposit - position['entry_deposit']
+        apr = (pnl / position['entry_deposit']) * 100
+        duration = datetime.utcnow() - position['entry_time']
+        minutes = int(duration.total_seconds() // 60)
+
+        log.append({
+            "entry": position,
+            "exit_price": exit_price,
+            "exit_deposit": exit_deposit,
+            "pnl": pnl,
+            "apr": apr,
+            "duration_min": minutes
+        })
+        position = None
+
+        await update.message.reply_text(
+            f"\u2705 Сделка закрыта\n\ud83d\udcc8 P&L: {pnl:.2f} USDT\n\ud83d\udcca APR: {apr:.2f}%\n\u23f0 Время в позиции: {minutes} мин"
+        )
+    except:
+        await update.message.reply_text("\u26a0\ufe0f Использование: /exit <цена> <депозит>")
+
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if position:
+        await update.message.reply_text(f"\ud83d\udd0d Позиция: {position['direction']} от {position['entry_price']}\nБаланс: {position['entry_deposit']}$")
+    else:
+        await update.message.reply_text("\u274c Позиция не открыта.")
+
+
+async def cmd_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not log:
+        await update.message.reply_text("\u26a0\ufe0f Сделок пока нет.")
         return
-
-    data["step_up"]   = up
-    data["step_down"] = down
-    data["last"] = None; data["last_diff"] = None  # сбросить историю алёртов
-    save(data)
-    await update.message.reply_text(f"✅ Порог вверх: {up}%  |  вниз: {down}%")
+    text = "\ud83d\udcca История сделок:\n"
+    for i, trade in enumerate(log[-5:], 1):
+        text += f"{i}. {trade['entry']['direction']} | P&L: {trade['pnl']:.2f}$ | APR: {trade['apr']:.2f}% | {trade['duration_min']} мин\n"
+    await update.message.reply_text(text)
 
 
-async def status(update: Update, _):
-    await update.message.reply_text(
-        "ℹ️ Текущий статус:\n"
-        f"• База: {data['base']}\n"
-        f"• Порог вверх: {data['step_up']} %\n"
-        f"• Порог вниз:  {data['step_down']} %"
-    )
+async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global position, log
+    position = None
+    log.clear()
+    await update.message.reply_text("\u267b\ufe0f История и позиция сброшены.")
 
 
-async def reset(update: Update, _):
-    data.update({
-        "base": None,
-        "last": None,
-        "last_diff": None,
-        "step_up":   DEFAULT_STEP_UP,
-        "step_down": DEFAULT_STEP_DOWN
-    }); save(data)
-    await update.message.reply_text("♻️ Всё сброшено к настройкам по умолчанию.")
-
-
-# ── bootstrap ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    if not TOKEN:
-        raise RuntimeError("BOT_TOKEN env var missing")
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.chat_ids = set()
 
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start",  start))
-    app.add_handler(CommandHandler("set",    set_base))
-    app.add_handler(CommandHandler("step",   set_step))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("reset",  reset))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("entry", cmd_entry))
+    app.add_handler(CommandHandler("exit", cmd_exit))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("log", cmd_log))
+    app.add_handler(CommandHandler("reset", cmd_reset))
+
     app.run_polling()
