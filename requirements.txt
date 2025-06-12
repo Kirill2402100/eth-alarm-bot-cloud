@@ -1,4 +1,4 @@
-python-telegram-bot==20.0
-aiohttp
-requests
-python-dotenv
+python-telegram-bot==20.7
+ccxt==4.2.45
+pandas==2.2.2
+pandas-ta==0.3.14b0
