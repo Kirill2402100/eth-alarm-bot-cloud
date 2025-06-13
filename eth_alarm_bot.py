@@ -1,11 +1,9 @@
 import os
 import asyncio
 from datetime import datetime
-from typing import Optional
-
-import ccxt
-import pandas as pd
 import numpy as np
+import pandas as pd
+import ccxt
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -17,7 +15,7 @@ PAIR = os.getenv("PAIR", "EUR/USDT")
 # === STATE ===
 current_signal = None
 last_cross = None
-position = None  # dict: entry_price, entry_deposit, entry_time, direction
+position = None
 log = []
 monitoring = False
 
@@ -53,7 +51,7 @@ async def monitor_signal(app):
                 current_signal = signal
                 last_cross = datetime.utcnow()
                 for chat_id in app.chat_ids:
-                    await app.bot.send_message(chat_id=chat_id, text=f"\U0001f4e1 Сигнал: {signal}\n\U0001f4b0 Цена: {price:.4f}\n\u23f0 Время: {last_cross.strftime('%H:%M UTC')}")
+                    await app.bot.send_message(chat_id=chat_id, text=f"📡 Сигнал: {signal}\n💰 Цена: {price:.4f}\n⏰ Время: {last_cross.strftime('%H:%M UTC')}")
         except Exception as e:
             print("[error]", e)
         await asyncio.sleep(30)
@@ -115,7 +113,7 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         position = None
 
         await update.message.reply_text(
-            f"\u2705 Сделка закрыта\n\U0001f4c8 P&L: {pnl:.2f} USDT\n\U0001f4ca APR: {apr:.2f}%\n⏰ Время в позиции: {minutes} мин"
+            f"\u2705 Сделка закрыта\n📈 P&L: {pnl:.2f} USDT\n📊 APR: {apr:.2f}%\n⏰ Время в позиции: {minutes} мин"
         )
     except:
         await update.message.reply_text("\u26a0\ufe0f Использование: /exit <цена> <депозит>")
@@ -123,7 +121,7 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if position:
-        await update.message.reply_text(f"\U0001f50d Позиция: {position['direction']} от {position['entry_price']}\nБаланс: {position['entry_deposit']}$")
+        await update.message.reply_text(f"🔍 Позиция: {position['direction']} от {position['entry_price']}\nБаланс: {position['entry_deposit']}$")
     else:
         await update.message.reply_text("\u274c Позиция не открыта.")
 
@@ -132,7 +130,7 @@ async def cmd_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not log:
         await update.message.reply_text("\u26a0\ufe0f Сделок пока нет.")
         return
-    text = "\U0001f4ca История сделок:\n"
+    text = "📊 История сделок:\n"
     for i, trade in enumerate(log[-5:], 1):
         text += f"{i}. {trade['entry']['direction']} | P&L: {trade['pnl']:.2f}$ | APR: {trade['apr']:.2f}% | {trade['duration_min']} мин\n"
     await update.message.reply_text(text)
