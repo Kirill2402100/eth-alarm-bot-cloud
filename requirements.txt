@@ -3,3 +3,5 @@ ccxt==4.2.45
 pandas==2.2.2
 pandas-ta==0.3.14b0
 numpy==1.24.4
+gspread==5.12.0
+oauth2client==4.1.3
