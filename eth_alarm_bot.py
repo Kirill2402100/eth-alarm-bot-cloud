@@ -197,11 +197,13 @@ async def send_signal(ctx: ContextTypes.DEFAULT_TYPE, sig: str, price: float, rs
 
 async def post_shutdown_hook(application: Application):
     """Эта функция будет вызвана при остановке бота для освобождения ресурсов."""
-    log.info("Graceful shutdown hook called.")
-    # Следующая строка закомментирована, чтобы избежать конфликта циклов событий при завершении.
-    # Соединение будет закрыто операционной системой при остановке процесса.
+    log.info("Graceful shutdown hook called. Exchange closing is disabled to prevent event loop conflict.")
+    #
+    # >>> ВАЖНО: Следующая строка ДОЛЖНА БЫТЬ закомментирована. <<<
+    #
     # await exchange.close()
-    log.info("Exchange resources will be released by the OS.")
+    #
+    log.info("Exchange resources will be released by the OS upon process termination.")
 
 ###############################################################################
 # Точка входа
