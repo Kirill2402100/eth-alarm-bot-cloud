@@ -220,22 +220,24 @@ app.add_handler(CommandHandler("leverage", cmd_leverage))
 async def main():
     try:
         # --- НАЧАЛО ИЗМЕНЕНИЯ ---
-        # Явно загружаем рынки. Если OKX вернет "сломанные" данные по
-        # какой-то одной паре, ccxt может выдать ошибку. Мы ее перехватим,
-        # но есть шанс, что наша основная пара уже будет загружена,
-        # и бот сможет продолжить работу.
+        # Явно загружаем рынки. Если OKX вернет "сломанные" данные,
+        # мы перехватим ошибку и просто выведем предупреждение.
         try:
             await exchange.load_markets()
             log.info("Markets loaded successfully.")
         except Exception as e:
-            # Ошибка TypeError, которую вы видите, произойдет здесь.
-            # Мы ее логируем и игнорируем, надеясь на лучшее.
             log.warning(f"Could not load all markets from OKX, but proceeding anyway. Error: {e}")
+
+        # Пытаемся получить баланс, но не даем боту упасть, если это не удастся.
+        # Ошибка может быть той же, что и при загрузке рынков.
+        try:
+            bal = await exchange.fetch_balance()
+            usdt_balance = bal['total'].get('USDT', 'N/A')
+            log.info(f"USDT balance: {usdt_balance}")
+        except Exception as e:
+            log.error(f"Could not fetch balance. The bot will continue to run. Error: {e}")
         # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
-        bal = await exchange.fetch_balance()
-        usdt_balance = bal['total'].get('USDT', 'N/A')
-        log.info(f"USDT balance: {usdt_balance}")
         await app.initialize()
         await app.start()
         await app.updater.start_polling()
