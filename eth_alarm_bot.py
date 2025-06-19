@@ -142,7 +142,6 @@ state = {
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Включает мониторинг и добавляет пользователя в список рассылки."""
-    # --- ИЗМЕНЕНИЕ ---
     # Доступ к chat_ids теперь через контекст (ctx.application)
     ctx.application.chat_ids.add(update.effective_chat.id)
     state["monitoring"] = True
@@ -184,7 +183,6 @@ async def monitor(ctx: ContextTypes.DEFAULT_TYPE):
                 cond_price = (price >= (1.002 * df['close'].iloc[-2])) if sig=="LONG" else (price <= 0.998 * df['close'].iloc[-2])
                 cond_rsi   = (rsi > 55) if sig=="LONG" else (rsi < 45)
                 if cond_price and cond_rsi:
-                    # --- ИЗМЕНЕНИЕ ---
                     # Передаем контекст в send_signal
                     await send_signal(ctx, sig, price, rsi)
         except ccxt.NetworkError as e:
@@ -201,7 +199,6 @@ async def send_signal(ctx: ContextTypes.DEFAULT_TYPE, sig: str, price: float, rs
            f"💰 Price: <code>{price:.2f}</code>\n"
            f"📈 RSI: {rsi:.1f}\n"
            f"⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}")
-    # --- ИЗМЕНЕНИЕ ---
     # Доступ к chat_ids и боту теперь через контекст (ctx.application)
     for cid in ctx.application.chat_ids:
         try:
@@ -236,9 +233,13 @@ async def main():
     except Exception as e:
         log.error(f"Could not fetch balance. The bot will continue to run. Error: {e}")
     
-    # --- ИЗМЕНЕНИЕ: Настройка бота перенесена сюда ---
+    # Настройка бота
     defaults = Defaults(parse_mode="HTML")
     app = ApplicationBuilder().token(BOT_TOKEN).defaults(defaults).build()
+
+    # --- ИСПРАВЛЕНИЕ ЗДЕСЬ ---
+    # Инициализируем пользовательский атрибут chat_ids как пустое множество.
+    app.chat_ids = set() 
 
     # Добавляем стартовые ID чатов из переменных окружения
     app.chat_ids.update(CHAT_IDS)
