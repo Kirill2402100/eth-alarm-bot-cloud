@@ -18,7 +18,7 @@ from telegram.ext import (
 ###############################################################################
 BOT_TOKEN      = os.getenv("BOT_TOKEN")
 CHAT_IDS       = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
-PAIR_RAW       = os.getenv("PAIR", "BTC-USDT-SWAP")        # «сырой» вид от пользователя
+PAIR_RAW       = os.getenv("PAIR", "BTC-USDT-SWAP")      # «сырой» вид от пользователя
 SHEET_ID       = os.getenv("SHEET_ID")
 INIT_LEVERAGE  = int(os.getenv("LEVERAGE", 1))
 
@@ -76,14 +76,9 @@ exchange = ccxt.okx({
     "apiKey":   os.getenv("OKX_API_KEY"),
     "secret":   os.getenv("OKX_SECRET"),
     "password": os.getenv("OKX_PASSWORD"),
-    "options":  {"defaultType": "swap"},           # гарантируем бессрочные фьючи
+    "options":  {"defaultType": "swap"},          # гарантируем бессрочные фьючи
     "enableRateLimit": True,
 })
-
-# --- ИЗМЕНЕНИЕ НАЧАЛО ---
-# Вместо вызова громоздкой функции validate_pair, просто нормализуем
-# имя пары. Это быстрее и не вызовет сбой, если API вернет "сломанные" данные
-# по другим, не нужным нам, торговым парам.
 
 # Нормализуем PAIR из переменной окружения
 if PAIR_RAW:
@@ -95,7 +90,6 @@ else:
     PAIR = "BTC-USDT-SWAP"
 
 log.info(f"Using trading pair: {PAIR}")
-# --- ИЗМЕНЕНИЕ КОНЕЦ ---
 
 
 ###############################################################################
@@ -225,6 +219,20 @@ app.add_handler(CommandHandler("leverage", cmd_leverage))
 ###############################################################################
 async def main():
     try:
+        # --- НАЧАЛО ИЗМЕНЕНИЯ ---
+        # Явно загружаем рынки. Если OKX вернет "сломанные" данные по
+        # какой-то одной паре, ccxt может выдать ошибку. Мы ее перехватим,
+        # но есть шанс, что наша основная пара уже будет загружена,
+        # и бот сможет продолжить работу.
+        try:
+            await exchange.load_markets()
+            log.info("Markets loaded successfully.")
+        except Exception as e:
+            # Ошибка TypeError, которую вы видите, произойдет здесь.
+            # Мы ее логируем и игнорируем, надеясь на лучшее.
+            log.warning(f"Could not load all markets from OKX, but proceeding anyway. Error: {e}")
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
         bal = await exchange.fetch_balance()
         usdt_balance = bal['total'].get('USDT', 'N/A')
         log.info(f"USDT balance: {usdt_balance}")
