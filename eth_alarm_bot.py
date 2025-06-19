@@ -1,5 +1,5 @@
 # eth_alarm_bot.py
-import os, asyncio, json, logging
+import os, asyncio, json, logging, math, time
 from datetime import datetime
 
 import numpy as np
@@ -14,7 +14,7 @@ from telegram.ext import (
 )
 
 ###############################################################################
-# Константы / окружение
+# ─── Константы окружения ─────────────────────────────────────────────────────
 ###############################################################################
 BOT_TOKEN      = os.getenv("BOT_TOKEN")
 CHAT_IDS       = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
@@ -23,20 +23,20 @@ SHEET_ID       = os.getenv("SHEET_ID")
 INIT_LEVERAGE  = int(os.getenv("LEVERAGE", 1))
 
 ###############################################################################
-# Логирование ────────────────────────────────────────────────────────────────
+# ─── Логирование ─────────────────────────────────────────────────────────────
 ###############################################################################
 logging.basicConfig(
-    level=logging.INFO,                     # INFO для своего кода
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("bot")
 
-# ❶ Приглушаем httpx и его копию внутри PTB
+# глушим подробный вывод httpx (telegram)
 for noisy in ("httpx", "telegram.vendor.httpx"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 ###############################################################################
-# Google-Sheets helper
+# ─── Google Sheets helper ────────────────────────────────────────────────────
 ###############################################################################
 _GS_SCOPE = [
     "https://spreadsheets.google.com/feeds",
@@ -68,15 +68,15 @@ if SHEET_ID:
         WS.clear(); WS.append_row(HEADERS)
 
 ###############################################################################
-# Биржа OKX
+# ─── OKX биржа ───────────────────────────────────────────────────────────────
 ###############################################################################
 exchange = ccxt.okx({
-    "apiKey":    os.getenv("OKX_API_KEY"),
-    "secret":    os.getenv("OKX_SECRET"),
-    "password":  os.getenv("OKX_PASSWORD"),
-    "options":   {"defaultType": "swap"},
+    "apiKey":   os.getenv("OKX_API_KEY"),
+    "secret":   os.getenv("OKX_SECRET"),
+    "password": os.getenv("OKX_PASSWORD"),
+    "options":  {"defaultType": "swap"},
     "enableRateLimit": True,
-    # "verbose": True,  # включайте при отладке
+    # "verbose": True,     # включайте при отладке
 })
 
 PAIR = PAIR_RAW.replace("/", "-").replace(":USDT", "").upper()
@@ -84,11 +84,8 @@ if "-SWAP" not in PAIR:
     PAIR += "-SWAP"
 log.info(f"Using trading pair: {PAIR}")
 
-###############################################################################
-# Временный патч: безопасная загрузка рынков (устраняет баг старых ccxt)
-###############################################################################
 async def safe_load_okx_markets():
-    """Обходит parse_market-баг в ccxt < 4.4.87."""
+    """Обходит старую ошибку parse_market (ccxt < 4.4.87)."""
     try:
         return await exchange.load_markets()
     except TypeError as e:
@@ -98,7 +95,7 @@ async def safe_load_okx_markets():
         raise
 
 ###############################################################################
-# Стратегия (SSL-канал 13 + RSI)
+# ─── Стратегия SSL-канал + RSI ───────────────────────────────────────────────
 ###############################################################################
 def _calc_rsi(series: pd.Series, length=14):
     delta = series.diff()
@@ -130,15 +127,16 @@ def calculate_ssl(df: pd.DataFrame):
     return df
 
 ###############################################################################
-# Состояние стратегии
+# ─── Состояние бота ──────────────────────────────────────────────────────────
 ###############################################################################
 state = {
     "monitoring": False,
     "leverage":   INIT_LEVERAGE,
+    "position":   None,   # dict | None
 }
 
 ###############################################################################
-# Telegram-команды
+# ─── Telegram-команды ────────────────────────────────────────────────────────
 ###############################################################################
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(update.effective_chat.id)
@@ -161,7 +159,97 @@ async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🛠 Leverage set → {lev}x")
 
 ###############################################################################
-# Мониторинг рынка
+# ─── Торговые функции ────────────────────────────────────────────────────────
+###############################################################################
+async def get_free_usdt():
+    bal = await exchange.fetch_balance()
+    # OKX иногда отдаёт free/available в разных ключах
+    return bal["USDT"].get("available") or bal["USDT"].get("free") or 0
+
+async def open_position(side: str, price: float, ctx: ContextTypes.DEFAULT_TYPE):
+    """Открывает позицию целым депозитом × плечо, сохраняет её в state."""
+    usdt = await get_free_usdt()
+    if usdt <= 0:
+        await ctx.application.bot.send_message(list(ctx.application.chat_ids)[0],
+            "❗ Нет доступного USDT для открытия позиции")
+        return
+    qty = round((usdt * state["leverage"]) / price, 4)  # округляем до 0.0001
+    if qty <= 0:
+        return
+    await exchange.set_leverage(state["leverage"], symbol=PAIR)
+
+    # buy для LONG, sell для SHORT
+    side_order = "buy" if side == "LONG" else "sell"
+    order = await exchange.create_market_order(PAIR, side_order, qty)
+    entry = order["average"] or price
+
+    tp = entry * (1.005 if side == "LONG" else 0.995)
+    sl = entry * (0.995 if side == "LONG" else 1.005)
+
+    state["position"] = {
+        "side": side,
+        "amount": qty,
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "deposit": usdt,
+        "opened": time.time(),
+    }
+
+    txt = (f"🟢 <b>Позиция открыта {side}</b>\n"
+           f"💰 Депозит: <code>{usdt:.2f}</code>\n"
+           f"🎯 Entry: <code>{entry:.2f}</code>\n"
+           f"⛔ SL: <code>{sl:.2f}</code>\n"
+           f"🏁 TP: <code>{tp:.2f}</code>")
+    await broadcast(ctx, txt)
+
+async def close_position(reason: str, price: float, ctx: ContextTypes.DEFAULT_TYPE):
+    """Закрывает текущую позицию по рынку, пишет в Sheets, очищает state."""
+    pos = state["position"]
+    if not pos:
+        return
+    side_order = "sell" if pos["side"] == "LONG" else "buy"
+    order = await exchange.create_market_order(PAIR, side_order, pos["amount"], params={"reduceOnly": True})
+    close_price = order["average"] or price
+    pnl = (close_price - pos["entry"]) * pos["amount"]
+    if pos["side"] == "SHORT":
+        pnl = -pnl
+    days = max((time.time() - pos["opened"]) / 86400, 1e-9)
+    apr = (pnl / pos["deposit"]) * (365 / days) * 100
+
+    txt = (f"🔴 <b>Позиция закрыта: {reason}</b>\n"
+           f"💰 Депозит: <code>{pos['deposit']:.2f}</code>\n"
+           f"📈 Close: <code>{close_price:.2f}</code>\n"
+           f"🧮 P&L: <code>{pnl:.2f}</code>\n"
+           f"📅 APR: <code>{apr:.2f}%</code>")
+    await broadcast(ctx, txt)
+
+    # запись в Google Sheets
+    if WS:
+        rr = round(abs((pos['tp'] - pos['entry']) / (pos['entry'] - pos['sl'])), 2)
+        WS.append_row([
+            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            pos["side"],
+            pos["deposit"],
+            pos["entry"],
+            pos["sl"],
+            pos["tp"],
+            rr,
+            pnl,
+            round(apr, 2),
+        ])
+
+    state["position"] = None
+
+async def broadcast(ctx, text: str):
+    for cid in ctx.application.chat_ids:
+        try:
+            await ctx.application.bot.send_message(cid, text)
+        except Exception as e:
+            log.warning("broadcast: %s", e)
+
+###############################################################################
+# ─── Основной мониторинг ────────────────────────────────────────────────────
 ###############################################################################
 async def monitor(ctx: ContextTypes.DEFAULT_TYPE):
     log.info("monitor() loop started")
@@ -173,39 +261,50 @@ async def monitor(ctx: ContextTypes.DEFAULT_TYPE):
             df = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','vol'])
             df['ts'] = pd.to_datetime(df['ts'], unit='ms')
             df = calculate_ssl(df)
+            price = df['close'].iloc[-1]
+            rsi   = df['rsi'  ].iloc[-1]
+
+            # 1) Проверка TP/SL
+            pos = state["position"]
+            if pos:
+                hit_tp = price >= pos["tp"] if pos["side"]=="LONG" else price <= pos["tp"]
+                hit_sl = price <= pos["sl"] if pos["side"]=="LONG" else price >= pos["sl"]
+                if hit_tp:
+                    await close_position("TP", price, ctx)
+                elif hit_sl:
+                    await close_position("SL", price, ctx)
+
+            # 2) Сигналы стратегии
             sigs = df.dropna(subset=['ssl_sig'])
             if len(sigs) >= 2 and sigs.iloc[-1]['ssl_sig'] != sigs.iloc[-2]['ssl_sig']:
-                sig   = sigs.iloc[-1]['ssl_sig']
-                price = df['close'].iloc[-1]
-                rsi   = df['rsi'  ].iloc[-1]
-                cond_price = price >= 1.002*df['close'].iloc[-2] if sig=="LONG" else price <= 0.998*df['close'].iloc[-2]
-                cond_rsi   = rsi > 55 if sig=="LONG" else rsi < 45
+                sig = sigs.iloc[-1]['ssl_sig']
+                cond_price = (
+                    price >= 1.002*df['close'].iloc[-2] if sig=="LONG"
+                    else price <= 0.998*df['close'].iloc[-2]
+                )
+                cond_rsi = (rsi > 55) if sig=="LONG" else (rsi < 45)
                 if cond_price and cond_rsi:
-                    await send_signal(ctx, sig, price, rsi)
+                    if pos:
+                        # если тренд сменился — закрываем и переворачиваемся
+                        if pos["side"] != sig:
+                            await close_position("смена тренда", price, ctx)
+                            await open_position(sig, price, ctx)
+                    else:
+                        await open_position(sig, price, ctx)
+
         except Exception as e:
             log.exception("monitor-loop error: %s", e)
         await asyncio.sleep(30)
 
-async def send_signal(ctx: ContextTypes.DEFAULT_TYPE, sig: str, price: float, rsi: float):
-    txt = (f"📡 <b>Signal → {sig}</b>\n"
-           f"💰 Price: <code>{price:.2f}</code>\n"
-           f"📈 RSI: {rsi:.1f}\n"
-           f"⏰ {datetime.utcnow():%H:%M:%S UTC}")
-    for cid in ctx.application.chat_ids:
-        try:
-            await ctx.application.bot.send_message(cid, txt)
-        except Exception as e:
-            log.warning("send_signal: %s", e)
-
 ###############################################################################
-# Graceful shutdown
+# ─── Graceful shutdown ──────────────────────────────────────────────────────
 ###############################################################################
 async def post_shutdown_hook(app: Application):
     log.info("post_shutdown_hook → closing OKX client…")
     await exchange.close()
 
 ###############################################################################
-# Точка входа
+# ─── Точка входа ────────────────────────────────────────────────────────────
 ###############################################################################
 async def main():
     defaults = Defaults(parse_mode="HTML")
