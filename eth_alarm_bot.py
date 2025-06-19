@@ -14,7 +14,7 @@ from telegram.ext import (
 )
 
 ###############################################################################
-# Константы окружения
+# Константы / окружение
 ###############################################################################
 BOT_TOKEN      = os.getenv("BOT_TOKEN")
 CHAT_IDS       = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
@@ -23,16 +23,20 @@ SHEET_ID       = os.getenv("SHEET_ID")
 INIT_LEVERAGE  = int(os.getenv("LEVERAGE", 1))
 
 ###############################################################################
-# Логирование
+# Логирование ────────────────────────────────────────────────────────────────
 ###############################################################################
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,                     # INFO для своего кода
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("bot")
 
+# ❶ Приглушаем httpx и его копию внутри PTB
+for noisy in ("httpx", "telegram.vendor.httpx"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+
 ###############################################################################
-# Google-Sheets helper (без изменений)
+# Google-Sheets helper
 ###############################################################################
 _GS_SCOPE = [
     "https://spreadsheets.google.com/feeds",
@@ -62,8 +66,6 @@ if SHEET_ID:
     WS = _open_worksheet(SHEET_ID, "AI")
     if WS and WS.row_values(1) != HEADERS:
         WS.clear(); WS.append_row(HEADERS)
-elif SHEET_ID is None:
-    log.warning("SHEET_ID not set — Sheets logging disabled.")
 
 ###############################################################################
 # Биржа OKX
@@ -83,27 +85,26 @@ if "-SWAP" not in PAIR:
 log.info(f"Using trading pair: {PAIR}")
 
 ###############################################################################
-# ВРЕМЕННЫЙ патч загрузки рынков (обходит баг старых ccxt)
+# Временный патч: безопасная загрузка рынков (устраняет баг старых ccxt)
 ###############################################################################
 async def safe_load_okx_markets():
-    """Пытаемся загрузить рынки OKX, обходя известный parse_market-баг."""
+    """Обходит parse_market-баг в ccxt < 4.4.87."""
     try:
-        return await exchange.load_markets()       # обычный путь
+        return await exchange.load_markets()
     except TypeError as e:
         if "NoneType" in str(e) and "symbol = base" in str(e):
             log.warning("OKX parse_market bug caught — retry with SWAP only")
             return await exchange.load_markets({"instType": "SWAP"})
-        raise  # любая другая ошибка — прокидываем выше
+        raise
 
 ###############################################################################
-# Стратегия: SSL-канал + RSI (без изменений)
+# Стратегия (SSL-канал 13 + RSI)
 ###############################################################################
 def _calc_rsi(series: pd.Series, length=14):
     delta = series.diff()
-    gain = (delta.clip(lower=0)).rolling(length).mean()
-    loss = (-delta.clip(upper=0)).rolling(length).mean()
-    rs   = gain / loss
-    return 100 - (100 / (1 + rs))
+    gain  = delta.clip(lower=0).rolling(length).mean()
+    loss  = (-delta.clip(upper=0)).rolling(length).mean()
+    return 100 - 100 / (1 + gain / loss)
 
 def calculate_ssl(df: pd.DataFrame):
     sma = df['close'].rolling(13).mean()
@@ -129,7 +130,7 @@ def calculate_ssl(df: pd.DataFrame):
     return df
 
 ###############################################################################
-# Текущие настройки стратегии
+# Состояние стратегии
 ###############################################################################
 state = {
     "monitoring": False,
@@ -160,7 +161,7 @@ async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🛠 Leverage set → {lev}x")
 
 ###############################################################################
-# Основной мониторинг
+# Мониторинг рынка
 ###############################################################################
 async def monitor(ctx: ContextTypes.DEFAULT_TYPE):
     log.info("monitor() loop started")
@@ -197,7 +198,7 @@ async def send_signal(ctx: ContextTypes.DEFAULT_TYPE, sig: str, price: float, rs
             log.warning("send_signal: %s", e)
 
 ###############################################################################
-# post_shutdown — гарантированно закрываем биржу
+# Graceful shutdown
 ###############################################################################
 async def post_shutdown_hook(app: Application):
     log.info("post_shutdown_hook → closing OKX client…")
