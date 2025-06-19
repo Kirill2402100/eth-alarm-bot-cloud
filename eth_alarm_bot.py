@@ -209,53 +209,65 @@ async def post_shutdown_hook(application: Application):
 # Точка входа
 ###############################################################################
 async def main():
-    """Основная функция для асинхронной настройки бота."""
-    try:
-        await exchange.load_markets()
-        log.info("Markets loaded successfully.")
-    except Exception as e:
-        log.warning(f"Could not load all markets from OKX, but proceeding anyway. Error: {e}")
-
-    try:
-        bal = await exchange.fetch_balance()
-        usdt_balance = bal['total'].get('USDT', 'N/A')
-        log.info(f"USDT balance: {usdt_balance}")
-    except Exception as e:
-        log.error(f"Could not fetch balance. The bot will continue to run. Error: {e}")
+    """Основная функция для настройки и запуска бота в асинхронном режиме."""
     
+    # 1. Собираем приложение
     defaults = Defaults(parse_mode="HTML")
-    
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .defaults(defaults)
-        .post_shutdown(post_shutdown_hook)
         .build()
     )
 
-    app.chat_ids = set() 
+    # 2. Добавляем ID чатов и обработчики
+    app.chat_ids = set()
     app.chat_ids.update(CHAT_IDS)
-
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("stop",     cmd_stop))
     app.add_handler(CommandHandler("leverage", cmd_leverage))
-    
-    # Возвращаем настроенное приложение
-    return app
+
+    # 3. Запускаем все внутри try...finally для корректного завершения
+    try:
+        # Используем `async with` для управления жизненным циклом приложения
+        async with app:
+            # Инициализируем приложение
+            await app.initialize()
+
+            # Выполняем асинхронную настройку (биржа)
+            await exchange.load_markets()
+            log.info("Markets loaded successfully.")
+            bal = await exchange.fetch_balance()
+            usdt_balance = bal['total'].get('USDT', 'N/A')
+            log.info(f"USDT balance: {usdt_balance}")
+
+            # Запускаем бота
+            await app.start()
+            await app.updater.start_polling()
+            log.info("Bot has started polling successfully.")
+
+            # Держим скрипт активным, пока не получим сигнал остановки (Ctrl+C)
+            await asyncio.Event().wait()
+            
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Bot shutdown signal received.")
+    finally:
+        # Корректное завершение работы
+        log.info("Shutting down...")
+        if app.updater and app.updater.is_running():
+            await app.updater.stop()
+        await app.stop()
+        
+        # Закрываем сессию с биржей - это исправит ошибку "Unclosed client session"
+        await exchange.close()
+        log.info("Exchange connection closed gracefully.")
 
 
 if __name__ == "__main__":
     try:
-        # 1. Выполняем асинхронную настройку и получаем объект приложения
-        application = asyncio.run(main())
-
-        log.info("Bot is starting polling...")
-        # 2. Запускаем бота (это блокирующий вызов)
-        application.run_polling()
-
-    except (KeyboardInterrupt, SystemExit):
-        log.info("Bot shutdown requested by user.")
+        asyncio.run(main())
     except Exception as e:
+        # Логируем любые другие фатальные ошибки
         log.exception("Bot crashed with a fatal error: %s", e)
     finally:
         log.info("Bot process has terminated.")
