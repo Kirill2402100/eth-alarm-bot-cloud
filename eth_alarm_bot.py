@@ -1,16 +1,15 @@
 # eth_alarm_bot.py
-import os, asyncio, json, logging, math, time
+import os, asyncio, json, logging
 from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
-import ccxt.async_support as ccxt                      # ← асинхронный
+import ccxt.async_support as ccxt
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, ContextTypes,
-    Defaults
+    Application, ApplicationBuilder, CommandHandler, ContextTypes, Defaults
 )
 
 ###############################################################################
@@ -18,7 +17,7 @@ from telegram.ext import (
 ###############################################################################
 BOT_TOKEN      = os.getenv("BOT_TOKEN")
 CHAT_IDS       = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
-PAIR_RAW       = os.getenv("PAIR", "BTC-USDT-SWAP")      # «сырой» вид от пользователя
+PAIR_RAW       = os.getenv("PAIR", "BTC-USDT-SWAP")
 SHEET_ID       = os.getenv("SHEET_ID")
 INIT_LEVERAGE  = int(os.getenv("LEVERAGE", 1))
 
@@ -48,7 +47,8 @@ else:
 
 
 def _open_worksheet(sheet_id: str, title: str):
-    if not _gs: return None
+    if not _gs:
+        return None
     ss = _gs.open_by_key(sheet_id)
     try:
         ws = ss.worksheet(title)
@@ -56,8 +56,10 @@ def _open_worksheet(sheet_id: str, title: str):
         ws = ss.add_worksheet(title, rows=1000, cols=20)
     return ws
 
-HEADERS = ["DATE-TIME", "POSITION", "DEPOSIT", "ENTRY", "STOP LOSS",
-           "TAKE PROFIT", "RR", "P&L (USDT)", "APR (%)"]
+
+HEADERS = ["DATE-TIME", "POSITION", "DEPOSIT", "ENTRY",
+           "STOP LOSS", "TAKE PROFIT", "RR", "P&L (USDT)", "APR (%)"]
+
 if SHEET_ID:
     WS = _open_worksheet(SHEET_ID, "AI")
     if WS and WS.row_values(1) != HEADERS:
@@ -66,7 +68,6 @@ if SHEET_ID:
 else:
     WS = None
     log.warning("SHEET_ID not set. Google Sheets logging is disabled.")
-
 
 ###############################################################################
 # Биржа OKX
@@ -77,7 +78,7 @@ exchange = ccxt.okx({
     "password": os.getenv("OKX_PASSWORD"),
     "options":  {"defaultType": "swap"},
     "enableRateLimit": True,
-    "verbose": True,  # <--- ВОТ ЭТА СТРОКА
+    # "verbose": True,   # ← включайте при отладке
 })
 
 if PAIR_RAW:
@@ -98,6 +99,7 @@ def _calc_rsi(series: pd.Series, length=14):
     loss = (-delta.clip(upper=0)).rolling(window=length).mean()
     rs   = gain / loss
     return 100 - (100 / (1 + rs))
+
 
 def calculate_ssl(df: pd.DataFrame):
     sma = df['close'].rolling(13).mean()
@@ -134,9 +136,8 @@ state = {
 }
 
 ###############################################################################
-# Telegram-bot: Команды и функции
+# Telegram-bot: команды и функции
 ###############################################################################
-
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(update.effective_chat.id)
     state["monitoring"] = True
@@ -144,9 +145,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.chat_data.get("task"):
         ctx.chat_data["task"] = asyncio.create_task(monitor(ctx))
 
+
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["monitoring"] = False
     await update.message.reply_text("⛔ Monitoring OFF")
+
 
 async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     arg = update.message.text.split(maxsplit=1)
@@ -156,6 +159,7 @@ async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lev = int(arg[1])
     state["leverage"] = max(1, min(100, lev))
     await update.message.reply_text(f"🛠 Leverage set ↦ {state['leverage']}x")
+
 
 async def monitor(ctx: ContextTypes.DEFAULT_TYPE):
     log.info("monitor() loop started")
@@ -172,8 +176,11 @@ async def monitor(ctx: ContextTypes.DEFAULT_TYPE):
                 sig = sigs.iloc[-1]['ssl_sig']
                 price = df['close'].iloc[-1]
                 rsi   = df['rsi'].iloc[-1]
-                cond_price = (price >= (1.002 * df['close'].iloc[-2])) if sig=="LONG" else (price <= 0.998 * df['close'].iloc[-2])
-                cond_rsi   = (rsi > 55) if sig=="LONG" else (rsi < 45)
+                cond_price = (
+                    price >= (1.002 * df['close'].iloc[-2])
+                    if sig == "LONG" else price <= 0.998 * df['close'].iloc[-2]
+                )
+                cond_rsi   = (rsi > 55) if sig == "LONG" else (rsi < 45)
                 if cond_price and cond_rsi:
                     await send_signal(ctx, sig, price, rsi)
         except ccxt.NetworkError as e:
@@ -183,6 +190,7 @@ async def monitor(ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.exception("monitor-loop error: %s", e)
         await asyncio.sleep(30)
+
 
 async def send_signal(ctx: ContextTypes.DEFAULT_TYPE, sig: str, price: float, rsi: float):
     txt = (f"📡 <b>Signal → {sig}</b>\n"
@@ -195,79 +203,70 @@ async def send_signal(ctx: ContextTypes.DEFAULT_TYPE, sig: str, price: float, rs
         except Exception as e:
             log.warning("send_signal: %s", e)
 
+
+###############################################################################
+# Graceful shutdown hook
+###############################################################################
 async def post_shutdown_hook(application: Application):
-    """Эта функция будет вызвана при остановке бота для освобождения ресурсов."""
-    log.info("Graceful shutdown hook called. Exchange closing is disabled to prevent event loop conflict.")
-    #
-    # >>> ВАЖНО: Следующая строка ДОЛЖНА БЫТЬ закомментирована. <<<
-    #
-    # await exchange.close()
-    #
-    log.info("Exchange resources will be released by the OS upon process termination.")
+    """Вызывается PTB при выключении, пока event-loop ещё активен."""
+    log.info("post_shutdown_hook → closing OKX client …")
+    try:
+        await exchange.close()
+    except Exception as e:
+        log.warning("exchange.close() raised: %s", e)
+    else:
+        log.info("OKX client closed gracefully.")
+
 
 ###############################################################################
 # Точка входа
 ###############################################################################
 async def main():
-    """Основная функция для настройки и запуска бота в асинхронном режиме."""
-    
-    # 1. Собираем приложение
     defaults = Defaults(parse_mode="HTML")
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .defaults(defaults)
+        .post_shutdown(post_shutdown_hook)   # 👈 регистрируем хук
         .build()
     )
 
-    # 2. Добавляем ID чатов и обработчики
-    app.chat_ids = set()
-    app.chat_ids.update(CHAT_IDS)
+    # регистрируем команды
+    app.chat_ids = set(CHAT_IDS)
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("stop",     cmd_stop))
     app.add_handler(CommandHandler("leverage", cmd_leverage))
 
-    # 3. Запускаем все внутри try...finally для корректного завершения
-    try:
-        # Используем `async with` для управления жизненным циклом приложения
-        async with app:
-            # Инициализируем приложение
-            await app.initialize()
+    # основной цикл бота
+    async with app:
+        await app.initialize()
 
-            # Выполняем асинхронную настройку (биржа)
-            await exchange.load_markets()
-            log.info("Markets loaded successfully.")
-            bal = await exchange.fetch_balance()
-            usdt_balance = bal['total'].get('USDT', 'N/A')
-            log.info(f"USDT balance: {usdt_balance}")
+        await exchange.load_markets()
+        log.info("Markets loaded successfully.")
+        bal = await exchange.fetch_balance()
+        log.info("USDT balance: %s", bal['total'].get('USDT', 'N/A'))
 
-            # Запускаем бота
-            await app.start()
-            await app.updater.start_polling()
-            log.info("Bot has started polling successfully.")
+        await app.start()
+        await app.updater.start_polling()
+        log.info("Bot polling started.")
 
-            # Держим скрипт активным, пока не получим сигнал остановки (Ctrl+C)
+        try:
+            # держим процесс, пока не получим сигнал остановки (Ctrl+C / SIGTERM)
             await asyncio.Event().wait()
-            
-    except (KeyboardInterrupt, SystemExit):
-        log.info("Bot shutdown signal received.")
-    finally:
-        # Корректное завершение работы
-        log.info("Shutting down...")
-        if app.updater and app.updater.is_running():
-            await app.updater.stop()
-        await app.stop()
-        
-        # Закрываем сессию с биржей - это исправит ошибку "Unclosed client session"
-        await exchange.close()
-        log.info("Exchange connection closed gracefully.")
+        finally:
+            log.info("Stopping bot …")
+            await app.updater.stop()   # Updater ещё валиден
+            await app.stop()           # корректно гасим PTB
+
+            # exchange.close() НЕ вызываем здесь — он уже закроется в post_shutdown_hook
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Termination signal received.")
     except Exception as e:
-        # Логируем любые другие фатальные ошибки
-        log.exception("Bot crashed with a fatal error: %s", e)
+        log.exception("Bot crashed with fatal error: %s", e)
     finally:
-        log.info("Bot process has terminated.")
+        log.info("Process terminated.")
