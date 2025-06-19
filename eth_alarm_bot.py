@@ -38,7 +38,6 @@ _GS_SCOPE = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive",
 ]
-# Проверяем, есть ли учетные данные, чтобы избежать ошибок при локальном запуске
 if os.getenv("GOOGLE_CREDENTIALS"):
     creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
     _creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, _GS_SCOPE)
@@ -76,17 +75,15 @@ exchange = ccxt.okx({
     "apiKey":   os.getenv("OKX_API_KEY"),
     "secret":   os.getenv("OKX_SECRET"),
     "password": os.getenv("OKX_PASSWORD"),
-    "options":  {"defaultType": "swap"},          # гарантируем бессрочные фьючи
+    "options":  {"defaultType": "swap"},
     "enableRateLimit": True,
 })
 
-# Нормализуем PAIR из переменной окружения
 if PAIR_RAW:
     PAIR = PAIR_RAW.replace("/", "-").replace(":USDT", "").upper()
     if "-SWAP" not in PAIR:
         PAIR += "-SWAP"
 else:
-    # Устанавливаем значение по умолчанию, если переменная окружения пуста
     PAIR = "BTC-USDT-SWAP"
 
 log.info(f"Using trading pair: {PAIR}")
@@ -130,10 +127,10 @@ def calculate_ssl(df: pd.DataFrame):
 ###############################################################################
 state = {
     "monitoring": False,
-    "current_sig": None,      # LONG | SHORT | None
-    "last_cross":  None,      # datetime
+    "current_sig": None,
+    "last_cross":  None,
     "leverage":    INIT_LEVERAGE,
-    "position":    None,      # dict | None
+    "position":    None,
 }
 
 ###############################################################################
@@ -141,7 +138,6 @@ state = {
 ###############################################################################
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Включает мониторинг и добавляет пользователя в список рассылки."""
     ctx.application.chat_ids.add(update.effective_chat.id)
     state["monitoring"] = True
     await update.message.reply_text("✅ Monitoring ON")
@@ -149,12 +145,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.chat_data["task"] = asyncio.create_task(monitor(ctx))
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Выключает мониторинг."""
     state["monitoring"] = False
     await update.message.reply_text("⛔ Monitoring OFF")
 
 async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Устанавливает кредитное плечо."""
     arg = update.message.text.split(maxsplit=1)
     if len(arg) != 2 or not arg[1].isdigit():
         await update.message.reply_text("Использование: <code>/leverage 3</code>")
@@ -164,7 +158,6 @@ async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🛠 Leverage set ↦ {state['leverage']}x")
 
 async def monitor(ctx: ContextTypes.DEFAULT_TYPE):
-    """Основной цикл, который получает данные с биржи и ищет сигналы."""
     log.info("monitor() loop started")
     while True:
         if not state["monitoring"]:
@@ -192,7 +185,6 @@ async def monitor(ctx: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(30)
 
 async def send_signal(ctx: ContextTypes.DEFAULT_TYPE, sig: str, price: float, rsi: float):
-    """Отправляет сообщение с сигналом всем активным пользователям."""
     txt = (f"📡 <b>Signal → {sig}</b>\n"
            f"💰 Price: <code>{price:.2f}</code>\n"
            f"📈 RSI: {rsi:.1f}\n"
@@ -205,9 +197,11 @@ async def send_signal(ctx: ContextTypes.DEFAULT_TYPE, sig: str, price: float, rs
 
 async def post_shutdown_hook(application: Application):
     """Эта функция будет вызвана при остановке бота для освобождения ресурсов."""
-    log.info("Closing exchange connection...")
-    await exchange.close()
-    log.info("Exchange connection closed.")
+    log.info("Graceful shutdown hook called.")
+    # Следующая строка закомментирована, чтобы избежать конфликта циклов событий при завершении.
+    # Соединение будет закрыто операционной системой при остановке процесса.
+    # await exchange.close()
+    log.info("Exchange resources will be released by the OS.")
 
 ###############################################################################
 # Точка входа
@@ -229,7 +223,6 @@ async def main():
     
     defaults = Defaults(parse_mode="HTML")
     
-    # Регистрируем хук завершения работы прямо при сборке приложения
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -238,16 +231,13 @@ async def main():
         .build()
     )
 
-    # Инициализируем пользовательский атрибут и добавляем ID из переменных окружения
     app.chat_ids = set() 
     app.chat_ids.update(CHAT_IDS)
 
-    # Регистрируем хэндлеры
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("stop",     cmd_stop))
     app.add_handler(CommandHandler("leverage", cmd_leverage))
 
-    # Запускаем бота
     log.info("Bot is starting polling...")
     await app.run_polling()
 
