@@ -15,7 +15,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = [int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",")]
 PAIR = os.getenv("PAIR")
 if not PAIR:
-    raise ValueError("❌ Ошибка: переменная PAIR не задана.")SHEET_ID = os.getenv("SHEET_ID")
+    raise ValueError("❌ Ошибка: переменная PAIR не задана.")
+SHEET_ID = os.getenv("SHEET_ID")
 LEVERAGE = int(os.getenv("LEVERAGE", 1))
 
 # === GOOGLE SHEETS ===
