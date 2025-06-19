@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
-import ccxt.async_support as ccxt               # ← асинхронный
+import ccxt.async_support as ccxt                      # ← асинхронный
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
@@ -18,7 +18,7 @@ from telegram.ext import (
 ###############################################################################
 BOT_TOKEN      = os.getenv("BOT_TOKEN")
 CHAT_IDS       = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
-PAIR_RAW       = os.getenv("PAIR", "BTC-USDT-SWAP")           # «сырой» вид от пользователя
+PAIR_RAW       = os.getenv("PAIR", "BTC-USDT-SWAP")        # «сырой» вид от пользователя
 SHEET_ID       = os.getenv("SHEET_ID")
 INIT_LEVERAGE  = int(os.getenv("LEVERAGE", 1))
 
@@ -38,11 +38,18 @@ _GS_SCOPE = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive",
 ]
-creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
-_creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, _GS_SCOPE)
-_gs = gspread.authorize(_creds)
+# Проверяем, есть ли учетные данные, чтобы избежать ошибок при локальном запуске
+if os.getenv("GOOGLE_CREDENTIALS"):
+    creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+    _creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, _GS_SCOPE)
+    _gs = gspread.authorize(_creds)
+else:
+    _gs = None
+    log.warning("GOOGLE_CREDENTIALS not set. Google Sheets logging is disabled.")
+
 
 def _open_worksheet(sheet_id: str, title: str):
+    if not _gs: return None
     ss = _gs.open_by_key(sheet_id)
     try:
         ws = ss.worksheet(title)
@@ -52,10 +59,15 @@ def _open_worksheet(sheet_id: str, title: str):
 
 HEADERS = ["DATE-TIME", "POSITION", "DEPOSIT", "ENTRY", "STOP LOSS",
            "TAKE PROFIT", "RR", "P&L (USDT)", "APR (%)"]
-WS = _open_worksheet(SHEET_ID, "AI")
-if WS.row_values(1) != HEADERS:
-    WS.clear()
-    WS.append_row(HEADERS)
+if SHEET_ID:
+    WS = _open_worksheet(SHEET_ID, "AI")
+    if WS and WS.row_values(1) != HEADERS:
+        WS.clear()
+        WS.append_row(HEADERS)
+else:
+    WS = None
+    log.warning("SHEET_ID not set. Google Sheets logging is disabled.")
+
 
 ###############################################################################
 # Биржа OKX
@@ -64,36 +76,35 @@ exchange = ccxt.okx({
     "apiKey":   os.getenv("OKX_API_KEY"),
     "secret":   os.getenv("OKX_SECRET"),
     "password": os.getenv("OKX_PASSWORD"),
-    "options":  {"defaultType": "swap"},          # гарантируем бессрочные фьючи
+    "options":  {"defaultType": "swap"},           # гарантируем бессрочные фьючи
     "enableRateLimit": True,
 })
 
-async def validate_pair(pair_raw: str) -> str:
-    """Ищем нужный маркет в okx.swap. Допускаем 2 формы записи."""
-    await exchange.load_markets()
-    markets = exchange.markets
-    # Нормализуем оба возможных формата
-    aliases = {
-        pair_raw.replace("/", "-").replace(":USDT", "").upper() + "-SWAP",
-        pair_raw.replace("-", "/").split(":")[0].upper() + "/USDT:USDT"
-    }
-    for symbol in aliases:
-        if symbol in markets:
-            return symbol
-    raise ValueError(
-        f"PAIR '{pair_raw}' not found on OKX; "
-        f"did you mean e.g. {next(iter(list(markets)[:3]))} ?"
-    )
+# --- ИЗМЕНЕНИЕ НАЧАЛО ---
+# Вместо вызова громоздкой функции validate_pair, просто нормализуем
+# имя пары. Это быстрее и не вызовет сбой, если API вернет "сломанные" данные
+# по другим, не нужным нам, торговым парам.
 
-PAIR = asyncio.run(validate_pair(PAIR_RAW))  # валидируем синхронно при импорте
+# Нормализуем PAIR из переменной окружения
+if PAIR_RAW:
+    PAIR = PAIR_RAW.replace("/", "-").replace(":USDT", "").upper()
+    if "-SWAP" not in PAIR:
+        PAIR += "-SWAP"
+else:
+    # Устанавливаем значение по умолчанию, если переменная окружения пуста
+    PAIR = "BTC-USDT-SWAP"
+
+log.info(f"Using trading pair: {PAIR}")
+# --- ИЗМЕНЕНИЕ КОНЕЦ ---
+
 
 ###############################################################################
 # Стратегия: SSL-канал 13 + ценовое подтверждение + RSI
 ###############################################################################
 def _calc_rsi(series: pd.Series, length=14):
     delta = series.diff()
-    gain = (delta.clip(lower=0)).rolling(length).mean()
-    loss = (-delta.clip(upper=0)).rolling(length).mean()
+    gain = (delta.clip(lower=0)).rolling(window=length).mean()
+    loss = (-delta.clip(upper=0)).rolling(window=length).mean()
     rs   = gain / loss
     return 100 - (100 / (1 + rs))
 
@@ -136,7 +147,7 @@ state = {
 ###############################################################################
 DEFAULTS = Defaults(parse_mode="HTML")
 app = ApplicationBuilder().token(BOT_TOKEN).defaults(DEFAULTS).build()
-app.chat_ids = set(CHAT_IDS)        # добавляем стартовые id
+app.chat_ids = set(CHAT_IDS)      # добавляем стартовые id
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Команды
@@ -183,6 +194,10 @@ async def monitor(ctx: ContextTypes.DEFAULT_TYPE):
                 cond_rsi   = (rsi > 55) if sig=="LONG" else (rsi < 45)
                 if cond_price and cond_rsi:
                     await send_signal(sig, price, rsi)
+        except ccxt.NetworkError as e:
+            log.error("Network error during fetch_ohlcv: %s", e)
+        except ccxt.ExchangeError as e:
+            log.error("Exchange error: %s. Is the pair '%s' correct?", e, PAIR)
         except Exception as e:
             log.exception("monitor-loop error: %s", e)
         await asyncio.sleep(30)
@@ -211,13 +226,19 @@ app.add_handler(CommandHandler("leverage", cmd_leverage))
 async def main():
     try:
         bal = await exchange.fetch_balance()
-        log.info("USDT balance: %s", bal['total'].get('USDT'))
+        usdt_balance = bal['total'].get('USDT', 'N/A')
+        log.info(f"USDT balance: {usdt_balance}")
         await app.initialize()
         await app.start()
         await app.updater.start_polling()
+        log.info("Bot has started successfully.")
         await app.updater.idle()
+    except Exception as e:
+        log.exception("Fatal error in main(): %s", e)
     finally:
+        log.info("Closing exchange connection...")
         await exchange.close()
+        log.info("Bot is shutting down.")
 
 if __name__ == "__main__":
     asyncio.run(main())
