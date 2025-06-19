@@ -137,27 +137,26 @@ state = {
 }
 
 ###############################################################################
-# Telegram-bot
+# Telegram-bot: Команды и функции
 ###############################################################################
-DEFAULTS = Defaults(parse_mode="HTML")
-app = ApplicationBuilder().token(BOT_TOKEN).defaults(DEFAULTS).build()
-app.chat_ids = set(CHAT_IDS)      # добавляем стартовые id
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Команды
-# ──────────────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    app.chat_ids.add(update.effective_chat.id)
+    """Включает мониторинг и добавляет пользователя в список рассылки."""
+    # --- ИЗМЕНЕНИЕ ---
+    # Доступ к chat_ids теперь через контекст (ctx.application)
+    ctx.application.chat_ids.add(update.effective_chat.id)
     state["monitoring"] = True
     await update.message.reply_text("✅ Monitoring ON")
     if not ctx.chat_data.get("task"):
         ctx.chat_data["task"] = asyncio.create_task(monitor(ctx))
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Выключает мониторинг."""
     state["monitoring"] = False
     await update.message.reply_text("⛔ Monitoring OFF")
 
 async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Устанавливает кредитное плечо."""
     arg = update.message.text.split(maxsplit=1)
     if len(arg) != 2 or not arg[1].isdigit():
         await update.message.reply_text("Использование: <code>/leverage 3</code>")
@@ -166,10 +165,8 @@ async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["leverage"] = max(1, min(100, lev))
     await update.message.reply_text(f"🛠 Leverage set ↦ {state['leverage']}x")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Основной цикл мониторинга
-# ──────────────────────────────────────────────────────────────────────────────
 async def monitor(ctx: ContextTypes.DEFAULT_TYPE):
+    """Основной цикл, который получает данные с биржи и ищет сигналы."""
     log.info("monitor() loop started")
     while True:
         if not state["monitoring"]:
@@ -187,7 +184,9 @@ async def monitor(ctx: ContextTypes.DEFAULT_TYPE):
                 cond_price = (price >= (1.002 * df['close'].iloc[-2])) if sig=="LONG" else (price <= 0.998 * df['close'].iloc[-2])
                 cond_rsi   = (rsi > 55) if sig=="LONG" else (rsi < 45)
                 if cond_price and cond_rsi:
-                    await send_signal(sig, price, rsi)
+                    # --- ИЗМЕНЕНИЕ ---
+                    # Передаем контекст в send_signal
+                    await send_signal(ctx, sig, price, rsi)
         except ccxt.NetworkError as e:
             log.error("Network error during fetch_ohlcv: %s", e)
         except ccxt.ExchangeError as e:
@@ -196,31 +195,25 @@ async def monitor(ctx: ContextTypes.DEFAULT_TYPE):
             log.exception("monitor-loop error: %s", e)
         await asyncio.sleep(30)
 
-async def send_signal(sig: str, price: float, rsi: float):
+async def send_signal(ctx: ContextTypes.DEFAULT_TYPE, sig: str, price: float, rsi: float):
+    """Отправляет сообщение с сигналом всем активным пользователям."""
     txt = (f"📡 <b>Signal → {sig}</b>\n"
            f"💰 Price: <code>{price:.2f}</code>\n"
            f"📈 RSI: {rsi:.1f}\n"
            f"⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}")
-    for cid in app.chat_ids:
+    # --- ИЗМЕНЕНИЕ ---
+    # Доступ к chat_ids и боту теперь через контекст (ctx.application)
+    for cid in ctx.application.chat_ids:
         try:
-            await app.bot.send_message(cid, txt)
+            await ctx.application.bot.send_message(cid, txt)
         except Exception as e:
             log.warning("send_signal: %s", e)
-
-###############################################################################
-# Регистрация хэндлеров и функции завершения работы
-###############################################################################
-app.add_handler(CommandHandler("start",    cmd_start))
-app.add_handler(CommandHandler("stop",     cmd_stop))
-app.add_handler(CommandHandler("leverage", cmd_leverage))
 
 async def post_shutdown_hook(application: Application):
     """Эта функция будет вызвана при остановке бота для освобождения ресурсов."""
     log.info("Closing exchange connection...")
     await exchange.close()
     log.info("Exchange connection closed.")
-
-app.post_shutdown(post_shutdown_hook)
 
 ###############################################################################
 # Точка входа
@@ -242,9 +235,23 @@ async def main():
         log.info(f"USDT balance: {usdt_balance}")
     except Exception as e:
         log.error(f"Could not fetch balance. The bot will continue to run. Error: {e}")
+    
+    # --- ИЗМЕНЕНИЕ: Настройка бота перенесена сюда ---
+    defaults = Defaults(parse_mode="HTML")
+    app = ApplicationBuilder().token(BOT_TOKEN).defaults(defaults).build()
+
+    # Добавляем стартовые ID чатов из переменных окружения
+    app.chat_ids.update(CHAT_IDS)
+
+    # Регистрируем хэндлеры
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("stop",     cmd_stop))
+    app.add_handler(CommandHandler("leverage", cmd_leverage))
+
+    # Регистрируем функцию, которая будет вызвана при остановке
+    app.post_shutdown(post_shutdown_hook)
 
     # Запускаем бота. run_polling будет работать, пока процесс не будет прерван.
-    # При остановке он вызовет зарегистрированную нами post_shutdown_hook.
     log.info("Bot is starting polling...")
     await app.run_polling()
 
