@@ -9,7 +9,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes,
+    Application, ApplicationBuilder, CommandHandler, ContextTypes,
     Defaults
 )
 
@@ -208,47 +208,53 @@ async def send_signal(sig: str, price: float, rsi: float):
             log.warning("send_signal: %s", e)
 
 ###############################################################################
-# Регистрация хэндлеров
+# Регистрация хэндлеров и функции завершения работы
 ###############################################################################
 app.add_handler(CommandHandler("start",    cmd_start))
 app.add_handler(CommandHandler("stop",     cmd_stop))
 app.add_handler(CommandHandler("leverage", cmd_leverage))
 
+async def post_shutdown_hook(application: Application):
+    """Эта функция будет вызвана при остановке бота для освобождения ресурсов."""
+    log.info("Closing exchange connection...")
+    await exchange.close()
+    log.info("Exchange connection closed.")
+
+app.post_shutdown(post_shutdown_hook)
+
 ###############################################################################
 # Точка входа
 ###############################################################################
 async def main():
+    """Основная функция для настройки и запуска бота."""
+    # Явно загружаем рынки. Если OKX вернет "сломанные" данные,
+    # мы перехватим ошибку и просто выведем предупреждение.
     try:
-        # Явно загружаем рынки. Если OKX вернет "сломанные" данные,
-        # мы перехватим ошибку и просто выведем предупреждение.
-        try:
-            await exchange.load_markets()
-            log.info("Markets loaded successfully.")
-        except Exception as e:
-            log.warning(f"Could not load all markets from OKX, but proceeding anyway. Error: {e}")
-
-        # Пытаемся получить баланс, но не даем боту упасть, если это не удастся.
-        try:
-            bal = await exchange.fetch_balance()
-            usdt_balance = bal['total'].get('USDT', 'N/A')
-            log.info(f"USDT balance: {usdt_balance}")
-        except Exception as e:
-            log.error(f"Could not fetch balance. The bot will continue to run. Error: {e}")
-        
-        # --- НАЧАЛО ИЗМЕНЕНИЯ ---
-        # В python-telegram-bot v20+ метод run_polling() обрабатывает инициализацию,
-        # запуск бота и поддержание его в рабочем состоянии.
-        # Он заменяет старую последовательность initialize/start/start_polling/idle.
-        log.info("Bot is starting polling...")
-        await app.run_polling()
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
-
+        await exchange.load_markets()
+        log.info("Markets loaded successfully.")
     except Exception as e:
-        log.exception("Fatal error in main(): %s", e)
-    finally:
-        log.info("Closing exchange connection...")
-        await exchange.close()
-        log.info("Bot is shutting down.")
+        log.warning(f"Could not load all markets from OKX, but proceeding anyway. Error: {e}")
+
+    # Пытаемся получить баланс, но не даем боту упасть, если это не удастся.
+    try:
+        bal = await exchange.fetch_balance()
+        usdt_balance = bal['total'].get('USDT', 'N/A')
+        log.info(f"USDT balance: {usdt_balance}")
+    except Exception as e:
+        log.error(f"Could not fetch balance. The bot will continue to run. Error: {e}")
+
+    # Запускаем бота. run_polling будет работать, пока процесс не будет прерван.
+    # При остановке он вызовет зарегистрированную нами post_shutdown_hook.
+    log.info("Bot is starting polling...")
+    await app.run_polling()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Bot shutdown requested by user.")
+    except Exception as e:
+        log.exception("Bot crashed with a fatal error: %s", e)
+    finally:
+        log.info("Bot process has terminated.")
