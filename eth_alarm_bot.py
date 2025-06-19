@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """ssl_rsi_okx_bot.py — финальная версия
 --------------------------------------
-Telegram-бот для автоматической торговли бессрочными фьючерсами OKX
-Стратегия: пересечение SSL-канала 13/13  →  подтверждение ценой ±0.2 %  →  фильтр RSI (55/45)
-SL / TP = ±0.5 %;  плечо configurable.
+Telegram‑бот для автоматической торговли бессрочными фьючерсами OKX
+Стратегия: пересечение SSL‑канала 13/13  →  подтверждение ценой ±0.2 %  →  фильтр RSI (55/45)
+SL / TP = ±0.5 %;  плечо configurable.
 
 Переменные Railway ➜ Variables (⚠️ обязательны)
 ------------------------------------------------
@@ -25,12 +25,12 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 BOT_TOKEN = os.getenv("BOT_TOKEN");   assert BOT_TOKEN, "BOT_TOKEN missing"
 CHAT_IDS  = {int(cid) for cid in os.getenv("CHAT_IDS", "").split(',') if cid.strip().isdigit()}
 RAW_PAIR  = os.getenv("PAIR", "").strip();         assert RAW_PAIR, "PAIR missing"
-# ► авто-конвертируем, если передан формат BTC-USDT
+# ► авто‑конвертируем, если передан формат BTC-USDT
 if "-" in RAW_PAIR and "/" not in RAW_PAIR:
     base, quote = RAW_PAIR.split("-")
     PAIR = f"{base}/{quote}:{quote}"
 else:
-    PAIR = RAW_PAIR        # уже ccxt-формат BTC/USDT:USDT
+    PAIR = RAW_PAIR        # уже ccxt‑формат BTC/USDT:USDT
 LEVERAGE = int(os.getenv("LEVERAGE", 1))
 SHEET_ID = os.getenv("SHEET_ID");     assert SHEET_ID, "SHEET_ID missing"
 
@@ -52,11 +52,16 @@ exchange = ccxt.okx({
 })
 # ⚠️ некоторые старые рынки ломают parse_market(); грузим безопасно
 try:
-    exchange.load_markets()
-except Exception:
-    print("[warn] load_markets failed — fallback to single symbol load")
-    exchange.markets = {PAIR: exchange.fetch_market(PAIR)}
-exchange.set_leverage(LEVERAGE, PAIR)
+    try:
+    # загружаем ТОЛЬКО swap-рынки; общий вызов иногда падает на устаревших инструментах
+    exchange.load_markets(params={"instType": "SWAP"})
+except Exception as e:
+    # fallback: fetch_markets только для swap и формируем словарь вручную
+    print("[warn] load_markets failed → fallback", e)
+    swap_markets = exchange.fetch_markets(params={"instType": "SWAP"})
+    exchange.markets = {m['symbol']: m for m in swap_markets}
+
+exchange.set_leverage(LEVERAGE, PAIR)(LEVERAGE, PAIR)
 
 # === Индикаторы ===
 WINDOW_SSL = 13
