@@ -14,9 +14,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = [int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",")]
 PAIR = os.getenv("PAIR")
-if not PAIR or "/" not in PAIR:
-    raise ValueError("❌ Ошибка: переменная PAIR не задана или в неправильном формате (ожидается BTC/USDT).")
-SHEET_ID = os.getenv("SHEET_ID")
+if not PAIR:
+    raise ValueError("❌ Ошибка: переменная PAIR не задана.")SHEET_ID = os.getenv("SHEET_ID")
 LEVERAGE = int(os.getenv("LEVERAGE", 1))
 
 # === GOOGLE SHEETS ===
