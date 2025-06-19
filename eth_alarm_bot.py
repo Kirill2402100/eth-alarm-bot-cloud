@@ -77,6 +77,7 @@ exchange = ccxt.okx({
     "password": os.getenv("OKX_PASSWORD"),
     "options":  {"defaultType": "swap"},
     "enableRateLimit": True,
+    "verbose": True,  # <--- ВОТ ЭТА СТРОКА
 })
 
 if PAIR_RAW:
@@ -87,7 +88,6 @@ else:
     PAIR = "BTC-USDT-SWAP"
 
 log.info(f"Using trading pair: {PAIR}")
-
 
 ###############################################################################
 # Стратегия: SSL-канал 13 + ценовое подтверждение + RSI
