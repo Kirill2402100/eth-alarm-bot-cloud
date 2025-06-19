@@ -209,7 +209,7 @@ async def post_shutdown_hook(application: Application):
 # Точка входа
 ###############################################################################
 async def main():
-    """Основная функция для настройки и запуска бота."""
+    """Основная функция для асинхронной настройки бота."""
     try:
         await exchange.load_markets()
         log.info("Markets loaded successfully.")
@@ -239,14 +239,20 @@ async def main():
     app.add_handler(CommandHandler("start",    cmd_start))
     app.add_handler(CommandHandler("stop",     cmd_stop))
     app.add_handler(CommandHandler("leverage", cmd_leverage))
-
-    log.info("Bot is starting polling...")
-    await app.run_polling()
+    
+    # Возвращаем настроенное приложение
+    return app
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        # 1. Выполняем асинхронную настройку и получаем объект приложения
+        application = asyncio.run(main())
+
+        log.info("Bot is starting polling...")
+        # 2. Запускаем бота (это блокирующий вызов)
+        application.run_polling()
+
     except (KeyboardInterrupt, SystemExit):
         log.info("Bot shutdown requested by user.")
     except Exception as e:
