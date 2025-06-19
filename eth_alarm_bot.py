@@ -219,7 +219,6 @@ app.add_handler(CommandHandler("leverage", cmd_leverage))
 ###############################################################################
 async def main():
     try:
-        # --- НАЧАЛО ИЗМЕНЕНИЯ ---
         # Явно загружаем рынки. Если OKX вернет "сломанные" данные,
         # мы перехватим ошибку и просто выведем предупреждение.
         try:
@@ -229,20 +228,21 @@ async def main():
             log.warning(f"Could not load all markets from OKX, but proceeding anyway. Error: {e}")
 
         # Пытаемся получить баланс, но не даем боту упасть, если это не удастся.
-        # Ошибка может быть той же, что и при загрузке рынков.
         try:
             bal = await exchange.fetch_balance()
             usdt_balance = bal['total'].get('USDT', 'N/A')
             log.info(f"USDT balance: {usdt_balance}")
         except Exception as e:
             log.error(f"Could not fetch balance. The bot will continue to run. Error: {e}")
+        
+        # --- НАЧАЛО ИЗМЕНЕНИЯ ---
+        # В python-telegram-bot v20+ метод run_polling() обрабатывает инициализацию,
+        # запуск бота и поддержание его в рабочем состоянии.
+        # Он заменяет старую последовательность initialize/start/start_polling/idle.
+        log.info("Bot is starting polling...")
+        await app.run_polling()
         # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling()
-        log.info("Bot has started successfully.")
-        await app.updater.idle()
     except Exception as e:
         log.exception("Fatal error in main(): %s", e)
     finally:
