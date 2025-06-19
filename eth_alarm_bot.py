@@ -50,18 +50,16 @@ exchange = ccxt.okx({
     "enableRateLimit": True,
     "options": {"defaultType": "swap"}
 })
-# ⚠️ некоторые старые рынки ломают parse_market(); грузим безопасно
+
 try:
-    try:
-    # загружаем ТОЛЬКО swap-рынки; общий вызов иногда падает на устаревших инструментах
+    # грузим только swap-рынки
     exchange.load_markets(params={"instType": "SWAP"})
 except Exception as e:
-    # fallback: fetch_markets только для swap и формируем словарь вручную
     print("[warn] load_markets failed → fallback", e)
-    swap_markets = exchange.fetch_markets(params={"instType": "SWAP"})
-    exchange.markets = {m['symbol']: m for m in swap_markets}
+    swap = exchange.fetch_markets(params={"instType": "SWAP"})
+    exchange.markets = {m["symbol"]: m for m in swap}
 
-exchange.set_leverage(LEVERAGE, PAIR)(LEVERAGE, PAIR)
+exchange.set_leverage(LEVERAGE, PAIR)
 
 # === Индикаторы ===
 WINDOW_SSL = 13
