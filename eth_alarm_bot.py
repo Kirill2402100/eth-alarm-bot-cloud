@@ -50,16 +50,18 @@ exchange = ccxt.okx({
     "enableRateLimit": True,
     "options": {"defaultType": "swap"}
 })
-
+# ⚠️ некоторые старые рынки ломают parse_market(); грузим безопасно
 try:
-    # грузим только swap-рынки
+    try:
+    # загружаем ТОЛЬКО swap‑рынки; общий вызов иногда падает на устаревших инструментах
     exchange.load_markets(params={"instType": "SWAP"})
 except Exception as e:
+    # fallback: fetch_markets только для swap и формируем словарь вручную
     print("[warn] load_markets failed → fallback", e)
-    swap = exchange.fetch_markets(params={"instType": "SWAP"})
-    exchange.markets = {m["symbol"]: m for m in swap}
+    swap_markets = exchange.fetch_markets(params={"instType": "SWAP"})
+    exchange.markets = {m['symbol']: m for m in swap_markets}
 
-exchange.set_leverage(LEVERAGE, PAIR)
+exchange.set_leverage(LEVERAGE, PAIR)(LEVERAGE, PAIR)
 
 # === Индикаторы ===
 WINDOW_SSL = 13
@@ -147,15 +149,30 @@ async def cmd_start(u:Update,c:ContextTypes.DEFAULT_TYPE):
     global monitoring
     c.application.chat_ids.add(u.effective_chat.id)
     if not monitoring:
-        monitoring=True; asyncio.create_task(monitor(c.application)); await u.message.reply_text('Monitoring ON ✅')
+        monitoring=True; asyncio.create_task(monitor(c.application))
+        await u.message.reply_text('Monitoring ON ✅')
     else:
         await u.message.reply_text('Уже запущен.')
+
 async def cmd_stop(u:Update,c:ContextTypes.DEFAULT_TYPE):
     global monitoring; monitoring=False; await u.message.reply_text('⏹️ Monitoring OFF')
+
 async def cmd_leverage(u:Update,c:ContextTypes.DEFAULT_TYPE):
     global LEVERAGE
     try:
         lev=int(c.args[0]); exchange.set_leverage(lev,PAIR); LEVERAGE=lev
         await u.message.reply_text(f'Leverage set to {lev}x')
     except Exception as e:
-        await u.message.reply
+        await u.message.reply_text(f'Error: {e}')
+
+# === MAIN LOOP ===
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.chat_ids = set(CHAT_IDS)            # сохранить начальные ID (опционально)
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stop",  cmd_stop))
+    app.add_handler(CommandHandler("leverage", cmd_leverage))
+
+    print("✅ Bot up — waiting for /start …")
+    app.run_polling()
