@@ -1,7 +1,8 @@
 # ============================================================================
 #  eth_alarm_bot.py — Variant B
-#  SSL-13 + ATR-confirm + RSI + ATR/ADX/Volume filters (TP-1 + adaptive trail)
-#  Рабочая автоторговля на OKX  •  © 2025-06-20
+#  SSL-13 + ATR-confirm + RSI  + ATR/ADX/Volume-filter
+#  Реальная торговля OKX (TP-1  + адаптивный трейлинг)
+#  © 2025-06-20
 # ============================================================================
 
 import os, asyncio, json, logging, math, time
@@ -54,10 +55,8 @@ def _open_worksheet(sheet_id: str, title: str):
     except gspread.WorksheetNotFound:
         return ss.add_worksheet(title, rows=1000, cols=20)
 
-HEADERS = [
-    "DATE-TIME", "POSITION", "DEPOSIT", "ENTRY",
-    "STOP LOSS", "TAKE PROFIT", "RR", "P&L (USDT)", "APR (%)"
-]
+HEADERS = ["DATE-TIME", "POSITION", "DEPOSIT", "ENTRY",
+           "STOP LOSS", "TAKE PROFIT", "RR", "P&L (USDT)", "APR (%)"]
 WS = None
 if SHEET_ID:
     WS = _open_worksheet(SHEET_ID, "AI")
@@ -67,7 +66,7 @@ if SHEET_ID:
 # ─────────────────────────────── OKX ─────────────────────────────────────────
 exchange = ccxt.okx({
     "apiKey":   os.getenv("OKX_API_KEY"),
-    "secret":   os.getenv("OKX_SECRET"),
+    "secret":   os.getenv("OKX_SECRET"   ),
     "password": os.getenv("OKX_PASSWORD"),
     "options":  {"defaultType": "swap"},
     "enableRateLimit": True,
@@ -78,34 +77,34 @@ if "-SWAP" not in PAIR:
     PAIR += "-SWAP"
 log.info("Using trading pair: %s", PAIR)
 
-# ───────────────────────--- Variant B настройки ---───────────────────────────
-SSL_LEN          = 13
-USE_ATR_CONF     = True
-PC_ATR_MUL       = 0.60
-PC_LONG_PERC     = 0.40 / 100
-PC_SHORT_PERC    = 0.40 / 100
+# ─────────────────────── Параметры стратегии (Variant B) ─────────────────────
+SSL_LEN       = 13
+USE_ATR_CONF  = True
+PC_ATR_MUL    = 0.60
+PC_LONG_PERC  = 0.40 / 100
+PC_SHORT_PERC = 0.40 / 100
 
-RSI_LEN          = 14
-RSI_LONG_T       = 55
-RSI_SHORT_T      = 45
+RSI_LEN    = 14
+RSI_LONG_T = 55
+RSI_SHORT_T= 45
 
-ATR_LEN          = 14
-ATR_MIN_PCT      = 0.35 / 100
-ADX_LEN          = 14
-ADX_MIN          = 24
+ATR_LEN    = 14
+ATR_MIN_PCT= 0.35 / 100
+ADX_LEN    = 14      # surrogate ADX
+ADX_MIN    = 24
 
-USE_VOL_FILTER   = True
-VOL_MULT         = 1.40
-VOL_LEN          = 20
+USE_VOL_FILTER = True
+VOL_MULT   = 1.40
+VOL_LEN    = 20
 
-USE_ATR_STOPS    = True
-TP1_SHARE        = 0.20
-TP1_ATR_MUL      = 1.0
-TRAIL_ATR_MUL    = 0.65
-TP1_PCT          = 1.00 / 100
-TRAIL_PCT        = 0.60 / 100
+USE_ATR_STOPS = True
+TP1_SHARE   = 0.20
+TP1_ATR_MUL = 1.0
+TRAIL_ATR_MUL = 0.65
+TP1_PCT     = 1.0 / 100
+TRAIL_PCT   = 0.60 / 100
 
-WAIT_BARS        = 1           # пауза после закрытия позиции (баров)
+WAIT_BARS   = 1      # пауза после закрытия позиции (баров)
 
 # ─────────────────────────── Индикаторы ─────────────────────────────────────
 def _ta_rsi(series: pd.Series, length=14):
@@ -132,33 +131,32 @@ def calc_ssl_and_filters(df: pd.DataFrame) -> pd.DataFrame:
     # сигнал: +1 / −1 / 0
     sig = [0]
     for i in range(1, len(df)):
-        pu, pd = df.at[i-1, 'ssl_up'], df.at[i-1, 'ssl_dn']
-        cu, cd = df.at[i  , 'ssl_up'], df.at[i  , 'ssl_dn']
+        pu, pd = df.at[i-1,'ssl_up'], df.at[i-1,'ssl_dn']
+        cu, cd = df.at[i  ,'ssl_up'], df.at[i  ,'ssl_dn']
         if not np.isnan([pu, pd, cu, cd]).any():
-            if pu < pd and cu > cd:
-                sig.append( 1)
-            elif pu > pd and cu < cd:
-                sig.append(-1)
-            else:
-                sig.append(sig[-1])
+            if pu < pd and cu > cd:   sig.append( 1)
+            elif pu > pd and cu < cd: sig.append(-1)
+            else:                     sig.append(sig[-1])
         else:
             sig.append(sig[-1])
     df['ssl_sig'] = sig
 
     df['rsi'] = _ta_rsi(df['close'], RSI_LEN)
-    df['atr'] = df['close'].rolling(ATR_LEN).apply(
-        lambda x: pd.Series(x).max() - pd.Series(x).min(), raw=False)
 
-    # surrogate ADX (high-low range EMA)
+    # ATR (max-min) без Series → raw=True даёт ndarray, ошибки больше нет
+    df['atr'] = df['close'].rolling(ATR_LEN, center=False).apply(
+        lambda x: x.max() - x.min(), raw=True)
+
+    # surrogate ADX: EMA(high-low)
     df['adx'] = (df['high'] - df['low']).ewm(span=ADX_LEN).mean()
 
-    # Vol-filter OK?
+    # Volume OK?
     df['vol_ok'] = ~USE_VOL_FILTER | (
-        df['volume'] > df['volume'].rolling(VOL_LEN).mean() * VOL_MULT
-    )
+        df['volume'] > df['volume'].rolling(VOL_LEN).mean() * VOL_MULT)
+
     return df
 
-# ────────────────────────── Состояние ───────────────────────────────────────
+# ────────────────────────── Глобальное состояние ───────────────────────────
 state = {
     "monitor": False,
     "leverage": INIT_LEVERAGE,
@@ -166,12 +164,12 @@ state = {
     "bars_since_close": 999,
 }
 
-# ─────────────────── Telegram-команды ───────────────────────────────────────
+# ──────────────────────── Telegram-команды ──────────────────────────────────
 async def cmd_start(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(upd.effective_chat.id)
     state["monitor"] = True
     await upd.message.reply_text("✅ Monitoring ON")
-    if "task" not in ctx.chat_data:
+    if not ctx.chat_data.get("task"):
         ctx.chat_data["task"] = asyncio.create_task(monitor(ctx))
 
 async def cmd_stop(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -181,174 +179,108 @@ async def cmd_stop(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_leverage(upd: Update, ctx: ContextTypes.DEFAULT_TYPE):
     parts = upd.message.text.split(maxsplit=1)
     if len(parts) != 2 or not parts[1].isdigit():
-        await upd.message.reply_text("Использование: /leverage 3")
+        await upd.message.reply_text("<code>/leverage 3</code>")
         return
     state["leverage"] = max(1, min(100, int(parts[1])))
-    await upd.message.reply_text(f"↔ Leverage set → {state['leverage']}×")
+    await upd.message.reply_text(f"🛠 leverage set → {state['leverage']}×")
 
 # ───────────────────────────── helpers ──────────────────────────────────────
-async def broadcast(ctx, txt: str):
+async def broadcast(ctx, txt):                    # отправка всем chat_id
     for cid in ctx.application.chat_ids:
-        try:
-            await ctx.application.bot.send_message(cid, txt)
-        except:  # noqa
-            pass
+        try: await ctx.application.bot.send_message(cid, txt)
+        except: pass
 
-async def get_free_usdt() -> float:
+async def get_free_usdt():
     bal = await exchange.fetch_balance()
-    return bal["USDT"].get("available") or bal["USDT"].get("free") or 0.0
+    return bal["USDT"].get("available") or bal["USDT"].get("free") or 0
 
 # ───────────────────────── open / close позиции ─────────────────────────────
 async def open_pos(side: str, price: float, ctx):
     usdt = await get_free_usdt()
-    m = exchange.market(PAIR)
-    step     = m["precision"]["amount"] or 0.0001
-    min_amt  = m["limits"]["amount"]["min"] or step
-    qty_raw  = (usdt * state["leverage"]) / price
-    qty      = math.floor(qty_raw / step) * step
-    qty      = round(qty, 8)
-    if qty < min_amt:
-        await broadcast(ctx, f"❗ Недостаточно средств ({qty:.4f} < {min_amt})")
+    m     = exchange.market(PAIR)
+    step  = m["precision"]["amount"] or 0.0001
+    min_a = m["limits"]["amount"]["min"] or step
+    qty   = math.floor((usdt*state['leverage']/price)/step)*step
+    qty   = round(qty, 8)
+    if qty < min_a:
+        await broadcast(ctx, f"❗ Недостаточно средств ({qty} < {min_a})")
         return
-
-    await exchange.set_leverage(state["leverage"], PAIR)
+    await exchange.set_leverage(state['leverage'], PAIR)
     order = await exchange.create_market_order(
-        PAIR, "buy" if side == "LONG" else "sell", qty
-    )
+        PAIR, 'buy' if side=='LONG' else 'sell', qty)
     entry = order["average"] or price
+    tp = entry + TP1_ATR_MUL*price*TRAIL_PCT if side=="LONG" else entry - TP1_ATR_MUL*price*TRAIL_PCT
+    sl = entry - price*TRAIL_PCT if side=="LONG" else entry + price*TRAIL_PCT
+    state['position'] = {
+        "side":side,"amount":qty,"entry":entry,"tp":tp,"sl":sl,
+        "deposit":usdt,"opened":time.time()}
+    await broadcast(ctx,f"🟢 Открыта {side} qty={qty} entry={entry:.2f}")
+    state['bars_since_close'] = 0
 
-    tp = (entry + TP1_ATR_MUL * TRAIL_PCT * entry) if side == "LONG" \
-        else (entry - TP1_ATR_MUL * TRAIL_PCT * entry)
-    sl = entry * (1 - TRAIL_PCT) if side == "LONG" else entry * (1 + TRAIL_PCT)
-
-    state["position"] = {
-        "side":    side,
-        "amount":  qty,
-        "entry":   entry,
-        "tp":      tp,
-        "sl":      sl,
-        "deposit": usdt,
-        "opened":  time.time(),
-    }
-    state["bars_since_close"] = 0
-    await broadcast(ctx,
-        f"🟢 <b>Открыта {side}</b> qty={qty} entry={entry:.2f}\n"
-        f"TP={tp:.2f}  SL={sl:.2f}")
-
-async def close_pos(reason: str, price: float, ctx):
-    p = state["position"]
-    if not p:
-        return
+async def close_pos(reason:str, price:float, ctx):
+    p = state['position']
+    if not p: return
     order = await exchange.create_market_order(
-        PAIR, "sell" if p["side"] == "LONG" else "buy",
-        p["amount"], params={"reduceOnly": True}
-    )
-    close_price = order["average"] or price
-    pnl = (close_price - p["entry"]) * p["amount"]
-    if p["side"] == "SHORT":
-        pnl = -pnl
-    days = max((time.time() - p["opened"]) / 86400, 1e-9)
-    apr  = (pnl / p["deposit"]) * (365 / days) * 100
+        PAIR, 'sell' if p['side']=='LONG' else 'buy', p['amount'],
+        params={"reduceOnly":True})
+    close_p = order["average"] or price
+    pnl = (close_p - p['entry']) * p['amount']
+    if p['side']=='SHORT': pnl = -pnl
+    days = max((time.time()-p['opened'])/86400,1e-9)
+    apr  = (pnl/p['deposit'])*(365/days)*100
+    await broadcast(ctx,f"🔴 Закрыта ({reason}) pnl={pnl:.2f} APR={apr:.1f}%")
+    state['position'] = None
+    state['bars_since_close'] = 0
 
-    await broadcast(ctx,
-        f"🔴 <b>Закрыта {reason}</b>  pnl={pnl:.2f}  APR={apr:.1f}%")
-
-    if WS:
-        rr = abs((p["tp"] - p["entry"]) / (p["entry"] - p["sl"]))
-        WS.append_row([
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            p["side"], p["deposit"], p["entry"], p["sl"], p["tp"],
-            round(rr, 2), round(pnl, 2), round(apr, 2)
-        ])
-    state["position"] = None
-    state["bars_since_close"] = 0
-
-# ─────────────────────────── Main loop monitor ──────────────────────────────
-async def monitor(ctx: ContextTypes.DEFAULT_TYPE):
-    log.info("monitor() loop started")
+# ─────────────────────────── Main monitor loop ──────────────────────────────
+async def monitor(ctx):
+    log.info("monitor started")
     while True:
-        if not state["monitor"]:
-            await asyncio.sleep(2)
-            continue
+        if not state['monitor']:
+            await asyncio.sleep(2); continue
         try:
-            ohlcv = await exchange.fetch_ohlcv(PAIR, timeframe="15m", limit=150)
-            df = pd.DataFrame(
-                ohlcv, columns=["ts","open","high","low","close","volume"]
-            )
+            ohlcv = await exchange.fetch_ohlcv(PAIR, '15m', limit=150)
+            df = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','volume'])
             df = calc_ssl_and_filters(df)
+            price = df['close'].iat[-1]
+            row   = df.iloc[-1]
 
-            if len(df) < 2:
-                await asyncio.sleep(30)
-                continue
-
-            row        = df.iloc[-1]
-            price      = row["close"]
-            price_prev = df["close"].iloc[-2]
-
-            ssl_sig = int(row["ssl_sig"])
-            atr     = row["atr"]
-            rsi     = row["rsi"]
-            vol_ok  = bool(row["vol_ok"])
-
-            # --- TP / SL hit? --------------------------------------------------
-            pos = state["position"]
+            # ------- TP / SL -------
+            pos = state['position']
             if pos:
-                hit_tp = price >= pos["tp"] if pos["side"] == "LONG" else price <= pos["tp"]
-                hit_sl = price <= pos["sl"] if pos["side"] == "LONG" else price >= pos["sl"]
-                if hit_tp:
-                    await close_pos("TP", price, ctx)
-                elif hit_sl:
-                    await close_pos("SL", price, ctx)
+                hit_tp = price >= pos['tp'] if pos['side']=='LONG' else price <= pos['tp']
+                hit_sl = price <= pos['sl'] if pos['side']=='LONG' else price >= pos['sl']
+                if hit_tp: await close_pos("TP", price, ctx)
+                elif hit_sl: await close_pos("SL", price, ctx)
 
-            # --- can open / flip ----------------------------------------------
-            can_reenter = state["bars_since_close"] >= WAIT_BARS
+            # ------- новая сделка? -------
+            ssl_sig = int(row['ssl_sig'])
+            if state['position'] is None and state['bars_since_close']>=WAIT_BARS:
+                if (ssl_sig== 1 and row['vol_ok'] and row['atr']/price>ATR_MIN_PCT
+                    and row['adx']>ADX_MIN and row['rsi']>RSI_LONG_T):
+                    # подтверждение цены
+                    if (USE_ATR_CONF and price >= df['close'].iat[-2] + PC_ATR_MUL*row['atr']) \
+                       or (not USE_ATR_CONF and price >= df['close'].iat[-2]*(1+PC_LONG_PERC)):
+                        await open_pos("LONG", price, ctx)
 
-            pc_long_ok = (
-                price >= price_prev + PC_ATR_MUL * atr
-                if USE_ATR_CONF else
-                price >= price_prev * (1 + PC_LONG_PERC)
-            )
-            pc_short_ok = (
-                price <= price_prev - PC_ATR_MUL * atr
-                if USE_ATR_CONF else
-                price <= price_prev * (1 - PC_SHORT_PERC)
-            )
+                elif (ssl_sig==-1 and row['vol_ok'] and row['atr']/price>ATR_MIN_PCT
+                      and row['adx']>ADX_MIN and row['rsi']<RSI_SHORT_T):
+                    if (USE_ATR_CONF and price <= df['close'].iat[-2] - PC_ATR_MUL*row['atr']) \
+                       or (not USE_ATR_CONF and price <= df['close'].iat[-2]*(1-PC_SHORT_PERC)):
+                        await open_pos("SHORT", price, ctx)
 
-            long_cond  = (
-                can_reenter and vol_ok and
-                ssl_sig ==  1 and pc_long_ok  and rsi > RSI_LONG_T
-            )
-            short_cond = (
-                can_reenter and vol_ok and
-                ssl_sig == -1 and pc_short_ok and rsi < RSI_SHORT_T
-            )
+            state['bars_since_close'] += 1
 
-            # --- execute -------------------------------------------------------
-            if long_cond:
-                if pos and pos["side"] == "SHORT":
-                    await close_pos("смена тренда", price, ctx)
-                if not state["position"]:
-                    await open_pos("LONG", price, ctx)
-
-            elif short_cond:
-                if pos and pos["side"] == "LONG":
-                    await close_pos("смена тренда", price, ctx)
-                if not state["position"]:
-                    await open_pos("SHORT", price, ctx)
-
-            state["bars_since_close"] += 1
-
-        except Exception as e:  # noqa
-            log.exception("monitor-loop error: %s", e)
-
+        except Exception as e:
+            log.exception("monitor error: %s", e)
         await asyncio.sleep(30)
 
-# ────────────────────── Graceful shutdown (OKX close) ───────────────────────
+# ─────────────────────────── Graceful shutdown ──────────────────────────────
 async def post_shutdown_hook(app: Application):
-    log.info("Shutting down → closing OKX client…")
+    log.info("closing OKX client…")
     await exchange.close()
 
-# ─────────────────────────── main()  asyncio  ───────────────────────────────
+# ─────────────────────────────── main() ─────────────────────────────────────
 async def main():
     defaults = Defaults(parse_mode="HTML")
     app = (
@@ -359,19 +291,21 @@ async def main():
         .build()
     )
     app.chat_ids = set(CHAT_IDS)
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("stop",     cmd_stop))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stop",  cmd_stop))
     app.add_handler(CommandHandler("leverage", cmd_leverage))
 
     async with app:
         await app.initialize()
+        await exchange.load_markets()       # bug-safe версию уже не нужно
         bal = await exchange.fetch_balance()
-        log.info("USDT balance: %s", bal["total"].get("USDT", "N/A"))
+        log.info("USDT balance: %s", bal["total"].get("USDT","N/A"))
+
         await app.start()
         await app.updater.start_polling()
         log.info("Bot polling started.")
         try:
-            await asyncio.Event().wait()     # run forever
+            await asyncio.Event().wait()    # run forever
         finally:
             await app.updater.stop()
             await app.stop()
