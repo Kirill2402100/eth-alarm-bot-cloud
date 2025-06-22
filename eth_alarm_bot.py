@@ -161,15 +161,25 @@ async def open_pos(side,price,ctx):
     state['bars_since_close']=0; state['alert12']=0
     await broadcast(ctx,f"🟢 Открыта {side} qty={qty} entry={entry:.2f}")
 
-async def close_pos(reason,price,ctx):
-    p=state['position'];   if not p: return
-    order=await exchange.create_market_order(PAIR,'sell' if p['side']=='LONG' else 'buy',
-                                             p['amount'],params={"reduceOnly":True})
-    close_p=order['average'] or price
-    pnl=(close_p-p['entry'])*p['amount']*(1 if p['side']=='LONG' else -1)
-    apr=(pnl/p['deposit'])*(365/max((time.time()-p['opened'])/86400,1e-9))*100
-    await broadcast(ctx,f"🔴 Закрыта ({reason}) pnl={pnl:.2f} APR={apr:.1f}%")
-    state.update(position=None,bars_since_close=0)
+async def close_pos(reason, price, ctx):
+    p = state['position']
+    if not p:
+        return
+
+    order = await exchange.create_market_order(
+        PAIR,
+        'sell' if p['side'] == 'LONG' else 'buy',
+        p['amount'],
+        params={"reduceOnly": True}
+    )
+    close_price = order['average'] or price
+    pnl = (close_price - p['entry']) * p['amount']
+    if p['side'] == 'SHORT':
+        pnl = -pnl
+    apr = (pnl / p['deposit']) * 365 / max((time.time() - p['opened']) / 86400, 1e-9) * 100
+
+    await broadcast(ctx, f"🔴 Закрыта ({reason}) pnl={pnl:.2f} APR={apr:.1f}%")
+    state.update(position=None, bars_since_close=0)
 
 # ──────────── Main monitor ───────────────────────────────────────────────────
 async def monitor(ctx):
