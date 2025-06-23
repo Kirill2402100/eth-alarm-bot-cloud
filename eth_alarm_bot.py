@@ -111,16 +111,18 @@ def calc_ind(df: pd.DataFrame):
     df['ssl_up'] = np.where(df['close'] > sma, hi, lo)
     df['ssl_dn'] = np.where(df['close'] > sma, lo, hi)
     
-    # --- SSL Signal ---
-    df['ssl_sig'] = 0
+    # --- SSL Signal (исправлено для pandas > 2.0) ---
     ssl_cross_up = (df['ssl_up'].shift(1) < df['ssl_dn'].shift(1)) & (df['ssl_up'] > df['ssl_dn'])
     ssl_cross_down = (df['ssl_up'].shift(1) > df['ssl_dn'].shift(1)) & (df['ssl_up'] < df['ssl_dn'])
-    df.loc[ssl_cross_up, 'ssl_sig'] = 1
-    df.loc[ssl_cross_down, 'ssl_sig'] = -1
     
-    # --- ИСПРАВЛЕНИЕ v2: Убираем FutureWarning о downcasting ---
-    df['ssl_sig'] = df['ssl_sig'].replace(0, pd.NA).ffill()
-    df['ssl_sig'] = df['ssl_sig'].fillna(0).astype(int) # Явно указываем тип данных
+    # Создаем временную серию, чтобы избежать модификации на месте
+    signal = pd.Series(np.nan, index=df.index)
+    signal.loc[ssl_cross_up] = 1
+    signal.loc[ssl_cross_down] = -1
+    
+    # Заполняем пропуски вперед и оставшиеся в начале нулями
+    signal = signal.ffill()
+    df['ssl_sig'] = signal.fillna(0).astype(int)
 
     # --- Other Indicators ---
     df['rsi'] = _ta_rsi(df['close'], RSI_LEN)
