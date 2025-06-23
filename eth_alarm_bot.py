@@ -100,8 +100,7 @@ def calc_ind(df):
         else: sig.append(sig[-1])
     df['ssl_sig']=sig
     df['rsi']=_rsi(df['close'],RSI_LEN)
-    df['atr']=df['close'].rolling(ATR_LEN).apply(
-        lambda x: pd.Series(x).max()-pd.Series(x).min(),raw=False)
+    df['atr'] = df['close'].rolling(ATR_LEN).max() - df['close'].rolling(ATR_LEN).min()    
     df['adx']=(df['high']-df['low']).ewm(span=ADX_LEN).mean()
     df['vol_ok']=(~USE_VOL_FILTER)|(
         df['volume']>df['volume'].rolling(VOL_LEN).mean()*VOL_MULT)
