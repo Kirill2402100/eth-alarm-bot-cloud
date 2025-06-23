@@ -118,10 +118,9 @@ def calc_ind(df: pd.DataFrame):
     df.loc[ssl_cross_up, 'ssl_sig'] = 1
     df.loc[ssl_cross_down, 'ssl_sig'] = -1
     
-    # --- ИСПРАВЛЕНИЕ: Убираем FutureWarning ---
-    # Заменяем 0 на NA (Not a Number) и затем применяем forward-fill
+    # --- ИСПРАВЛЕНИЕ v2: Убираем FutureWarning о downcasting ---
     df['ssl_sig'] = df['ssl_sig'].replace(0, pd.NA).ffill()
-    df['ssl_sig'] = df['ssl_sig'].fillna(0) # Заполняем оставшиеся NA в начале
+    df['ssl_sig'] = df['ssl_sig'].fillna(0).astype(int) # Явно указываем тип данных
 
     # --- Other Indicators ---
     df['rsi'] = _ta_rsi(df['close'], RSI_LEN)
