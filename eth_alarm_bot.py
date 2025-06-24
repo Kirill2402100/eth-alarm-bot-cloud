@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# eth_alarm_bot.py — Final Version (23-Jun-2025)
+# eth_alarm_bot.py — Final Version (24-Jun-2025)
 # Интегрирована стратегия v7 "Aggressive"
 # ============================================================================
 
@@ -115,12 +115,10 @@ def calc_ind(df: pd.DataFrame):
     ssl_cross_up = (df['ssl_up'].shift(1) < df['ssl_dn'].shift(1)) & (df['ssl_up'] > df['ssl_dn'])
     ssl_cross_down = (df['ssl_up'].shift(1) > df['ssl_dn'].shift(1)) & (df['ssl_up'] < df['ssl_dn'])
     
-    # Создаем временную серию, чтобы избежать модификации на месте
     signal = pd.Series(np.nan, index=df.index)
     signal.loc[ssl_cross_up] = 1
     signal.loc[ssl_cross_down] = -1
     
-    # Заполняем пропуски вперед и оставшиеся в начале нулями
     signal = signal.ffill()
     df['ssl_sig'] = signal.fillna(0).astype(int)
 
@@ -157,7 +155,7 @@ async def get_free_usdt():
 # ─────────────────────── open / close position ────────────────────────
 async def open_pos(side: str, price: float, atr: float, ctx):
     usdt = await get_free_usdt()
-    if usdt <= 1: # Минимальная проверка баланса
+    if usdt <= 1:
         await broadcast(ctx, "❗ Недостаточно средств для открытия позиции.")
         return
         
@@ -171,8 +169,10 @@ async def open_pos(side: str, price: float, atr: float, ctx):
         return
 
     await exchange.set_leverage(state['leverage'], PAIR)
-    params = {"tdMode": "isolated",
-              "posSide": "long" if side == "LONG" else "short"}
+    
+    # ИСПРАВЛЕНИЕ: Удален параметр "posSide", чтобы обеспечить совместимость
+    # с односторонним режимом (One-way mode), который используется по умолчанию.
+    params = {"tdMode": "isolated"}
 
     try:
         order = await exchange.create_market_order(
@@ -195,11 +195,11 @@ async def close_pos(reason: str, price: float, ctx):
     p = state['position']
     if not p: return
     
-    state['position'] = None # Немедленно сбрасываем состояние
+    state['position'] = None
     
-    params = {"tdMode": "isolated",
-              "posSide": "long" if p['side'] == "LONG" else "short",
-              "reduceOnly": True}
+    # ИСПРАВЛЕНИЕ: Удален параметр "posSide"
+    params = {"tdMode": "isolated", "reduceOnly": True}
+    
     try:
         order = await exchange.create_market_order(
             PAIR, 'sell' if p['side'] == "LONG" else 'buy', p['amount'], params=params)
@@ -279,7 +279,6 @@ async def monitor(ctx):
                 
                 if new_sl != pos['sl']:
                     pos['sl'] = new_sl
-                    # log.info(f"Трейлинг-стоп для {pos['side']} подвинут на {new_sl:.2f}")
 
                 # 3b. Проверка TP и SL
                 tp_price = pos['entry'] + (pos['atr_at_entry'] * TP_ATR_MUL) if pos['side'] == "LONG" else pos['entry'] - (pos['atr_at_entry'] * TP_ATR_MUL)
@@ -300,8 +299,11 @@ async def monitor(ctx):
                 # 4a. Сбор всех условий
                 sig = int(ind['ssl_sig'])
                 
-                # Общие фильтры
-                atr_ok = (atr / price) > ATR_MIN_PCT
+                if sig == 0: # Пропускаем итерацию, если сигнал не определен
+                    await asyncio.sleep(30)
+                    continue
+
+                atr_ok = (atr / price) > ATR_MIN_PCT if atr > 0 else False
                 vol_ok = ind['vol_ok']
                 
                 # Условия для LONG
