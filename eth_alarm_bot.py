@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ============================================================================
-# eth_alarm_bot.py — v13.4 "Simplified Trend" (25-Jun-2025)
-# • Упрощена логика фильтра по EMA согласно требованию.
+# eth_alarm_bot.py — v13.2 "Final Fix" (25-Jun-2025)
+# • Исправлен KeyError при поиске информации о торговой паре.
 # ============================================================================
 
 import os, asyncio, json, logging, math, time
@@ -144,7 +144,9 @@ async def open_pos(side, price, llm, td, ctx):
         await broadcast(ctx,"❗ Недостаточно средств."); state['position']=None; return
 
     try:
-        m = exchange.markets[PAIR]
+        # ---> ИСПРАВЛЕНИЕ: Используем exchange.market() вместо прямого доступа <---
+        m = exchange.market(PAIR)
+        
         contract_value = m.get('contractVal', 1)
         lot_size = m['limits']['amount']['min'] or 1
         position_size_usdt = (usdt_balance * 0.99) * state['leverage']
@@ -155,22 +157,17 @@ async def open_pos(side, price, llm, td, ctx):
             await broadcast(ctx,f"❗ Недостаточно средств для мин. лота ({lot_size})."); state['position']=None; return
 
         await exchange.set_leverage(state['leverage'], PAIR)
-        
-        # ---> ГЛАВНОЕ ИЗМЕНЕНИЕ ЗДЕСЬ <---
-        # Мы добавляем детальное логирование ошибки от биржи
-        order=await exchange.create_market_order(PAIR,'buy' if side=="LONG" else 'sell', num_contracts, params={"tdMode":"isolated"})
+        order = await exchange.create_market_order(PAIR,'buy' if side=="LONG" else 'sell', num_contracts, params={"tdMode":"isolated"})
         if not isinstance(order, dict) or 'average' not in order:
-            raise ValueError(f"Invalid order response from exchange: {order}")
+            raise ValueError(f"Invalid order response: {order}")
 
     except Exception as e:
-        # Этот блок теперь распечатает нам полную ошибку
         log.error("--- DETAILED ORDER REJECTION ERROR ---")
         log.error("EXCEPTION TYPE: %s", type(e))
         log.error("EXCEPTION DETAILS: %s", e)
         log.error("------------------------------------")
         await broadcast(ctx, f"❌ Биржа отклонила ордер. Детали в логе Railway.")
         state['position']=None; return
-    # ---> КОНЕЦ ИЗМЕНЕНИЙ <---
 
     entry=order.get('average',price)
     atr=td.get('atr')
@@ -181,7 +178,7 @@ async def open_pos(side, price, llm, td, ctx):
     state['position']=dict(side=side,amount=num_contracts,entry=entry,sl=sl,tp=tp,opened=time.time(),llm=llm,dep=usdt_balance)
     await broadcast(ctx, (f"✅ Открыта {side} qty={num_contracts:.4f}\n🔹Entry={entry:.2f}\n"
                           f"🔻SL={sl:.2f}  🔺TP={tp:.2f}"))
-    
+
 async def close_pos(reason, price, ctx):
     p=state.pop('position',None); 
     if not p: return
@@ -202,7 +199,7 @@ async def close_pos(reason, price, ctx):
 # ────────── Telegram cmd ──────────
 async def cmd_start(u,ctx):
     ctx.application.chat_ids.add(u.effective_chat.id); state["monitor"]=True
-    await u.message.reply_text("✅ Monitoring ON (v13.4 Simplified Trend)")
+    await u.message.reply_text("✅ Monitoring ON (v13.2 Final Fix)")
     if not ctx.chat_data.get("task"): ctx.chat_data["task"]=asyncio.create_task(monitor(ctx))
 async def cmd_stop(u,ctx): state["monitor"]=False; await u.message.reply_text("⛔ Monitoring OFF")
 async def cmd_lev(u,ctx):
@@ -233,12 +230,8 @@ async def monitor(ctx):
 
             if not state.get('position'):
                 sig=int(ind['ssl_sig'])
-                
-                # ---> ИЗМЕНЕННАЯ ЛОГИКА ФИЛЬТРА EMA <---
-                longCond = sig==1  and (ind['close'] > ind['ema_fast'] and ind['close'] > ind['ema_slow']) and ind['rsi']>RSI_LONGT
-                shortCond= sig==-1 and (ind['close'] < ind['ema_fast'] and ind['close'] < ind['ema_slow']) and ind['rsi']<RSI_SHORTT
-                # ---> КОНЕЦ ИЗМЕНЕНИЙ <---
-
+                longCond = sig==1  and ind['close']>ind['ema_fast']>ind['ema_slow'] and ind['rsi']>RSI_LONGT
+                shortCond= sig==-1 and ind['close']<ind['ema_fast']<ind['ema_slow'] and ind['rsi']<RSI_SHORTT
                 side="LONG" if longCond else "SHORT" if shortCond else None
                 if not side: continue
                 
@@ -249,7 +242,8 @@ async def monitor(ctx):
                 recent_low = df['low'].tail(lookback).min()
 
                 td={"asset":PAIR,"tf":"15m","signal":side,"price":ind['close'],
-                    "atr":round(ind['atr'], 4),"rsi":round(ind['rsi'],1),
+                    "atr":round(ind['atr'], 4) if not pd.isna(ind['atr']) else 0,
+                    "rsi":round(ind['rsi'],1),
                     "market_structure": {
                         "recent_high": round(recent_high, 2),
                         "recent_low": round(recent_low, 2)
