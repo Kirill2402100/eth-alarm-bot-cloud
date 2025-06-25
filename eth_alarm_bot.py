@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 # ============================================================================
-# eth_alarm_bot.py — v12.4  (25-Jun-2025)
-# • Устойчивый ask_llm(): ловит любой «пустой» / не-JSON ответ и не падает
-# • Логирует «сырой» ответ LLM (Railway logs) при ошибке разбора
-# • Сообщения LLM на русском
-# • Проверка qty ≥ minAmount
+# eth_alarm_bot.py — v12.5 (25-Jun-2025)
+# • Исправлен AttributeError при расчете ATR.
 # ============================================================================
 
 import os, asyncio, json, logging, math, time
@@ -23,7 +20,7 @@ CHAT_IDS    = {int(c) for c in os.getenv("CHAT_IDS", "0").split(",") if c}
 PAIR_RAW    = os.getenv("PAIR", "BTC-USDT-SWAP")
 INIT_LEV    = int(os.getenv("LEVERAGE", 4))
 
-LLM_API_KEY  = os.getenv("LLM_API_KEY")          # ← обязателен
+LLM_API_KEY  = os.getenv("LLM_API_KEY")       # ← обязателен
 LLM_API_URL  = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
 LLM_THRESHOLD= float(os.getenv("LLM_CONFIDENCE_THRESHOLD", 7.0))
 
@@ -68,6 +65,7 @@ def _ta_rsi(series:pd.Series, length=14):
     loss=(-delta.clip(upper=0)).rolling(length).mean().replace(0,np.nan)
     rs=gain/ loss ; rsi=100-100/(1+rs); return rsi.fillna(50)
 
+# ---> ИСПРАВЛЕННАЯ ФУНКЦИЯ <---
 def calc_ind(df:pd.DataFrame):
     df['ema_fast']=df['close'].ewm(span=20, adjust=False).mean()
     df['ema_slow']=df['close'].ewm(span=50, adjust=False).mean()
@@ -81,11 +79,14 @@ def calc_ind(df:pd.DataFrame):
     sig.loc[cross_up]=1 ; sig.loc[cross_dn]=-1
     df['ssl_sig']=sig.ffill().fillna(0).astype(int)
     df['rsi']=_ta_rsi(df['close'], RSI_LEN)
-    atr=np.maximum.reduce([
-        df['high']-df['low'],
-        (df['high']-df['close'].shift()).abs(),
-        (df['low'] -df['close'].shift()).abs() ])
-    df['atr']=atr.rolling(14).mean()
+    
+    # Расчет ATR через Pandas
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['atr'] = true_range.rolling(14).mean()
+    
     return df
 
 # ────────── глобальное состояние ──────────
@@ -164,7 +165,7 @@ async def close_pos(reason, price, ctx):
 # ────────── Telegram cmd ──────────
 async def cmd_start(u,ctx):
     ctx.application.chat_ids.add(u.effective_chat.id); state["monitor"]=True
-    await u.message.reply_text("✅ Monitoring ON (v12.4)")
+    await u.message.reply_text("✅ Monitoring ON (v12.5)")
     if not ctx.chat_data.get("task"): ctx.chat_data["task"]=asyncio.create_task(monitor(ctx))
 async def cmd_stop(u,ctx): state["monitor"]=False; await u.message.reply_text("⛔ Monitoring OFF")
 async def cmd_lev(u,ctx):
