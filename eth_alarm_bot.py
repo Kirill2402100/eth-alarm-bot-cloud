@@ -159,11 +159,9 @@ async def get_llm_decision(trade_data: dict, ctx):
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "gpt-4.1" # Или другая модель, например gpt-3.5-turbo
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"} # Важно для получения JSON
-    }
-
+    "model": "gpt-4.1", # Убедитесь, что здесь ID вашей модели
+    "messages": [{"role": "user", "content": prompt}]
+}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(LLM_API_URL, headers=headers, json=payload, timeout=30) as response:
