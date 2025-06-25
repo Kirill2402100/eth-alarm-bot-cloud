@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ============================================================================
-# eth_alarm_bot.py — v12 "Stabilized-AI" (25-Jun-2025)
-# Исправлены все ошибки: управление состоянием, повторная отправка, логика цикла.
+# eth_alarm_bot.py — v12.1 "Hotfix" (25-Jun-2025)
+# Исправлен критический TypeError в функции open_pos.
 # ============================================================================
 
 import os
@@ -39,7 +39,7 @@ log = logging.getLogger("bot")
 for noisy in ("httpx", "telegram.vendor.httpx", "aiohttp.access"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
-# ───────────────────────── Google Sheets (без изменений) ────────────────
+# ───────────────────────── Google Sheets ────────────────
 _GS_SCOPE = ["https://spreadsheets.google.com/feeds",
              "https://www.googleapis.com/auth/drive"]
 if os.getenv("GOOGLE_CREDENTIALS"):
@@ -60,7 +60,7 @@ WS = _ws("AI-V12")
 if WS and WS.row_values(1) != HEADERS:
     WS.clear(); WS.append_row(HEADERS)
 
-# ──────────────────────────── OKX (без изменений) ──────────────────────
+# ──────────────────────────── OKX ──────────────────────
 exchange = ccxt.okx({
     "apiKey": os.getenv("OKX_API_KEY"),
     "secret": os.getenv("OKX_SECRET"),
@@ -77,13 +77,13 @@ RSI_LEN = 14
 RSI_LONGT = 52
 RSI_SHORTT = 48
 
-# ─────────────────────────── indicators (без изменений) ──────────────────
+# ─────────────────────────── indicators ──────────────────
 def _ta_rsi(series: pd.Series, length=14):
     delta = series.diff()
     gain = delta.clip(lower=0).rolling(window=length, min_periods=length).mean()
     loss = (-delta.clip(upper=0)).rolling(window=length, min_periods=length).mean()
     if loss.empty or loss.iloc[-1] == 0: return 100
-    rs = gain / loss
+    rs = gain.iloc[-1] / loss.iloc[-1] if loss.iloc[-1] != 0 else float('inf')
     return 100 - (100 / (1 + rs))
 
 def calc_atr(df: pd.DataFrame, length=14):
@@ -107,8 +107,7 @@ def calc_ind(df: pd.DataFrame):
     signal = pd.Series(np.nan, index=df.index)
     signal.loc[ssl_cross_up] = 1
     signal.loc[ssl_cross_down] = -1
-    signal = signal.ffill()
-    df['ssl_sig'] = signal.fillna(0).astype(int)
+    df['ssl_sig'] = signal.ffill().fillna(0).astype(int)
     df['rsi'] = _ta_rsi(df['close'], RSI_LEN)
     df['atr'] = calc_atr(df, 14)
     return df
@@ -116,7 +115,7 @@ def calc_ind(df: pd.DataFrame):
 # ─────────────────────────── state ─────────────────────
 state = { "monitor": False, "leverage": INIT_LEV, "position": None, "last_ts": 0 }
 
-# ───────────────────────── helpers / telegram (без изменений) ──────────
+# ───────────────────────── helpers / telegram ──────────
 async def broadcast(ctx, txt):
     for cid in ctx.application.chat_ids:
         try: await ctx.application.bot.send_message(cid, txt)
@@ -131,7 +130,7 @@ async def get_free_usdt():
         log.error("Could not fetch balance: %s", e)
         return 0
 
-# ───────────────────────── LLM Analyser (без изменений) ─────────────────
+# ───────────────────────── LLM Analyser ─────────────────
 LLM_PROMPT_TEMPLATE = """
 Ты — профессиональный трейдер-аналитик по имени 'Сигма'. Твоя задача — проанализировать предоставленный торговый сетап в формате JSON и вернуть свой вердикт СТРОГО в формате JSON. Не добавляй никаких лишних слов или объяснений вне JSON.
 Твои правила анализа:
@@ -170,30 +169,29 @@ async def get_llm_decision(trade_data: dict, ctx):
         return None
 
 # ─────────────────── open / close position (ИСПРАВЛЕНЫ) ───────────────────
+# ИСПРАВЛЕНИЕ 1: Добавлен trade_data в аргументы функции
 async def open_pos(side: str, price: float, llm_decision: dict, trade_data: dict, ctx):
     usdt = await get_free_usdt()
     if usdt <= 1:
-        await broadcast(ctx, "❗ Недостаточно средств.")
-        state['position'] = None
-        return
+        await broadcast(ctx, "❗ Недостаточно средств."); state['position'] = None; return
     m = exchange.market(PAIR)
     step = m['precision']['amount'] or 0.0001
     qty = math.floor((usdt * state['leverage'] / price) / step) * step
     if qty < (m['limits']['amount']['min'] or step):
-        await broadcast(ctx, f"❗ Недостаточно средств: qty={qty} (min={m['limits']['amount']['min']})")
-        state['position'] = None
-        return
+        await broadcast(ctx, f"❗ Недостаточно средств: qty={qty} (min={m['limits']['amount']['min']})"); state['position'] = None; return
     await exchange.set_leverage(state['leverage'], PAIR)
     params = {"tdMode": "isolated"}
     try:
         order = await exchange.create_market_order(PAIR, 'buy' if side == "LONG" else 'sell', qty, params=params)
     except Exception as e:
-        await broadcast(ctx, f"❌ Ошибка открытия позиции: {e}")
-        state['position'] = None; return
+        await broadcast(ctx, f"❌ Ошибка открытия позиции: {e}"); state['position'] = None; return
     entry = order.get('average', price)
+    
+    # ИСПРАВЛЕНИЕ 3: ATR теперь безопасно берется из переданного trade_data
     atr = trade_data.get('volatility_atr', 0)
     sl = llm_decision.get('suggested_sl', entry - (atr * 1.5) if side == "LONG" else entry + (atr * 1.5))
     tp = llm_decision.get('suggested_tp', entry + (atr * 3.0) if side == "LONG" else entry - (atr * 3.0))
+
     state['position'] = dict(side=side, amount=qty, entry=entry, sl=sl, tp=tp, deposit=usdt, opened=time.time(), llm_decision=llm_decision)
     await broadcast(ctx, f"✅ Открыта {side} | Qty: {qty:.5f} | Entry: {entry:.2f}\nSL: {sl:.2f} | TP: {tp:.2f}")
 
@@ -218,10 +216,10 @@ async def close_pos(reason: str, price: float, ctx):
             WS.append_row([datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), p['side'], p['deposit'], p['entry'], p['sl'], p['tp'], rr, pnl, round(apr, 2), llm_decision_text, llm_confidence])
         except Exception as e: log.error("Failed to write to Google Sheets: %s", e)
 
-# ─────────────────── telegram commands (без изменений) ───────────────────
+# ─────────────────── telegram commands ───────────────────
 async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(u.effective_chat.id); state["monitor"] = True
-    await u.message.reply_text("✅ Monitoring ON (Strategy v12 Stabilized-AI)")
+    await u.message.reply_text("✅ Monitoring ON (Strategy v12.1 Hotfix)")
     if not ctx.chat_data.get("task"): ctx.chat_data["task"] = asyncio.create_task(monitor(ctx))
 async def cmd_stop(u: Update, ctx): state["monitor"] = False; await u.message.reply_text("⛔ Monitoring OFF")
 async def cmd_lev(u: Update, ctx):
@@ -232,33 +230,30 @@ async def cmd_lev(u: Update, ctx):
 # |                       ГЛАВНЫЙ ЦИКЛ МОНИТОРИНГА (ИСПРАВЛЕН)             |
 # ============================================================================
 async def monitor(ctx):
-    log.info("Monitor started with Strategy v12")
+    log.info("Monitor started with Strategy v12.1")
     while True:
-        await asyncio.sleep(30) # Спим в начале цикла
+        await asyncio.sleep(30)
         if not state["monitor"]: continue
         try:
             ohlcv_15m = await exchange.fetch_ohlcv(PAIR, '15m', limit=50)
             df_15m = pd.DataFrame(ohlcv_15m, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
             
-            # --- ПРОВЕРКА, НОВАЯ ЛИ СВЕЧА ---
             current_ts = df_15m.iloc[-1]['ts']
-            if current_ts == state.get("last_ts"): continue # Если свеча та же, пропускаем итерацию
-            state["last_ts"] = current_ts # Обновляем время последней обработанной свечи
+            if current_ts == state.get("last_ts"): continue
+            state["last_ts"] = current_ts
             
             log.info("New 15m candle detected (TS: %s). Analyzing...", current_ts)
             df_15m = calc_ind(df_15m)
-            price = df_15m.iloc[-1]['close']
             
-            # --- 1. ПРОВЕРКА ОТКРЫТОЙ ПОЗИЦИИ ---
             pos = state.get("position")
             if pos and pos.get('side'):
+                price = df_15m.iloc[-1]['close']
                 hit_tp = price >= pos['tp'] if pos['side'] == "LONG" else price <= pos['tp']
                 hit_sl = price <= pos['sl'] if pos['side'] == "LONG" else price >= pos['sl']
                 if hit_tp: await close_pos("TP", price, ctx)
                 elif hit_sl: await close_pos("SL", price, ctx)
-                continue # Если есть позиция, новую не ищем
+                continue
 
-            # --- 2. ПОИСК НОВОГО СИГНАЛА ---
             if state.get("position") is None:
                 ind = df_15m.iloc[-1]
                 sig = int(ind['ssl_sig'])
@@ -275,14 +270,15 @@ async def monitor(ctx):
                     log.info("Base %s signal detected. Querying LLM...", side_to_check)
                     await broadcast(ctx, f"🔍 Найден базовый сигнал {side_to_check}. Отправляю на анализ в LLM...")
                     
-                    trade_data = {"asset": PAIR, "timeframe": "15m", "signal_type": side_to_check, "current_price": price, "indicators": {"rsi_value": round(ind['rsi'], 2), "ema_fast_value": round(ind['ema_fast'], 2), "ema_slow_value": round(ind['ema_slow'], 2), "ssl_signal": "Crossover Up" if side_to_check == "LONG" else "Crossover Down"}, "volatility_atr": round(ind['atr'], 4)}
+                    trade_data = {"asset": PAIR, "timeframe": "15m", "signal_type": side_to_check, "current_price": ind['close'], "indicators": {"rsi_value": round(ind['rsi'], 2), "ema_fast_value": round(ind['ema_fast'], 2), "ema_slow_value": round(ind['ema_slow'], 2), "ssl_signal": "Crossover Up" if side_to_check == "LONG" else "Crossover Down"}, "volatility_atr": round(ind['atr'], 4)}
                     
                     state['position'] = {"opening": True}
                     llm_decision = await get_llm_decision(trade_data, ctx)
 
                     if llm_decision and llm_decision.get('decision') == 'APPROVE' and llm_decision.get('confidence_score', 0) >= LLM_CONFIDENCE_THRESHOLD:
                         log.info("LLM approved trade. Opening %s position.", side_to_check)
-                        await open_pos(side_to_check, price, llm_decision, trade_data, ctx)
+                        # ИСПРАВЛЕНИЕ 2: Передаем trade_data в функцию open_pos
+                        await open_pos(side_to_check, ind['close'], llm_decision, trade_data, ctx)
                     else:
                         log.info("LLM rejected trade or confidence too low.")
                         await broadcast(ctx, "🤖 LLM отклонил сигнал.")
@@ -293,7 +289,7 @@ async def monitor(ctx):
             log.exception("Unhandled error in monitor loop: %s", e)
             state['position'] = None
         
-# ─────────────────── entry-point (без изменений) ──────────────────────
+# ─────────────────── entry-point ──────────────────────
 async def shutdown_hook(app): log.info("Shutting down..."); await exchange.close()
 async def main():
     app = (ApplicationBuilder().token(BOT_TOKEN).defaults(Defaults(parse_mode="HTML")).post_shutdown(shutdown_hook).build())
