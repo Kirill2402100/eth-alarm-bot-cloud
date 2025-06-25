@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 # ============================================================================
-# eth_alarm_bot.py — v12.6 (25-Jun-2025)
-# • Модель LLM вынесена в переменные окружения.
-# • Исправлен парсинг ответа LLM с Markdown.
-# • Исправлен AttributeError при расчете ATR.
+# eth_alarm_bot.py — v12.7 "Resilient" (25-Jun-2025)
+# • Добавлена обработка ошибок при создании ордера для предотвращения падений.
 # ============================================================================
 
 import os, asyncio, json, logging, math, time
@@ -24,7 +22,7 @@ INIT_LEV    = int(os.getenv("LEVERAGE", 4))
 
 LLM_API_KEY  = os.getenv("LLM_API_KEY")
 LLM_API_URL  = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
-LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "gpt-4.1") # <-- НОВАЯ ПЕРЕМЕННАЯ
+LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "gpt-4.1")
 LLM_THRESHOLD= float(os.getenv("LLM_CONFIDENCE_THRESHOLD", 7.0))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -111,7 +109,6 @@ LLM_PROMPT = (
 
 async def ask_llm(trade_data, ctx):
     if not LLM_API_KEY: return None
-    # ИСПОЛЬЗУЕМ ПЕРЕМЕННУЮ ВМЕСТО ЖЕСТКО ЗАДАННОЙ МОДЕЛИ
     payload={"model":LLM_MODEL_ID,"messages":[{"role":"user","content":LLM_PROMPT.format(trade=json.dumps(trade_data,ensure_ascii=False))}],"temperature":0.2}
     headers={"Authorization":f"Bearer {LLM_API_KEY}","Content-Type":"application/json"}
     try:
@@ -145,11 +142,27 @@ async def ask_llm(trade_data, ctx):
 async def open_pos(side, price, llm, td, ctx):
     atr=td.get('atr', 0); usdt=await free_usdt()
     m=exchange.market(PAIR); step=m['precision']['amount'] or 0.0001
-    qty=math.floor((usdt*state['leverage']/price)/step)*step
+    # Рассчитываем желаемое количество, используя 99% баланса для безопасности
+    qty=math.floor(((usdt * 0.99) * state['leverage']/price)/step)*step
+
     if qty < (m['limits']['amount']['min'] or step):
-        await broadcast(ctx,"❗ Недостаточно средств."); state['position']=None; return
+        await broadcast(ctx,f"❗ Недостаточно средств для мин. лота ({m['limits']['amount']['min']}). Нужно {price * m['limits']['amount']['min'] / state['leverage']:.2f} USDT."); state['position']=None; return
+    
     await exchange.set_leverage(state['leverage'], PAIR)
-    order=await exchange.create_market_order(PAIR,'buy' if side=="LONG" else 'sell',qty,params={"tdMode":"isolated"})
+    
+    # ---> ИСПРАВЛЕНИЕ: Оборачиваем создание ордера в try...except <---
+    try:
+        order=await exchange.create_market_order(PAIR,'buy' if side=="LONG" else 'sell',qty,params={"tdMode":"isolated"})
+        if not isinstance(order, dict) or 'average' not in order:
+            log.error("Exchange returned invalid order object: %s", order)
+            await broadcast(ctx, "⚠️ Биржа вернула некорректный ответ на ордер. Позиция могла не открыться.")
+            state['position']=None; return
+    except Exception as e:
+        log.error("Failed to create order: %s", e)
+        await broadcast(ctx, f"❌ Биржа отклонила ордер: {e}")
+        state['position']=None; return
+    # ---> КОНЕЦ ИСПРАВЛЕНИЯ <---
+
     entry=order.get('average',price)
     sl=llm.get('suggested_sl', entry-atr*1.5 if side=="LONG" else entry+atr*1.5)
     tp=llm.get('suggested_tp', entry+atr*3.0 if side=="LONG" else entry-atr*3.0)
@@ -160,8 +173,14 @@ async def open_pos(side, price, llm, td, ctx):
 async def close_pos(reason, price, ctx):
     p=state.pop('position',None); 
     if not p: return
-    order=await exchange.create_market_order(PAIR,'sell' if p['side']=="LONG" else 'buy',p['amount'],params={"tdMode":"isolated","reduceOnly":True})
-    close_price=order.get('average',price)
+    try:
+        order=await exchange.create_market_order(PAIR,'sell' if p['side']=="LONG" else 'buy',p['amount'],params={"tdMode":"isolated","reduceOnly":True})
+        close_price=order.get('average',price)
+    except Exception as e:
+        log.error("Failed to close position: %s", e)
+        await broadcast(ctx, f"❌ Ошибка закрытия позиции: {e}. Пожалуйста, проверьте биржу.")
+        close_price = price # Используем последнюю известную цену для расчета P&L
+        
     pnl=(close_price-p['entry'])*p['amount']*(1 if p['side']=="LONG" else -1)
     days=max((time.time()-p['opened'])/86400,1e-9); apr=pnl/p['dep']*(365/days)*100
     await broadcast(ctx,f"⛔ Закрыта ({reason}) P&L={pnl:.2f}$ APR={apr:.1f}%")
@@ -172,7 +191,7 @@ async def close_pos(reason, price, ctx):
 # ────────── Telegram cmd ──────────
 async def cmd_start(u,ctx):
     ctx.application.chat_ids.add(u.effective_chat.id); state["monitor"]=True
-    await u.message.reply_text("✅ Monitoring ON (v12.6)")
+    await u.message.reply_text("✅ Monitoring ON (v12.7 Resilient)")
     if not ctx.chat_data.get("task"): ctx.chat_data["task"]=asyncio.create_task(monitor(ctx))
 async def cmd_stop(u,ctx): state["monitor"]=False; await u.message.reply_text("⛔ Monitoring OFF")
 async def cmd_lev(u,ctx):
@@ -188,13 +207,13 @@ async def monitor(ctx):
         try:
             ohl=await exchange.fetch_ohlcv(PAIR,'15m',limit=50)
             df=pd.DataFrame(ohl,columns=['ts','open','high','low','close','volume'])
-            if df.iloc[-1]['ts']==state['last_ts']: continue
+            if df.iloc[-1]['ts']==state.get('last_ts', 0): continue
             state['last_ts']=int(df.iloc[-1]['ts'])
             df=calc_ind(df); ind=df.iloc[-1]
 
             # выход
             p=state.get('position')
-            if p:
+            if p and p.get('side'):
                 price=ind['close']
                 if (p['side']=="LONG" and price>=p['tp']) or (p['side']=="SHORT" and price<=p['tp']):
                     await close_pos("TP",price,ctx)
@@ -203,20 +222,21 @@ async def monitor(ctx):
                 continue
 
             # вход
-            sig=int(ind['ssl_sig'])
-            longCond = sig==1  and ind['close']>ind['ema_fast']>ind['ema_slow'] and ind['rsi']>RSI_LONGT
-            shortCond= sig==-1 and ind['close']<ind['ema_fast']<ind['ema_slow'] and ind['rsi']<RSI_SHORTT
-            side="LONG" if longCond else "SHORT" if shortCond else None
-            if not side: continue
-            await broadcast(ctx,f"🔍 Базовый сигнал {side}. Анализ LLM…")
-            td={"asset":PAIR,"tf":"15m","signal":side,"price":ind['close'],
-                "atr":ind['atr'],"rsi":round(ind['rsi'],1),"ema_fast":round(ind['ema_fast'],2),"ema_slow":round(ind['ema_slow'],2)}
-            state['position']={"opening":True}
-            llm=await ask_llm(td,ctx)
-            if llm and llm.get("decision")=="APPROVE" and llm.get("confidence_score",0)>=LLM_THRESHOLD:
-                await open_pos(side, ind['close'], llm, td, ctx)
-            else:
-                await broadcast(ctx,"🟦 LLM отклонил сигнал."); state['position']=None
+            if not state.get('position'):
+                sig=int(ind['ssl_sig'])
+                longCond = sig==1  and ind['close']>ind['ema_fast']>ind['ema_slow'] and ind['rsi']>RSI_LONGT
+                shortCond= sig==-1 and ind['close']<ind['ema_fast']<ind['ema_slow'] and ind['rsi']<RSI_SHORTT
+                side="LONG" if longCond else "SHORT" if shortCond else None
+                if not side: continue
+                await broadcast(ctx,f"🔍 Базовый сигнал {side}. Анализ LLM…")
+                td={"asset":PAIR,"tf":"15m","signal":side,"price":ind['close'],
+                    "atr":ind['atr'],"rsi":round(ind['rsi'],1),"ema_fast":round(ind['ema_fast'],2),"ema_slow":round(ind['ema_slow'],2)}
+                state['position']={"opening":True}
+                llm=await ask_llm(td,ctx)
+                if llm and llm.get("decision")=="APPROVE" and llm.get("confidence_score",0)>=LLM_THRESHOLD:
+                    await open_pos(side, ind['close'], llm, td, ctx)
+                else:
+                    await broadcast(ctx,"🟦 LLM отклонил сигнал."); state['position']=None
         except Exception as e:
             log.exception("loop err: %s", e); state['position']=None
 
