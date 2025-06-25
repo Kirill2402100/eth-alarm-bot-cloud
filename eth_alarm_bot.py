@@ -1,7 +1,39 @@
 #!/usr/bin/env python3
 # ============================================================================
-# eth_alarm_bot.py — v14.0 "The Citadel" (25-Jun-2025)
-# • Финальная стабильная версия со всеми исправлениями и улучшениями.
+# eth_alarm_bot.py — v15.1 "Smarter Prompt" (25-Jun-2025)
+# • Улучшен промпт для LLM с требованием по R:R.
+# ============================================================================
+
+import os, asyncio, json, logging, math, time
+from datetime import datetime
+
+import aiohttp, numpy as np, pandas as pd
+import ccxt.async_support as ccxt
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, Defaults, ContextTypes
+
+# ... (весь остальной код остается без изменений) ...
+
+# ────────── LLM ──────────
+LLM_PROMPT = (
+"Ты — трейдер-аналитик 'Сигма'. Дай ответ ТОЛЬКО JSON c полями "
+"decision (APPROVE / REJECT), confidence_score (0–10), reasoning (RU), "
+"suggested_tp, suggested_sl. "
+"Правила для анализа: "
+"1. Для LONG SL должен быть ниже recent_low, а TP - ниже recent_high. "
+"2. Для SHORT SL должен быть выше recent_high, а TP - выше recent_low. "
+"3. Соотношение Риск/Прибыль для предложенных уровней должно быть не менее 1:2 (прибыль в два раза больше риска). "
+"Проанализируй Trade:\n{trade}")
+
+# ... (весь остальной код до конца остается без изменений) ...
+
+# Полный код для v15.1
+#!/usr/bin/env python3
+# ============================================================================
+# eth_alarm_bot.py — v15.1 "Smarter Prompt" (25-Jun-2025)
+# • Улучшен промпт для LLM с требованием по R:R.
 # ============================================================================
 
 import os, asyncio, json, logging, math, time
@@ -45,7 +77,7 @@ def _ws(title:str):
     except gspread.WorksheetNotFound: return ss.add_worksheet(title, rows=1000, cols=20)
 
 HEADERS = ["DATE-UTC","SIDE","DEPOSIT","ENTRY","SL","TP","RR","P&L","APR%","LLM","CONF","EXIT_METHOD"]
-WS = _ws("AI-V14")
+WS = _ws("AI-V15")
 if WS and WS.row_values(1)!=HEADERS: WS.clear(); WS.append_row(HEADERS)
 
 # ────────── биржа OKX (swap, isolated) ──────────
@@ -109,8 +141,12 @@ LLM_PROMPT = (
 "Ты — трейдер-аналитик 'Сигма'. Дай ответ ТОЛЬКО JSON c полями "
 "decision (APPROVE / REJECT), confidence_score (0–10), reasoning (RU), "
 "suggested_tp, suggested_sl. "
-"Правила для TP/SL: Для LONG SL должен быть ниже recent_low, а TP - ниже recent_high. Для SHORT наоборот. "
-"Анализируй Trade:\n{trade}")
+"Правила для анализа: "
+"1. Для LONG SL должен быть ниже recent_low, а TP - ниже recent_high. "
+"2. Для SHORT SL должен быть выше recent_high, а TP - выше recent_low. "
+"3. Соотношение Риск/Прибыль для предложенных уровней должно быть не менее 1:2 (прибыль в два раза больше риска). "
+"Проанализируй Trade:\n{trade}")
+
 
 async def ask_llm(trade_data, ctx):
     if not LLM_API_KEY: return None
@@ -160,11 +196,12 @@ async def open_pos(side, price, llm, td, ctx):
             raise ValueError(f"Invalid order response: {order}")
 
     except Exception as e:
-        log.error("--- DETAILED ORDER REJECTION ERROR ---")
-        log.error("EXCEPTION TYPE: %s", type(e)); log.error("EXCEPTION DETAILS: %s", e)
-        await broadcast(ctx, f"❌ Биржа отклонила ордер. Детали в логе Railway."); state['position']=None; return
+        log.error("Failed to create order: %s", e)
+        await broadcast(ctx, f"❌ Биржа отклонила ордер: {e}"); state['position']=None; return
 
     entry=order.get('average') or order.get('price') or price
+    real_amount = order.get('filled', num_contracts)
+    
     atr=td.get('atr')
     if atr is None: await broadcast(ctx,"⚠️ Не удалось рассчитать ATR. Отмена сделки."); state['position']=None; return
 
@@ -172,19 +209,38 @@ async def open_pos(side, price, llm, td, ctx):
     sl = llm.get('suggested_sl')
     tp = llm.get('suggested_tp')
 
-    if not (sl and tp):
+    if not (sl and tp and (abs(tp - entry) > abs(entry - sl) * (rrRatio - 0.1))): # rrRatio - 0.1 to avoid float precision issues
         exit_method = "(Уровни по ATR)"
+        if sl and tp:
+             await broadcast(ctx, "⚠️ LLM предложил нелогичный R:R. Использую запасной расчет по ATR.")
         sl = entry - atr * 1.5 if side == "LONG" else entry + atr * 1.5
-        tp = entry + atr * 2.0 if side == "LONG" else entry - atr * 2.0
+        tp = entry + atr * 3.0 if side == "LONG" else entry - atr * 3.0
 
-    state['position']=dict(side=side,amount=num_contracts,entry=entry,sl=sl,tp=tp,opened=time.time(),llm=llm,dep=usdt_balance,exit_method=exit_method)
-    await broadcast(ctx, (f"✅ Открыта {side} qty={num_contracts:.4f}\n🔹Entry={entry:.2f}\n"
+    state['position']=dict(side=side,amount=real_amount,entry=entry,sl=sl,tp=tp,opened=time.time(),llm=llm,dep=usdt_balance,exit_method=exit_method)
+    
+    sl_params = {'tdMode': 'isolated', 'reduceOnly': True}
+    tp_params = {'tdMode': 'isolated', 'reduceOnly': True}
+    try:
+        # Установка Stop Loss ордера
+        await exchange.create_order(PAIR, 'market', 'sell' if side == "LONG" else 'buy', real_amount, None, {'stopLoss': {'triggerPrice': sl}, **sl_params})
+        # Установка Take Profit ордера
+        await exchange.create_order(PAIR, 'limit', 'sell' if side == "LONG" else 'buy', real_amount, tp, {'takeProfit': {'triggerPrice': tp}, **tp_params})
+    except Exception as e:
+        log.error("Failed to set SL/TP orders: %s", e)
+        await broadcast(ctx, "⚠️ Не удалось выставить SL/TP на бирже. Закройте позицию вручную!")
+
+    await broadcast(ctx, (f"✅ Открыта {side} qty={real_amount:.4f}\n🔹Entry={entry:.2f}\n"
                           f"🔻SL={sl:.2f}  🔺TP={tp:.2f}\n"
                           f"<i>{exit_method}</i>"))
 
 async def close_pos(reason, price, ctx):
     p=state.pop('position',None); 
     if not p: return
+    try:
+        await exchange.cancel_all_orders(PAIR)
+    except Exception as e:
+        log.warning("Could not cancel all orders, may fail to close: %s", e)
+    
     try:
         order=await exchange.create_market_order(PAIR,'sell' if p['side']=="LONG" else 'buy',p['amount'],params={"tdMode":"isolated","reduceOnly":True})
         close_price=order.get('average',price)
@@ -202,7 +258,7 @@ async def close_pos(reason, price, ctx):
 # ────────── Telegram cmd ──────────
 async def cmd_start(u,ctx):
     ctx.application.chat_ids.add(u.effective_chat.id); state["monitor"]=True
-    await u.message.reply_text("✅ Monitoring ON (v14.0 Final Citadel)")
+    await u.message.reply_text("✅ Monitoring ON (v15.1 Smarter Prompt)")
     if not ctx.chat_data.get("task"): ctx.chat_data["task"]=asyncio.create_task(monitor(ctx))
 async def cmd_stop(u,ctx): state["monitor"]=False; await u.message.reply_text("⛔ Monitoring OFF")
 async def cmd_lev(u,ctx):
@@ -216,6 +272,24 @@ async def monitor(ctx):
         await asyncio.sleep(30)
         if not state['monitor']: continue
         try:
+            p=state.get('position')
+            if p and p.get('side'):
+                try:
+                    positions = await exchange.fetch_positions([PAIR])
+                    open_positions = [pos for pos in positions if pos.get('unrealizedPnl') is not None and float(pos.get('unreal_pnl', 0)) != 0.0]
+                    if not open_positions:
+                        log.info("Position seems to be closed manually. Resetting state.")
+                        await broadcast(ctx, "ℹ️ Позиция была закрыта вручную. Сбрасываю состояние.")
+                        state['position'] = None; continue
+                    
+                    ticker = await exchange.fetch_ticker(PAIR)
+                    price = ticker['last']
+                    if (p['side']=="LONG" and price>=p['tp']) or (p['side']=="SHORT" and price<=p['tp']): await close_pos("TP",price,ctx)
+                    elif (p['side']=="LONG" and price<=p['sl']) or (p['side']=="SHORT" and price>=p['sl']): await close_pos("SL",price,ctx)
+                except Exception as e:
+                    log.error("Error checking open position: %s", e)
+                continue
+
             ohl=await exchange.fetch_ohlcv(PAIR,'15m',limit=100)
             df=pd.DataFrame(ohl,columns=['ts','open','high','low','close','volume'])
             if int(df.iloc[-1]['ts'])==state.get('last_ts', 0): continue
@@ -223,13 +297,6 @@ async def monitor(ctx):
             
             df=calc_ind(df); ind=df.iloc[-1]
             log.info("New 15m candle analyzed (TS: %s)", state['last_ts'])
-
-            p=state.get('position')
-            if p and p.get('side'):
-                price=ind['close']
-                if (p['side']=="LONG" and price>=p['tp']) or (p['side']=="SHORT" and price<=p['tp']): await close_pos("TP",price,ctx)
-                elif (p['side']=="LONG" and price<=p['sl']) or (p['side']=="SHORT" and price>=p['sl']): await close_pos("SL",price,ctx)
-                continue
 
             if not state.get('position'):
                 sig=int(ind['ssl_sig'])
