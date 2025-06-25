@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # ============================================================================
-# eth_alarm_bot.py — v13.1 "Pro Sizing" (25-Jun-2025)
-# • Добавлен профессиональный расчет размера позиции на основе контрактов.
+# eth_alarm_bot.py — v13.3 "Hybrid Exits" (25-Jun-2025)
+# • Добавлена гибридная логика TP/SL: LLM-уровни с откатом до ATR-формулы.
+# • Сообщение об открытии теперь указывает, какой метод был использован.
 # ============================================================================
 
 import os, asyncio, json, logging, math, time
@@ -106,9 +107,11 @@ async def free_usdt():
 
 # ────────── LLM ──────────
 LLM_PROMPT = (
-"Ты — трейдер-аналитик. Дай ответ ТОЛЬКО JSON c полями "
+"Ты — трейдер-аналитик 'Сигма'. Дай ответ ТОЛЬКО JSON c полями "
 "decision (APPROVE / REJECT), confidence_score (0–10), reasoning (RU), "
-"suggested_tp, suggested_sl. Trade:\n{trade}")
+"suggested_tp, suggested_sl. "
+"Правила для TP/SL: Для LONG SL должен быть ниже recent_low, а TP - ниже recent_high. Для SHORT наоборот. "
+"Анализируй Trade:\n{trade}")
 
 async def ask_llm(trade_data, ctx):
     if not LLM_API_KEY: return None
@@ -136,7 +139,7 @@ async def ask_llm(trade_data, ctx):
     return None
 
 # ============================================================================
-# |              ТОРГОВЫЕ ДЕЙСТВИЯ (ЛОГИКА РАСЧЕТА РАЗМЕРА ИСПРАВЛЕНА)         |
+# |              ТОРГОВЫЕ ДЕЙСТВИЯ (ГИБРИДНАЯ ЛОГИКА TP/SL)                  |
 # ============================================================================
 async def open_pos(side, price, llm, td, ctx):
     usdt_balance = await free_usdt()
@@ -144,23 +147,16 @@ async def open_pos(side, price, llm, td, ctx):
         await broadcast(ctx,"❗ Недостаточно средств."); state['position']=None; return
 
     try:
-        # --- 1. Получаем детали рынка (включая размер контракта) ---
         m = exchange.markets[PAIR]
-        contract_value = m.get('contractVal', 1)  # Стоимость 1 контракта в базовой валюте (e.g., 0.001 BTC)
-        lot_size = m['limits']['amount']['min'] or 1 # Минимальный шаг изменения кол-ва контрактов
-
-        # --- 2. Рассчитываем, сколько контрактов мы можем себе позволить ---
-        position_size_usdt = (usdt_balance * 0.99) * state['leverage'] # C 1% запасом
-        # Кол-во контрактов = (Сумма в USDT) / (Цена * Стоимость 1 контракта)
+        contract_value = m.get('contractVal', 1)
+        lot_size = m['limits']['amount']['min'] or 1
+        position_size_usdt = (usdt_balance * 0.99) * state['leverage']
         num_contracts = position_size_usdt / (price * contract_value)
-        
-        # --- 3. Округляем до разрешенного биржей шага ---
         num_contracts = math.floor(num_contracts / lot_size) * lot_size
         
         if num_contracts < lot_size:
             await broadcast(ctx,f"❗ Недостаточно средств для мин. лота ({lot_size})."); state['position']=None; return
 
-        # --- 4. Открываем позицию с точным кол-вом контрактов ---
         await exchange.set_leverage(state['leverage'], PAIR)
         order = await exchange.create_market_order(PAIR,'buy' if side=="LONG" else 'sell', num_contracts, params={"tdMode":"isolated"})
         if not isinstance(order, dict) or 'average' not in order:
@@ -171,14 +167,25 @@ async def open_pos(side, price, llm, td, ctx):
         await broadcast(ctx, f"❌ Биржа отклонила ордер: {e}"); state['position']=None; return
 
     entry=order.get('average',price)
-    atr=td.get('atr', 0)
+    atr=td.get('atr')
     if atr is None: await broadcast(ctx,"⚠️ Не удалось рассчитать ATR. Отмена сделки."); state['position']=None; return
 
-    sl=llm.get('suggested_sl', entry - atr*1.5 if side=="LONG" else entry+atr*1.5)
-    tp=llm.get('suggested_tp', entry + atr*3.0 if side=="LONG" else entry-atr*3.0)
+    # --- НОВАЯ ГИБРИДНАЯ ЛОГИКА ---
+    exit_method = "(Уровни от LLM)"
+    sl = llm.get('suggested_sl')
+    tp = llm.get('suggested_tp')
+
+    if not (sl and tp): # Если LLM не дал оба уровня
+        exit_method = "(Уровни по ATR)"
+        sl = entry - atr * 1.5 if side == "LONG" else entry + atr * 1.5
+        tp = entry + atr * 2.0 if side == "LONG" else entry - atr * 2.0
+    # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+
     state['position']=dict(side=side,amount=num_contracts,entry=entry,sl=sl,tp=tp,opened=time.time(),llm=llm,dep=usdt_balance)
-    await broadcast(ctx, (f"✅ Открыта {side} qty={num_contracts:.4f}\n🔹Entry={entry:.2f}\n"
-                          f"🔻SL={sl:.2f}  🔺TP={tp:.2f}"))
+    await broadcast(ctx, (f"✅ Открыта {side} qty={num_contracts:.4f}\n"
+                          f"🔹Entry={entry:.2f}\n"
+                          f"🔻SL={sl:.2f}  🔺TP={tp:.2f}\n"
+                          f"<i>{exit_method}</i>")) # Добавляем информацию о методе
 
 async def close_pos(reason, price, ctx):
     p=state.pop('position',None); 
@@ -200,7 +207,7 @@ async def close_pos(reason, price, ctx):
 # ────────── Telegram cmd ──────────
 async def cmd_start(u,ctx):
     ctx.application.chat_ids.add(u.effective_chat.id); state["monitor"]=True
-    await u.message.reply_text("✅ Monitoring ON (v13.1 Pro Sizing)")
+    await u.message.reply_text("✅ Monitoring ON (v13.3 Hybrid Exits)")
     if not ctx.chat_data.get("task"): ctx.chat_data["task"]=asyncio.create_task(monitor(ctx))
 async def cmd_stop(u,ctx): state["monitor"]=False; await u.message.reply_text("⛔ Monitoring OFF")
 async def cmd_lev(u,ctx):
@@ -237,8 +244,18 @@ async def monitor(ctx):
                 if not side: continue
                 
                 await broadcast(ctx,f"🔍 Базовый сигнал {side}. Анализ LLM…")
+                
+                lookback = 50 
+                recent_high = df['high'].tail(lookback).max()
+                recent_low = df['low'].tail(lookback).min()
+
                 td={"asset":PAIR,"tf":"15m","signal":side,"price":ind['close'],
-                    "atr":ind['atr'],"rsi":round(ind['rsi'],1),"ema_fast":round(ind['ema_fast'],2),"ema_slow":round(ind['ema_slow'],2)}
+                    "atr":round(ind['atr'], 4),"rsi":round(ind['rsi'],1),
+                    "market_structure": {
+                        "recent_high": round(recent_high, 2),
+                        "recent_low": round(recent_low, 2)
+                    }
+                }
                 
                 state['position']={"opening":True}
                 llm=await ask_llm(td,ctx)
@@ -256,7 +273,7 @@ async def main():
     app.chat_ids=set(CHAT_IDS)
     app.add_handler(CommandHandler("start",cmd_start)); app.add_handler(CommandHandler("stop",cmd_stop)); app.add_handler(CommandHandler("leverage",cmd_lev))
     async with app:
-        try: # Добавил try-except блок для безопасной инициализации
+        try: 
             await exchange.load_markets()
             bal=await exchange.fetch_balance(); log.info("USDT free=%s total=%s", bal['USDT']['free'], bal['USDT']['total'])
         except Exception as e:
