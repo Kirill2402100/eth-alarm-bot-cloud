@@ -155,33 +155,33 @@ async def open_pos(side, price, llm, td, ctx):
             await broadcast(ctx,f"❗ Недостаточно средств для мин. лота ({lot_size})."); state['position']=None; return
 
         await exchange.set_leverage(state['leverage'], PAIR)
-        order = await exchange.create_market_order(PAIR,'buy' if side=="LONG" else 'sell', num_contracts, params={"tdMode":"isolated"})
+        
+        # ---> ГЛАВНОЕ ИЗМЕНЕНИЕ ЗДЕСЬ <---
+        # Мы добавляем детальное логирование ошибки от биржи
+        order=await exchange.create_market_order(PAIR,'buy' if side=="LONG" else 'sell', num_contracts, params={"tdMode":"isolated"})
         if not isinstance(order, dict) or 'average' not in order:
-            raise ValueError(f"Invalid order response: {order}")
+            raise ValueError(f"Invalid order response from exchange: {order}")
 
     except Exception as e:
-        log.error("Failed to create order: %s", e)
-        await broadcast(ctx, f"❌ Биржа отклонила ордер: {e}"); state['position']=None; return
+        # Этот блок теперь распечатает нам полную ошибку
+        log.error("--- DETAILED ORDER REJECTION ERROR ---")
+        log.error("EXCEPTION TYPE: %s", type(e))
+        log.error("EXCEPTION DETAILS: %s", e)
+        log.error("------------------------------------")
+        await broadcast(ctx, f"❌ Биржа отклонила ордер. Детали в логе Railway.")
+        state['position']=None; return
+    # ---> КОНЕЦ ИЗМЕНЕНИЙ <---
 
     entry=order.get('average',price)
     atr=td.get('atr')
     if atr is None: await broadcast(ctx,"⚠️ Не удалось рассчитать ATR. Отмена сделки."); state['position']=None; return
 
-    exit_method = "(Уровни от LLM)"
-    sl = llm.get('suggested_sl')
-    tp = llm.get('suggested_tp')
-
-    if not (sl and tp):
-        exit_method = "(Уровни по ATR)"
-        sl = entry - atr * 1.5 if side == "LONG" else entry + atr * 1.5
-        tp = entry + atr * 2.0 if side == "LONG" else entry - atr * 2.0
-
+    sl=llm.get('suggested_sl', entry - atr*1.5 if side=="LONG" else entry+atr*1.5)
+    tp=llm.get('suggested_tp', entry + atr*3.0 if side=="LONG" else entry-atr*3.0)
     state['position']=dict(side=side,amount=num_contracts,entry=entry,sl=sl,tp=tp,opened=time.time(),llm=llm,dep=usdt_balance)
-    await broadcast(ctx, (f"✅ Открыта {side} qty={num_contracts:.4f}\n"
-                          f"🔹Entry={entry:.2f}\n"
-                          f"🔻SL={sl:.2f}  🔺TP={tp:.2f}\n"
-                          f"<i>{exit_method}</i>"))
-
+    await broadcast(ctx, (f"✅ Открыта {side} qty={num_contracts:.4f}\n🔹Entry={entry:.2f}\n"
+                          f"🔻SL={sl:.2f}  🔺TP={tp:.2f}"))
+    
 async def close_pos(reason, price, ctx):
     p=state.pop('position',None); 
     if not p: return
