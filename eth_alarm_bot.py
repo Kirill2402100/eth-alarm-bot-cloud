@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ============================================================================
-# eth_alarm_bot.py — v13.2 "Final Fix" (25-Jun-2025)
-# • Исправлен KeyError при поиске информации о торговой паре.
+# eth_alarm_bot.py — v14.0 "The Citadel" (25-Jun-2025)
+# • Финальная стабильная версия со всеми исправлениями и улучшениями.
 # ============================================================================
 
 import os, asyncio, json, logging, math, time
@@ -44,8 +44,8 @@ def _ws(title:str):
     try: return ss.worksheet(title)
     except gspread.WorksheetNotFound: return ss.add_worksheet(title, rows=1000, cols=20)
 
-HEADERS = ["DATE-UTC","SIDE","DEPOSIT","ENTRY","SL","TP","RR","P&L","APR%","LLM","CONF"]
-WS = _ws("AI-V13")
+HEADERS = ["DATE-UTC","SIDE","DEPOSIT","ENTRY","SL","TP","RR","P&L","APR%","LLM","CONF","EXIT_METHOD"]
+WS = _ws("AI-V14")
 if WS and WS.row_values(1)!=HEADERS: WS.clear(); WS.append_row(HEADERS)
 
 # ────────── биржа OKX (swap, isolated) ──────────
@@ -144,9 +144,7 @@ async def open_pos(side, price, llm, td, ctx):
         await broadcast(ctx,"❗ Недостаточно средств."); state['position']=None; return
 
     try:
-        # ---> ИСПРАВЛЕНИЕ: Используем exchange.market() вместо прямого доступа <---
         m = exchange.market(PAIR)
-        
         contract_value = m.get('contractVal', 1)
         lot_size = m['limits']['amount']['min'] or 1
         position_size_usdt = (usdt_balance * 0.99) * state['leverage']
@@ -158,26 +156,31 @@ async def open_pos(side, price, llm, td, ctx):
 
         await exchange.set_leverage(state['leverage'], PAIR)
         order = await exchange.create_market_order(PAIR,'buy' if side=="LONG" else 'sell', num_contracts, params={"tdMode":"isolated"})
-        if not isinstance(order, dict) or 'average' not in order:
+        if not isinstance(order, dict) or ('average' not in order and 'price' not in order):
             raise ValueError(f"Invalid order response: {order}")
 
     except Exception as e:
         log.error("--- DETAILED ORDER REJECTION ERROR ---")
-        log.error("EXCEPTION TYPE: %s", type(e))
-        log.error("EXCEPTION DETAILS: %s", e)
-        log.error("------------------------------------")
-        await broadcast(ctx, f"❌ Биржа отклонила ордер. Детали в логе Railway.")
-        state['position']=None; return
+        log.error("EXCEPTION TYPE: %s", type(e)); log.error("EXCEPTION DETAILS: %s", e)
+        await broadcast(ctx, f"❌ Биржа отклонила ордер. Детали в логе Railway."); state['position']=None; return
 
-    entry=order.get('average',price)
+    entry=order.get('average') or order.get('price') or price
     atr=td.get('atr')
     if atr is None: await broadcast(ctx,"⚠️ Не удалось рассчитать ATR. Отмена сделки."); state['position']=None; return
 
-    sl=llm.get('suggested_sl', entry - atr*1.5 if side=="LONG" else entry+atr*1.5)
-    tp=llm.get('suggested_tp', entry + atr*3.0 if side=="LONG" else entry-atr*3.0)
-    state['position']=dict(side=side,amount=num_contracts,entry=entry,sl=sl,tp=tp,opened=time.time(),llm=llm,dep=usdt_balance)
+    exit_method = "(Уровни от LLM)"
+    sl = llm.get('suggested_sl')
+    tp = llm.get('suggested_tp')
+
+    if not (sl and tp):
+        exit_method = "(Уровни по ATR)"
+        sl = entry - atr * 1.5 if side == "LONG" else entry + atr * 1.5
+        tp = entry + atr * 2.0 if side == "LONG" else entry - atr * 2.0
+
+    state['position']=dict(side=side,amount=num_contracts,entry=entry,sl=sl,tp=tp,opened=time.time(),llm=llm,dep=usdt_balance,exit_method=exit_method)
     await broadcast(ctx, (f"✅ Открыта {side} qty={num_contracts:.4f}\n🔹Entry={entry:.2f}\n"
-                          f"🔻SL={sl:.2f}  🔺TP={tp:.2f}"))
+                          f"🔻SL={sl:.2f}  🔺TP={tp:.2f}\n"
+                          f"<i>{exit_method}</i>"))
 
 async def close_pos(reason, price, ctx):
     p=state.pop('position',None); 
@@ -194,12 +197,12 @@ async def close_pos(reason, price, ctx):
     await broadcast(ctx,f"⛔ Закрыта ({reason}) P&L={pnl:.2f}$ APR={apr:.1f}%")
     if WS:
         rr=round(abs((p['tp']-p['entry'])/(p['entry']-p['sl'])),2) if p['entry']!=p['sl'] else 0
-        WS.append_row([datetime.utcnow().strftime("%F %T"),p['side'],p['dep'],p['entry'],p['sl'],p['tp'],rr,pnl,round(apr,2),p['llm']['decision'],p['llm']['confidence_score']])
+        WS.append_row([datetime.utcnow().strftime("%F %T"),p['side'],p['dep'],p['entry'],p['sl'],p['tp'],rr,pnl,round(apr,2),p['llm']['decision'],p['llm']['confidence_score'], p.get('exit_method', 'N/A')])
 
 # ────────── Telegram cmd ──────────
 async def cmd_start(u,ctx):
     ctx.application.chat_ids.add(u.effective_chat.id); state["monitor"]=True
-    await u.message.reply_text("✅ Monitoring ON (v13.2 Final Fix)")
+    await u.message.reply_text("✅ Monitoring ON (v14.0 Final Citadel)")
     if not ctx.chat_data.get("task"): ctx.chat_data["task"]=asyncio.create_task(monitor(ctx))
 async def cmd_stop(u,ctx): state["monitor"]=False; await u.message.reply_text("⛔ Monitoring OFF")
 async def cmd_lev(u,ctx):
@@ -230,8 +233,8 @@ async def monitor(ctx):
 
             if not state.get('position'):
                 sig=int(ind['ssl_sig'])
-                longCond = sig==1  and ind['close']>ind['ema_fast']>ind['ema_slow'] and ind['rsi']>RSI_LONGT
-                shortCond= sig==-1 and ind['close']<ind['ema_fast']<ind['ema_slow'] and ind['rsi']<RSI_SHORTT
+                longCond = sig==1  and (ind['close'] > ind['ema_fast'] and ind['close'] > ind['ema_slow']) and ind['rsi']>RSI_LONGT
+                shortCond= sig==-1 and (ind['close'] < ind['ema_fast'] and ind['close'] < ind['ema_slow']) and ind['rsi']<RSI_SHORTT
                 side="LONG" if longCond else "SHORT" if shortCond else None
                 if not side: continue
                 
