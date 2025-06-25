@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ============================================================================
-# eth_alarm_bot.py — v10 "Hyper-Aggressive" (24-Jun-2025)
-# Исправлен баг с состоянием, добавлена новая логика выхода
+# eth_alarm_bot.py — v11 "Sigma-AI" (25-Jun-2025)
+# Интегрирована система принятия решений на основе LLM.
 # ============================================================================
 
 import os
@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import ccxt.async_support as ccxt
 import gspread
+import aiohttp # <-- НОВАЯ ЗАВИСИМОСТЬ
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import (ApplicationBuilder, CommandHandler,
@@ -27,14 +28,18 @@ CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 PAIR_RAW = os.getenv("PAIR", "BTC-USDT-SWAP")
 SHEET_ID = os.getenv("SHEET_ID")
 INIT_LEV = int(os.getenv("LEVERAGE", 4))
+# --- НОВЫЕ ПЕРЕМЕННЫЕ ДЛЯ LLM ---
+LLM_API_KEY = os.getenv("LLM_API_KEY")
+LLM_API_URL = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
+
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
-for noisy in ("httpx", "telegram.vendor.httpx"):
+for noisy in ("httpx", "telegram.vendor.httpx", "aiohttp.access"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
-# ───────────────────────── Google Sheets (опц.) ───────────────────────
+# ───────────────────────── Google Sheets (без изменений) ────────────────
 _GS_SCOPE = ["https://spreadsheets.google.com/feeds",
              "https://www.googleapis.com/auth/drive"]
 if os.getenv("GOOGLE_CREDENTIALS"):
@@ -50,12 +55,12 @@ def _ws(title: str):
     try: return ss.worksheet(title)
     except gspread.WorksheetNotFound: return ss.add_worksheet(title, rows=1000, cols=20)
 
-HEADERS = ["DATE-TIME", "POSITION", "DEPOSIT", "ENTRY", "STOP LOSS", "TAKE PROFIT", "RR", "P&L (USDT)", "APR (%)"]
-WS = _ws("AI-V10")
+HEADERS = ["DATE-TIME", "POSITION", "DEPOSIT", "ENTRY", "STOP LOSS", "TAKE PROFIT", "RR", "P&L (USDT)", "APR (%)", "LLM DECISION", "LLM CONFIDENCE"]
+WS = _ws("AI-V11")
 if WS and WS.row_values(1) != HEADERS:
     WS.clear(); WS.append_row(HEADERS)
 
-# ──────────────────────────── OKX ───────────────────────────────────
+# ──────────────────────────── OKX (без изменений) ──────────────────────
 exchange = ccxt.okx({
     "apiKey": os.getenv("OKX_API_KEY"),
     "secret": os.getenv("OKX_SECRET"),
@@ -66,28 +71,19 @@ exchange = ccxt.okx({
 PAIR = PAIR_RAW.replace("/", "-").replace(":USDT", "").upper()
 if "-SWAP" not in PAIR: PAIR += "-SWAP"
 
-# ─── STRATEGY V10 "HYPER-AGGRESSIVE" PARAMETERS ─────────────────
+# ─── БАЗОВЫЕ ПАРАМЕТРЫ СТРАТЕГИИ (теперь используются для генерации сигнала) ───
 SSL_LEN = 13
 RSI_LEN = 14
 RSI_LONGT = 52
 RSI_SHORTT = 48
-ATR_LEN = 14
-ATR_CONFIRM_MUL = 0.4
-ATR_MIN_PCT = 0.35 / 100
-VOL_MULT = 1.0
-VOL_LEN = 20
-# --- Новые параметры выхода ---
-TP_ATR_MUL = 2.0         # Тейк-профит на 2 ATR
-INITIAL_SL_ATR_MUL = 1.0 # Начальный стоп на 1 ATR
-TRAIL_STEP_ATR_MUL = 0.5 # Шаг трейлинга 0.5 ATR
 
-# ─────────────────────────── indicators ───────────────────────────────
+# ─────────────────────────── indicators (без изменений) ──────────────────
 def _ta_rsi(series: pd.Series, length=14):
     delta = series.diff()
     gain = delta.clip(lower=0).rolling(length).mean()
     loss = (-delta.clip(upper=0)).rolling(length).mean()
-    if loss.iloc[-1] == 0: return 100
-    return 100 - 100 / (1 + gain / loss)
+    if loss.empty or loss.iloc[-1] == 0: return 100
+    return 100 - (100 / (1 + gain / loss))
 
 def calc_atr(df: pd.DataFrame, length=14):
     high_low = df['high'] - df['low']
@@ -98,6 +94,8 @@ def calc_atr(df: pd.DataFrame, length=14):
     return true_range.rolling(length).mean()
 
 def calc_ind(df: pd.DataFrame):
+    df['ema_fast'] = df['close'].ewm(span=20, adjust=False).mean()
+    df['ema_slow'] = df['close'].ewm(span=50, adjust=False).mean()
     sma = df['close'].rolling(SSL_LEN).mean()
     hi = df['high'].rolling(SSL_LEN).max()
     lo = df['low'].rolling(SSL_LEN).min()
@@ -111,14 +109,13 @@ def calc_ind(df: pd.DataFrame):
     signal = signal.ffill()
     df['ssl_sig'] = signal.fillna(0).astype(int)
     df['rsi'] = _ta_rsi(df['close'], RSI_LEN)
-    df['atr'] = calc_atr(df, ATR_LEN)
-    df['vol_ok'] = (df['volume'] > df['volume'].rolling(VOL_LEN).mean() * VOL_MULT)
+    df['atr'] = calc_atr(df, 14)
     return df
 
-# ─────────────────────────── state ──────────────────────────────────
+# ─────────────────────────── state (без изменений) ─────────────────────
 state = { "monitor": False, "leverage": INIT_LEV, "position": None }
 
-# ───────────────────────── helpers / telegram ─────────────────────────
+# ───────────────────────── helpers / telegram (без изменений) ──────────
 async def broadcast(ctx, txt):
     for cid in ctx.application.chat_ids:
         try: await ctx.application.bot.send_message(cid, txt)
@@ -132,14 +129,68 @@ async def get_free_usdt():
         log.error("Could not fetch balance: %s", e)
         return 0
 
-# ─────────────────────── open / close position ────────────────────────
-async def open_pos(side: str, price: float, atr: float, ctx):
+# ============================================================================
+# |                     НОВЫЙ МОДУЛЬ: LLM АНАЛИТИК                         |
+# ============================================================================
+LLM_PROMPT_TEMPLATE = """
+Ты — профессиональный трейдер-аналитик по имени 'Сигма'. Твоя задача — проанализировать предоставленный торговый сетап в формате JSON и вернуть свой вердикт СТРОГО в формате JSON.
+
+Не добавляй никаких лишних слов или объяснений вне JSON.
+
+Вот твои правила анализа:
+1. Оцени общую уверенность в сетапе по шкале от 0.0 до 10.0 и запиши в поле 'confidence_score'.
+2. Прими финальное решение: 'APPROVE' (одобрить) или 'REJECT' (отклонить). Запиши его в поле 'decision'.
+3. В поле 'reasoning' кратко опиши логику твоего решения.
+4. Основываясь на текущей цене и ATR, предложи разумные уровни для 'suggested_tp' (тейк-профит) и 'suggested_sl' (стоп-лосс).
+
+Проанализируй следующий сетап:
+{trade_data}
+"""
+
+async def get_llm_decision(trade_data: dict, ctx):
+    if not LLM_API_KEY:
+        log.warning("LLM_API_KEY не установлен. Пропускаем анализ ИИ.")
+        return None
+
+    prompt = LLM_PROMPT_TEMPLATE.format(trade_data=json.dumps(trade_data, indent=2))
+    
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "gpt-4.1" # Или другая модель, например gpt-3.5-turbo
+        "messages": [{"role": "user", "content": prompt}],
+        "response_format": {"type": "json_object"} # Важно для получения JSON
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(LLM_API_URL, headers=headers, json=payload, timeout=30) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    llm_response_str = result['choices'][0]['message']['content']
+                    llm_decision = json.loads(llm_response_str)
+                    log.info("LLM Decision: %s", llm_decision)
+                    await broadcast(ctx, f"🧠 LLM Анализ:\n<b>Решение:</b> {llm_decision.get('decision')}\n<b>Уверенность:</b> {llm_decision.get('confidence_score')}/10\n<b>Логика:</b> {llm_decision.get('reasoning')}")
+                    return llm_decision
+                else:
+                    error_text = await response.text()
+                    log.error("LLM API Error (status %s): %s", response.status, error_text)
+                    await broadcast(ctx, f"❌ Ошибка API LLM: статус {response.status}")
+                    return None
+    except Exception as e:
+        log.exception("Error during LLM API call: %s", e)
+        await broadcast(ctx, f"❌ Критическая ошибка при запросе к LLM: {e}")
+        return None
+
+# ─────────────────── open / close position (ДОРАБОТАНЫ) ───────────────────
+async def open_pos(side: str, price: float, llm_decision: dict, ctx):
     usdt = await get_free_usdt()
     if usdt <= 1:
         await broadcast(ctx, "❗ Недостаточно средств для открытия позиции.")
-        state['position'] = None # Сбрасываем блокировку, если не удалось открыть
         return
-        
+
     m = exchange.market(PAIR)
     step = m['precision']['amount'] or 0.0001
     qty = math.floor((usdt * state['leverage'] / price) / step) * step
@@ -147,7 +198,6 @@ async def open_pos(side: str, price: float, atr: float, ctx):
     
     if qty < (m['limits']['amount']['min'] or step):
         await broadcast(ctx, f"❗ Недостаточно средств: qty={qty} (min={m['limits']['amount']['min']})")
-        state['position'] = None
         return
 
     await exchange.set_leverage(state['leverage'], PAIR)
@@ -158,19 +208,20 @@ async def open_pos(side: str, price: float, atr: float, ctx):
     except Exception as e:
         log.error("Failed to create order: %s", e)
         await broadcast(ctx, f"❌ Ошибка открытия позиции: {e}")
-        state['position'] = None # Сбрасываем блокировку при ошибке
         return
 
     entry = order.get('average', price)
-    initial_sl = entry - (atr * INITIAL_SL_ATR_MUL) if side == "LONG" else entry + (atr * INITIAL_SL_ATR_MUL)
     
-    # Обновляем состояние полной информацией о сделке
-    state['position'] = dict(side=side, amount=qty, entry=entry, sl=initial_sl, atr_at_entry=atr, deposit=usdt, opened=time.time())
+    # ИСПОЛЬЗУЕМ TP/SL, предложенные LLM
+    sl = llm_decision.get('suggested_sl', entry - (trade_data['volatility_atr'] * 1.5) if side == "LONG" else entry + (trade_data['volatility_atr'] * 1.5))
+    tp = llm_decision.get('suggested_tp', entry + (trade_data['volatility_atr'] * 3.0) if side == "LONG" else entry - (trade_data['volatility_atr'] * 3.0))
+
+    state['position'] = dict(side=side, amount=qty, entry=entry, sl=sl, tp=tp, deposit=usdt, opened=time.time(), llm_decision=llm_decision)
     
-    await broadcast(ctx, f"✅ Открыта {side} | Qty: {qty:.5f} | Entry: {entry:.2f}")
+    await broadcast(ctx, f"✅ Открыта {side} | Qty: {qty:.5f} | Entry: {entry:.2f}\nSL: {sl:.2f} | TP: {tp:.2f}")
 
 async def close_pos(reason: str, price: float, ctx):
-    p = state.pop('position', None) # Используем pop для атомарного получения и удаления
+    p = state.pop('position', None)
     if not p: return
     
     params = {"tdMode": "isolated", "reduceOnly": True}
@@ -188,89 +239,94 @@ async def close_pos(reason: str, price: float, ctx):
 
     if WS:
         try:
-            tp = p['entry'] + (p['atr_at_entry'] * TP_ATR_MUL) if p['side'] == "LONG" else p['entry'] - (p['atr_at_entry'] * TP_ATR_MUL)
-            sl = p['entry'] - (p['atr_at_entry'] * INITIAL_SL_ATR_MUL) if p['side'] == "LONG" else p['entry'] + (p['atr_at_entry'] * INITIAL_SL_ATR_MUL)
-            rr = round(abs((tp - p['entry']) / (p['entry'] - sl)), 2)
-            WS.append_row([datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), p['side'], p['deposit'], p['entry'], sl, tp, rr, pnl, round(apr, 2)])
+            rr = round(abs((p['tp'] - p['entry']) / (p['entry'] - p['sl'])), 2) if p['entry'] != p['sl'] else 0
+            llm_decision_text = p.get('llm_decision', {}).get('decision', 'N/A')
+            llm_confidence = p.get('llm_decision', {}).get('confidence_score', 'N/A')
+            WS.append_row([datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), p['side'], p['deposit'], p['entry'], p['sl'], p['tp'], rr, pnl, round(apr, 2), llm_decision_text, llm_confidence])
         except Exception as e: log.error("Failed to write to Google Sheets: %s", e)
 
-# ──────────────────────── telegram commands ───────────────────────────
+# ─────────────────── telegram commands (без изменений) ───────────────────
 async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(u.effective_chat.id); state["monitor"] = True
-    await u.message.reply_text("✅ Monitoring ON (Strategy v10 Hyper-Aggressive)")
+    await u.message.reply_text("✅ Monitoring ON (Strategy v11 Sigma-AI)")
     if not ctx.chat_data.get("task"): ctx.chat_data["task"] = asyncio.create_task(monitor(ctx))
 async def cmd_stop(u: Update, ctx): state["monitor"] = False; await u.message.reply_text("⛔ Monitoring OFF")
 async def cmd_lev(u: Update, ctx):
     try: lev = int(u.message.text.split()[1]); assert 1 <= lev <= 100; state["leverage"] = lev; await u.message.reply_text(f"Leverage → {lev}×")
     except: await u.message.reply_text("Использование: /leverage 5")
 
-# ───────────────────────── MAIN MONITOR LOOP ──────────────────────────
+# ============================================================================
+# |                       ГЛАВНЫЙ ЦИКЛ МОНИТОРИНГА (ПЕРЕРАБОТАН)             |
+# ============================================================================
 async def monitor(ctx):
-    log.info("Monitor started with Strategy v10")
+    log.info("Monitor started with Strategy v11 Sigma-AI")
     while True:
         if not state["monitor"]: await asyncio.sleep(2); continue
         try:
-            ohlcv_15m = await exchange.fetch_ohlcv(PAIR, '15m', limit=150)
-            ohlcv_1h = await exchange.fetch_ohlcv(PAIR, '1h', limit=201)
+            ohlcv_15m = await exchange.fetch_ohlcv(PAIR, '15m', limit=50)
             df_15m = pd.DataFrame(ohlcv_15m, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
-            df_1h = pd.DataFrame(ohlcv_1h, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
             ind = calc_ind(df_15m).iloc[-1]
-            h1_sma200 = df_1h['close'].rolling(200).mean().iloc[-1]
             price = ind['close']; atr = ind['atr']
 
             pos = state.get("position")
-            # --- 3. ЛОГИКА ВЫХОДА ИЗ ПОЗИЦИИ ---
-            if isinstance(pos, dict): # Проверяем, что позиция полностью определена
-                # 3a. Обновление трейлинг-стопа
-                new_sl = 0
-                if pos['side'] == "LONG": new_sl = max(pos['sl'], price - (atr * TRAIL_STEP_ATR_MUL))
-                else: new_sl = min(pos['sl'], price + (atr * TRAIL_STEP_ATR_MUL))
-                if new_sl != pos['sl']: pos['sl'] = new_sl
-
-                # 3b. Проверка TP и SL
-                tp_price = pos['entry'] + (pos['atr_at_entry'] * TP_ATR_MUL) if pos['side'] == "LONG" else pos['entry'] - (pos['atr_at_entry'] * TP_ATR_MUL)
-                hit_tp = price >= tp_price if pos['side'] == "LONG" else price <= tp_price
+            # --- 1. ЛОГИКА ВЫХОДА ИЗ ПОЗИЦИИ ---
+            if isinstance(pos, dict):
+                hit_tp = price >= pos['tp'] if pos['side'] == "LONG" else price <= pos['tp']
                 hit_sl = price <= pos['sl'] if pos['side'] == "LONG" else price >= pos['sl']
                 if hit_tp: await close_pos("TP", price, ctx)
                 elif hit_sl: await close_pos("SL", price, ctx)
             
-            # --- 4. ЛОГИКА ВХОДА В ПОЗИЦИЮ ---
-            elif pos is None: # Входим только если нет открытой позиции или процесса открытия
-                sig = int(ind['ssl_sig']); 
+            # --- 2. ЛОГИКА ПОИСКА СИГНАЛА И ВХОДА ---
+            elif pos is None: # Входим только если нет открытой позиции
+                sig = int(ind['ssl_sig'])
                 if sig == 0: await asyncio.sleep(30); continue
-                atr_ok = (atr / price) > ATR_MIN_PCT if atr > 0 else False
-                vol_ok = ind['vol_ok']
                 
-                long_pc_ok = price >= df_15m['close'].iloc[-2] + (atr * ATR_CONFIRM_MUL)
-                long_rsi_ok = ind['rsi'] > RSI_LONGT
-                long_trend_ok = price > h1_sma200
-                longCond = sig == 1 and long_rsi_ok and long_pc_ok and atr_ok and vol_ok and long_trend_ok
+                base_long_cond = sig == 1 and (ind['close'] > ind['ema_fast'] > ind['ema_slow']) and ind['rsi'] > RSI_LONGT
+                base_short_cond = sig == -1 and (ind['close'] < ind['ema_fast'] < ind['ema_slow']) and ind['rsi'] < RSI_SHORTT
 
-                short_pc_ok = price <= df_15m['close'].iloc[-2] - (atr * ATR_CONFIRM_MUL)
-                short_rsi_ok = ind['rsi'] < RSI_SHORTT
-                short_trend_ok = price < h1_sma200
-                shortCond = sig == -1 and short_rsi_ok and short_pc_ok and atr_ok and vol_ok and short_trend_ok
+                side_to_check = None
+                if base_long_cond: side_to_check = "LONG"
+                elif base_short_cond: side_to_check = "SHORT"
                 
-                if longCond:
-                    log.info("LONG condition met. Opening position...")
-                    await broadcast(ctx, f"Сигнал LONG: цена={price:.2f}, RSI={ind['rsi']:.1f}")
-                    state['position'] = {"opening": True} # Блокируем новые сигналы
-                    await open_pos("LONG", price, atr, ctx)
-                elif shortCond:
-                    log.info("SHORT condition met. Opening position...")
-                    await broadcast(ctx, f"Сигнал SHORT: цена={price:.2f}, RSI={ind['rsi']:.1f}")
-                    state['position'] = {"opening": True} # Блокируем новые сигналы
-                    await open_pos("SHORT", price, atr, ctx)
+                if side_to_check:
+                    log.info("Base %s signal detected. Querying LLM...", side_to_check)
+                    await broadcast(ctx, f"🔍 Найден базовый сигнал {side_to_check}. Отправляю на анализ в LLM...")
+                    
+                    # Формируем данные для LLM
+                    global trade_data
+                    trade_data = {
+                        "asset": PAIR,
+                        "timeframe": "15m",
+                        "signal_type": side_to_check,
+                        "current_price": price,
+                        "indicators": {
+                            "rsi_value": round(ind['rsi'], 2),
+                            "ema_fast_value": round(ind['ema_fast'], 2),
+                            "ema_slow_value": round(ind['ema_slow'], 2),
+                            "ssl_signal": "Crossover Up" if side_to_check == "LONG" else "Crossover Down"
+                        },
+                        "volatility_atr": round(atr, 4)
+                    }
+                    
+                    llm_decision = await get_llm_decision(trade_data, ctx)
+
+                    # Принимаем финальное решение
+                    if llm_decision and llm_decision.get('decision') == 'APPROVE' and llm_decision.get('confidence_score', 0) >= 6.0:
+                        log.info("LLM approved trade. Opening %s position.", side_to_check)
+                        state['position'] = {"opening": True} # Блокируем новые сигналы
+                        await open_pos(side_to_check, price, llm_decision, ctx)
+                    else:
+                        log.info("LLM rejected trade or confidence too low.")
+                        await broadcast(ctx, "🤖 LLM отклонил сигнал.")
 
         except ccxt.NetworkError as e: log.warning("Network error: %s", e)
         except Exception as e: log.exception("Unhandled error in monitor loop: %s", e)
         
         await asyncio.sleep(30)
 
-# ───────────────────────── graceful shutdown ──────────────────────────
+# ─────────────────── entry-point (без изменений) ──────────────────────
 async def shutdown_hook(app): log.info("Shutting down..."); await exchange.close()
 
-# ───────────────────────── entry-point ────────────────────────────────
 async def main():
     app = (ApplicationBuilder().token(BOT_TOKEN).defaults(Defaults(parse_mode="HTML")).post_shutdown(shutdown_hook).build())
     app.chat_ids = set(CHAT_IDS)
@@ -284,6 +340,9 @@ async def main():
         except Exception as e: log.error("Failed to initialize exchange: %s", e); return
         await app.start(); await app.updater.start_polling(); log.info("Bot polling started.")
         await asyncio.Event().wait()
+
 if __name__ == "__main__":
-    try: asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit): log.info("Bot shutdown requested by user.")
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Bot shutdown requested by user.")
