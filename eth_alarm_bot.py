@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # ============================================================================
-# eth_alarm_bot.py — v13.3 "Hybrid Exits" (25-Jun-2025)
-# • Добавлена гибридная логика TP/SL: LLM-уровни с откатом до ATR-формулы.
-# • Сообщение об открытии теперь указывает, какой метод был использован.
+# eth_alarm_bot.py — v13.4 "Simplified Trend" (25-Jun-2025)
+# • Упрощена логика фильтра по EMA согласно требованию.
 # ============================================================================
 
 import os, asyncio, json, logging, math, time
@@ -138,9 +137,7 @@ async def ask_llm(trade_data, ctx):
         log.error("LLM req err: %s", e); await broadcast(ctx,f"❌ LLM error: {e}")
     return None
 
-# ============================================================================
-# |              ТОРГОВЫЕ ДЕЙСТВИЯ (ГИБРИДНАЯ ЛОГИКА TP/SL)                  |
-# ============================================================================
+# ────────── торговые действия ──────────
 async def open_pos(side, price, llm, td, ctx):
     usdt_balance = await free_usdt()
     if usdt_balance <= 1:
@@ -170,22 +167,20 @@ async def open_pos(side, price, llm, td, ctx):
     atr=td.get('atr')
     if atr is None: await broadcast(ctx,"⚠️ Не удалось рассчитать ATR. Отмена сделки."); state['position']=None; return
 
-    # --- НОВАЯ ГИБРИДНАЯ ЛОГИКА ---
     exit_method = "(Уровни от LLM)"
     sl = llm.get('suggested_sl')
     tp = llm.get('suggested_tp')
 
-    if not (sl and tp): # Если LLM не дал оба уровня
+    if not (sl and tp):
         exit_method = "(Уровни по ATR)"
         sl = entry - atr * 1.5 if side == "LONG" else entry + atr * 1.5
         tp = entry + atr * 2.0 if side == "LONG" else entry - atr * 2.0
-    # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
 
     state['position']=dict(side=side,amount=num_contracts,entry=entry,sl=sl,tp=tp,opened=time.time(),llm=llm,dep=usdt_balance)
     await broadcast(ctx, (f"✅ Открыта {side} qty={num_contracts:.4f}\n"
                           f"🔹Entry={entry:.2f}\n"
                           f"🔻SL={sl:.2f}  🔺TP={tp:.2f}\n"
-                          f"<i>{exit_method}</i>")) # Добавляем информацию о методе
+                          f"<i>{exit_method}</i>"))
 
 async def close_pos(reason, price, ctx):
     p=state.pop('position',None); 
@@ -207,7 +202,7 @@ async def close_pos(reason, price, ctx):
 # ────────── Telegram cmd ──────────
 async def cmd_start(u,ctx):
     ctx.application.chat_ids.add(u.effective_chat.id); state["monitor"]=True
-    await u.message.reply_text("✅ Monitoring ON (v13.3 Hybrid Exits)")
+    await u.message.reply_text("✅ Monitoring ON (v13.4 Simplified Trend)")
     if not ctx.chat_data.get("task"): ctx.chat_data["task"]=asyncio.create_task(monitor(ctx))
 async def cmd_stop(u,ctx): state["monitor"]=False; await u.message.reply_text("⛔ Monitoring OFF")
 async def cmd_lev(u,ctx):
@@ -238,8 +233,12 @@ async def monitor(ctx):
 
             if not state.get('position'):
                 sig=int(ind['ssl_sig'])
-                longCond = sig==1  and ind['close']>ind['ema_fast']>ind['ema_slow'] and ind['rsi']>RSI_LONGT
-                shortCond= sig==-1 and ind['close']<ind['ema_fast']<ind['ema_slow'] and ind['rsi']<RSI_SHORTT
+                
+                # ---> ИЗМЕНЕННАЯ ЛОГИКА ФИЛЬТРА EMA <---
+                longCond = sig==1  and (ind['close'] > ind['ema_fast'] and ind['close'] > ind['ema_slow']) and ind['rsi']>RSI_LONGT
+                shortCond= sig==-1 and (ind['close'] < ind['ema_fast'] and ind['close'] < ind['ema_slow']) and ind['rsi']<RSI_SHORTT
+                # ---> КОНЕЦ ИЗМЕНЕНИЙ <---
+
                 side="LONG" if longCond else "SHORT" if shortCond else None
                 if not side: continue
                 
