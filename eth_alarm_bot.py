@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # ============================================================================
-# eth_alarm_bot.py — v12.5 (25-Jun-2025)
+# eth_alarm_bot.py — v12.6 (25-Jun-2025)
+# • Модель LLM вынесена в переменные окружения.
+# • Исправлен парсинг ответа LLM с Markdown.
 # • Исправлен AttributeError при расчете ATR.
 # ============================================================================
 
@@ -20,8 +22,9 @@ CHAT_IDS    = {int(c) for c in os.getenv("CHAT_IDS", "0").split(",") if c}
 PAIR_RAW    = os.getenv("PAIR", "BTC-USDT-SWAP")
 INIT_LEV    = int(os.getenv("LEVERAGE", 4))
 
-LLM_API_KEY  = os.getenv("LLM_API_KEY")       # ← обязателен
+LLM_API_KEY  = os.getenv("LLM_API_KEY")
 LLM_API_URL  = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
+LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "gpt-4.1") # <-- НОВАЯ ПЕРЕМЕННАЯ
 LLM_THRESHOLD= float(os.getenv("LLM_CONFIDENCE_THRESHOLD", 7.0))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -65,7 +68,6 @@ def _ta_rsi(series:pd.Series, length=14):
     loss=(-delta.clip(upper=0)).rolling(length).mean().replace(0,np.nan)
     rs=gain/ loss ; rsi=100-100/(1+rs); return rsi.fillna(50)
 
-# ---> ИСПРАВЛЕННАЯ ФУНКЦИЯ <---
 def calc_ind(df:pd.DataFrame):
     df['ema_fast']=df['close'].ewm(span=20, adjust=False).mean()
     df['ema_slow']=df['close'].ewm(span=50, adjust=False).mean()
@@ -80,7 +82,6 @@ def calc_ind(df:pd.DataFrame):
     df['ssl_sig']=sig.ffill().fillna(0).astype(int)
     df['rsi']=_ta_rsi(df['close'], RSI_LEN)
     
-    # Расчет ATR через Pandas
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
@@ -110,7 +111,8 @@ LLM_PROMPT = (
 
 async def ask_llm(trade_data, ctx):
     if not LLM_API_KEY: return None
-    payload={"model":"gpt-4o-mini","messages":[{"role":"user","content":LLM_PROMPT.format(trade=json.dumps(trade_data,ensure_ascii=False))}],"temperature":0.2}
+    # ИСПОЛЬЗУЕМ ПЕРЕМЕННУЮ ВМЕСТО ЖЕСТКО ЗАДАННОЙ МОДЕЛИ
+    payload={"model":LLM_MODEL_ID,"messages":[{"role":"user","content":LLM_PROMPT.format(trade=json.dumps(trade_data,ensure_ascii=False))}],"temperature":0.2}
     headers={"Authorization":f"Bearer {LLM_API_KEY}","Content-Type":"application/json"}
     try:
         async with aiohttp.ClientSession() as s:
@@ -121,14 +123,19 @@ async def ask_llm(trade_data, ctx):
                     return None
                 try:
                     cont=json.loads(txt); msg=cont["choices"][0]["message"]["content"]
-                    ans=json.loads(msg)
+                    clean_msg = msg
+                    if "```json" in msg:
+                        clean_msg = msg.split("```json")[1].split("```")[0]
+                    elif "```" in msg:
+                        clean_msg = msg.split("```")[1].split("```")[0]
+                    ans=json.loads(clean_msg.strip())
                 except Exception as e:
                     log.error("LLM raw: %s", txt[:300])
                     await broadcast(ctx,"⚠️ LLM ответ непонятен, сигнал пропущен.")
                     return None
-                await broadcast(ctx, (f"🧠 <b>LLM:</b> {ans['decision']} "
-                                      f"(<i>{ans['confidence_score']}/10</i>)\n"
-                                      f"{ans['reasoning']}"))
+                await broadcast(ctx, (f"🧠 <b>LLM:</b> {ans.get('decision', 'N/A')} "
+                                      f"(<i>{ans.get('confidence_score', 'N/A')}/10</i>)\n"
+                                      f"<i>{ans.get('reasoning', '')}</i>"))
                 return ans
     except Exception as e:
         log.error("LLM req err: %s", e); await broadcast(ctx,f"❌ LLM error: {e}")
@@ -136,7 +143,7 @@ async def ask_llm(trade_data, ctx):
 
 # ────────── торговые действия ──────────
 async def open_pos(side, price, llm, td, ctx):
-    atr=td['atr']; usdt=await free_usdt()
+    atr=td.get('atr', 0); usdt=await free_usdt()
     m=exchange.market(PAIR); step=m['precision']['amount'] or 0.0001
     qty=math.floor((usdt*state['leverage']/price)/step)*step
     if qty < (m['limits']['amount']['min'] or step):
@@ -165,7 +172,7 @@ async def close_pos(reason, price, ctx):
 # ────────── Telegram cmd ──────────
 async def cmd_start(u,ctx):
     ctx.application.chat_ids.add(u.effective_chat.id); state["monitor"]=True
-    await u.message.reply_text("✅ Monitoring ON (v12.5)")
+    await u.message.reply_text("✅ Monitoring ON (v12.6)")
     if not ctx.chat_data.get("task"): ctx.chat_data["task"]=asyncio.create_task(monitor(ctx))
 async def cmd_stop(u,ctx): state["monitor"]=False; await u.message.reply_text("⛔ Monitoring OFF")
 async def cmd_lev(u,ctx):
@@ -206,7 +213,7 @@ async def monitor(ctx):
                 "atr":ind['atr'],"rsi":round(ind['rsi'],1),"ema_fast":round(ind['ema_fast'],2),"ema_slow":round(ind['ema_slow'],2)}
             state['position']={"opening":True}
             llm=await ask_llm(td,ctx)
-            if llm and llm["decision"]=="APPROVE" and llm["confidence_score"]>=LLM_THRESHOLD:
+            if llm and llm.get("decision")=="APPROVE" and llm.get("confidence_score",0)>=LLM_THRESHOLD:
                 await open_pos(side, ind['close'], llm, td, ctx)
             else:
                 await broadcast(ctx,"🟦 LLM отклонил сигнал."); state['position']=None
