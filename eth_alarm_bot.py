@@ -168,27 +168,30 @@ async def get_llm_decision(trade_data: dict, ctx):
         await broadcast(ctx, f"❌ Критическая ошибка при запросе к LLM: {e}")
         return None
 
-# ─────────────────── open / close position (ИСПРАВЛЕНЫ) ───────────────────
-# ИСПРАВЛЕНИЕ 1: Добавлен trade_data в аргументы функции
 async def open_pos(side: str, price: float, llm_decision: dict, trade_data: dict, ctx):
+    # ---> ВОТ ИСПРАВЛЕНИЕ: Безопасно извлекаем ATR из переданных данных <---
+    atr = trade_data.get('volatility_atr', 0)
+    
     usdt = await get_free_usdt()
     if usdt <= 1:
         await broadcast(ctx, "❗ Недостаточно средств."); state['position'] = None; return
+
     m = exchange.market(PAIR)
     step = m['precision']['amount'] or 0.0001
     qty = math.floor((usdt * state['leverage'] / price) / step) * step
     if qty < (m['limits']['amount']['min'] or step):
         await broadcast(ctx, f"❗ Недостаточно средств: qty={qty} (min={m['limits']['amount']['min']})"); state['position'] = None; return
+
     await exchange.set_leverage(state['leverage'], PAIR)
     params = {"tdMode": "isolated"}
     try:
         order = await exchange.create_market_order(PAIR, 'buy' if side == "LONG" else 'sell', qty, params=params)
     except Exception as e:
         await broadcast(ctx, f"❌ Ошибка открытия позиции: {e}"); state['position'] = None; return
+    
     entry = order.get('average', price)
     
-    # ИСПРАВЛЕНИЕ 3: ATR теперь безопасно берется из переданного trade_data
-    atr = trade_data.get('volatility_atr', 0)
+    # Теперь эта логика будет работать, так как переменная atr определена
     sl = llm_decision.get('suggested_sl', entry - (atr * 1.5) if side == "LONG" else entry + (atr * 1.5))
     tp = llm_decision.get('suggested_tp', entry + (atr * 3.0) if side == "LONG" else entry - (atr * 3.0))
 
