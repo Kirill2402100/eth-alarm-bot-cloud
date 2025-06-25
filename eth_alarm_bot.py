@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 # ============================================================================
-# eth_alarm_bot.py — v12.3  (25-Jun-2025)
-# • Исправлены все падения из-за NoneType при SL/TP и RR
-# • LLM теперь даёт содержательный reasoning + уровни SL/TP
-# • Сообщения о входе гарантированно отправляются
+# eth_alarm_bot.py — v12.4  (25-Jun-2025)
+# • FIX: _ta_rsi теперь возвращает Series → .fillna() больше не падает
 # ============================================================================
 
 import os, asyncio, json, logging, math, time
@@ -18,14 +16,14 @@ from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, Defaults, ContextTypes
 
-# ─────────────────────────── env / logging ────────────────────────────
+# ─────────────── env / logging ───────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
-PAIR_RAW = os.getenv("PAIR", "BTC-USDT-SWAP")
-SHEET_ID = os.getenv("SHEET_ID")
-INIT_LEV = int(os.getenv("LEVERAGE", 4))
-LLM_API_KEY = os.getenv("LLM_API_KEY")
-LLM_API_URL = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
+CHAT_IDS  = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
+PAIR_RAW  = os.getenv("PAIR", "BTC-USDT-SWAP")
+SHEET_ID  = os.getenv("SHEET_ID")
+INIT_LEV  = int(os.getenv("LEVERAGE", 4))
+LLM_API_KEY   = os.getenv("LLM_API_KEY")
+LLM_API_URL   = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
 LLM_CONFIDENCE_THRESHOLD = float(os.getenv("LLM_CONFIDENCE_THRESHOLD", 7.0))
 
 logging.basicConfig(level=logging.INFO,
@@ -34,7 +32,7 @@ log = logging.getLogger("bot")
 for noisy in ("httpx", "telegram.vendor.httpx", "aiohttp.access"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
-# ───────────────────────── Google Sheets ──────────────────────────────
+# ─────────────── Google Sheets ───────────────
 _GS_SCOPE = ["https://spreadsheets.google.com/feeds",
              "https://www.googleapis.com/auth/drive"]
 if os.getenv("GOOGLE_CREDENTIALS"):
@@ -44,7 +42,7 @@ if os.getenv("GOOGLE_CREDENTIALS"):
 else:
     _gs = None; log.warning("GOOGLE_CREDENTIALS not set.")
 
-def _ws(title: str):
+def _ws(title:str):
     if not (_gs and SHEET_ID): return None
     ss = _gs.open_by_key(SHEET_ID)
     try: return ss.worksheet(title)
@@ -55,7 +53,7 @@ WS = _ws("AI-V12")
 if WS and WS.row_values(1) != HEADERS:
     WS.clear(); WS.append_row(HEADERS)
 
-# ──────────────────────────── OKX ─────────────────────────────────────
+# ─────────────── OKX ───────────────
 exchange = ccxt.okx({
     "apiKey":    os.getenv("OKX_API_KEY"),
     "secret":    os.getenv("OKX_SECRET"),
@@ -66,46 +64,44 @@ exchange = ccxt.okx({
 PAIR = PAIR_RAW.replace("/", "-").replace(":USDT", "").upper()
 if "-SWAP" not in PAIR: PAIR += "-SWAP"
 
-# ─── базовые параметры стратегии ──────────────────────────────────────
+# ─────────────── strategy params ─────────────
 SSL_LEN, RSI_LEN = 13, 14
 RSI_LONGT, RSI_SHORTT = 52, 48
 
-# ─────────────────────── индикаторы (Pandas) ─────────────────────────
-def _ta_rsi(series: pd.Series, length=14):
+# ─────────────── indicators ─────────────
+def _ta_rsi(series: pd.Series, length:int=14) -> pd.Series:
+    """classic Wilder RSI, SAFE version returning pd.Series"""
     delta = series.diff()
-    gain = delta.clip(lower=0).rolling(length).mean()
-    loss = (-delta.clip(upper=0)).rolling(length).mean()
-    rs = np.where(loss == 0, np.inf, gain / loss)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
+    gain  = delta.clip(lower=0).rolling(length).mean()
+    loss  = (-delta.clip(upper=0)).rolling(length).mean()
+    rs    = np.where(loss==0, np.inf, gain / loss)
+    rsi   = 100 - 100/(1+rs)                # ← NumPy ndarray
+    return pd.Series(rsi, index=series.index).fillna(50)   # ← Series!
 
-def calc_atr(df: pd.DataFrame, length=14):
-    high_low = df['high'] - df['low']
-    high_close = (df['high'] - df['close'].shift()).abs()
-    low_close  = (df['low']  - df['close'].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+def calc_atr(df:pd.DataFrame,length:int=14)->pd.Series:
+    hl  = df['high'] - df['low']
+    hc  = (df['high'] - df['close'].shift()).abs()
+    lc  = (df['low']  - df['close'].shift()).abs()
+    tr  = pd.concat([hl,hc,lc],axis=1).max(axis=1)
     return tr.rolling(length).mean()
 
-def calc_ind(df: pd.DataFrame):
-    df['ema_fast'] = df['close'].ewm(span=20, adjust=False).mean()
-    df['ema_slow'] = df['close'].ewm(span=50, adjust=False).mean()
+def calc_ind(df:pd.DataFrame)->pd.DataFrame:
+    df['ema_fast'] = df['close'].ewm(span=20,adjust=False).mean()
+    df['ema_slow'] = df['close'].ewm(span=50,adjust=False).mean()
 
     sma = df['close'].rolling(SSL_LEN).mean()
     hi  = df['high'].rolling(SSL_LEN).max()
     lo  = df['low'].rolling(SSL_LEN).min()
-    df['ssl_up'] = np.where(df['close'] > sma, hi, lo)
-    df['ssl_dn'] = np.where(df['close'] > sma, lo, hi)
-    cross_up   = (df['ssl_up'].shift(1) < df['ssl_dn'].shift(1)) & (df['ssl_up'] > df['ssl_dn'])
-    cross_down = (df['ssl_up'].shift(1) > df['ssl_dn'].shift(1)) & (df['ssl_up'] < df['ssl_dn'])
-    sig = pd.Series(0, index=df.index)
-    sig[cross_up]   = 1
-    sig[cross_down] = -1
-    df['ssl_sig'] = sig.replace(0, np.nan).ffill().fillna(0).astype(int)
+    df['ssl_up'] = np.where(df['close']>sma, hi, lo)
+    df['ssl_dn'] = np.where(df['close']>sma, lo, hi)
+    cross_up   = (df['ssl_up'].shift(1)<df['ssl_dn'].shift(1))&(df['ssl_up']>df['ssl_dn'])
+    cross_down = (df['ssl_up'].shift(1)>df['ssl_dn'].shift(1))&(df['ssl_up']<df['ssl_dn'])
+    sig = pd.Series(0,index=df.index); sig[cross_up]=1; sig[cross_down]=-1
+    df['ssl_sig'] = sig.replace(0,np.nan).ffill().fillna(0).astype(int)
 
     df['rsi'] = _ta_rsi(df['close'], RSI_LEN)
-    df['atr'] = calc_atr(df, 14)
+    df['atr'] = calc_atr(df,14)
     return df
-
 # ─────────────────────────── состояние ────────────────────────────────
 state = {"monitor": False, "lev": INIT_LEV, "pos": None, "last_ts": 0}
 
