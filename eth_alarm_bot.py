@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ============================================================================
-# eth_alarm_bot.py — v13.0 "Production Ready" (25-Jun-2025)
-# • Финальная версия со всеми исправлениями.
+# eth_alarm_bot.py — v13.1 "Pro Sizing" (25-Jun-2025)
+# • Добавлен профессиональный расчет размера позиции на основе контрактов.
 # ============================================================================
 
 import os, asyncio, json, logging, math, time
@@ -135,31 +135,49 @@ async def ask_llm(trade_data, ctx):
         log.error("LLM req err: %s", e); await broadcast(ctx,f"❌ LLM error: {e}")
     return None
 
-# ────────── торговые действия ──────────
+# ============================================================================
+# |              ТОРГОВЫЕ ДЕЙСТВИЯ (ЛОГИКА РАСЧЕТА РАЗМЕРА ИСПРАВЛЕНА)         |
+# ============================================================================
 async def open_pos(side, price, llm, td, ctx):
-    atr=td.get('atr'); usdt=await free_usdt()
-    if atr is None: await broadcast(ctx,"⚠️ Не удалось рассчитать ATR. Отмена сделки."); state['position']=None; return
-    
-    m=exchange.market(PAIR); step=m['precision']['amount'] or 0.0001
-    qty=math.floor(((usdt * 0.99) * state['leverage']/price)/step)*step
-    
-    if qty < (m['limits']['amount']['min'] or step):
-        await broadcast(ctx,f"❗ Недостаточно средств для мин. лота ({m['limits']['amount']['min']})."); state['position']=None; return
-    
-    await exchange.set_leverage(state['leverage'], PAIR)
+    usdt_balance = await free_usdt()
+    if usdt_balance <= 1:
+        await broadcast(ctx,"❗ Недостаточно средств."); state['position']=None; return
+
     try:
-        order=await exchange.create_market_order(PAIR,'buy' if side=="LONG" else 'sell',qty,params={"tdMode":"isolated"})
+        # --- 1. Получаем детали рынка (включая размер контракта) ---
+        m = exchange.markets[PAIR]
+        contract_value = m.get('contractVal', 1)  # Стоимость 1 контракта в базовой валюте (e.g., 0.001 BTC)
+        lot_size = m['limits']['amount']['min'] or 1 # Минимальный шаг изменения кол-ва контрактов
+
+        # --- 2. Рассчитываем, сколько контрактов мы можем себе позволить ---
+        position_size_usdt = (usdt_balance * 0.99) * state['leverage'] # C 1% запасом
+        # Кол-во контрактов = (Сумма в USDT) / (Цена * Стоимость 1 контракта)
+        num_contracts = position_size_usdt / (price * contract_value)
+        
+        # --- 3. Округляем до разрешенного биржей шага ---
+        num_contracts = math.floor(num_contracts / lot_size) * lot_size
+        
+        if num_contracts < lot_size:
+            await broadcast(ctx,f"❗ Недостаточно средств для мин. лота ({lot_size})."); state['position']=None; return
+
+        # --- 4. Открываем позицию с точным кол-вом контрактов ---
+        await exchange.set_leverage(state['leverage'], PAIR)
+        order = await exchange.create_market_order(PAIR,'buy' if side=="LONG" else 'sell', num_contracts, params={"tdMode":"isolated"})
         if not isinstance(order, dict) or 'average' not in order:
             raise ValueError(f"Invalid order response: {order}")
+
     except Exception as e:
         log.error("Failed to create order: %s", e)
         await broadcast(ctx, f"❌ Биржа отклонила ордер: {e}"); state['position']=None; return
 
     entry=order.get('average',price)
-    sl=llm.get('suggested_sl', entry-atr*1.5 if side=="LONG" else entry+atr*1.5)
-    tp=llm.get('suggested_tp', entry+atr*3.0 if side=="LONG" else entry-atr*3.0)
-    state['position']=dict(side=side,amount=qty,entry=entry,sl=sl,tp=tp,opened=time.time(),llm=llm,dep=usdt)
-    await broadcast(ctx, (f"✅ Открыта {side} qty={qty:.4f}\n🔹Entry={entry:.2f}\n"
+    atr=td.get('atr', 0)
+    if atr is None: await broadcast(ctx,"⚠️ Не удалось рассчитать ATR. Отмена сделки."); state['position']=None; return
+
+    sl=llm.get('suggested_sl', entry - atr*1.5 if side=="LONG" else entry+atr*1.5)
+    tp=llm.get('suggested_tp', entry + atr*3.0 if side=="LONG" else entry-atr*3.0)
+    state['position']=dict(side=side,amount=num_contracts,entry=entry,sl=sl,tp=tp,opened=time.time(),llm=llm,dep=usdt_balance)
+    await broadcast(ctx, (f"✅ Открыта {side} qty={num_contracts:.4f}\n🔹Entry={entry:.2f}\n"
                           f"🔻SL={sl:.2f}  🔺TP={tp:.2f}"))
 
 async def close_pos(reason, price, ctx):
@@ -182,7 +200,7 @@ async def close_pos(reason, price, ctx):
 # ────────── Telegram cmd ──────────
 async def cmd_start(u,ctx):
     ctx.application.chat_ids.add(u.effective_chat.id); state["monitor"]=True
-    await u.message.reply_text("✅ Monitoring ON (v13.0 Final)")
+    await u.message.reply_text("✅ Monitoring ON (v13.1 Pro Sizing)")
     if not ctx.chat_data.get("task"): ctx.chat_data["task"]=asyncio.create_task(monitor(ctx))
 async def cmd_stop(u,ctx): state["monitor"]=False; await u.message.reply_text("⛔ Monitoring OFF")
 async def cmd_lev(u,ctx):
@@ -238,8 +256,11 @@ async def main():
     app.chat_ids=set(CHAT_IDS)
     app.add_handler(CommandHandler("start",cmd_start)); app.add_handler(CommandHandler("stop",cmd_stop)); app.add_handler(CommandHandler("leverage",cmd_lev))
     async with app:
-        await exchange.load_markets()
-        bal=await exchange.fetch_balance(); log.info("USDT free=%s total=%s", bal['USDT']['free'], bal['USDT']['total'])
+        try: # Добавил try-except блок для безопасной инициализации
+            await exchange.load_markets()
+            bal=await exchange.fetch_balance(); log.info("USDT free=%s total=%s", bal['USDT']['free'], bal['USDT']['total'])
+        except Exception as e:
+            log.error("Failed to load markets/balance on startup: %s", e)
         await app.start(); await app.updater.start_polling()
         await asyncio.Event().wait()
 
