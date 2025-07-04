@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v7.2 - Task Management Fix
-# • Исправлена ошибка TypeError: 'mappingproxy' при запуске сканера.
-# • Улучшено управление фоновой задачей сканирования.
+# v7.3 - Auto-Sheet Creation
+# • Бот теперь автоматически создает нужный лист в Google Таблице, если он отсутствует.
 # ============================================================================
 
 import os
@@ -24,6 +23,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID = os.getenv("SHEET_ID")
 COIN_LIST_SIZE = int(os.getenv("COIN_LIST_SIZE", "200"))
+WORKSHEET_NAME = "Trading_Logs_v7" # Имя листа вынесено в переменную
 
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_API_URL = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
@@ -35,23 +35,37 @@ log = logging.getLogger("bot")
 for n in ("httpx",): logging.getLogger(n).setLevel(logging.WARNING)
 
 # === GOOGLE SHEETS ===
-try:
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    gs = gspread.authorize(creds)
-    LOGS_WS = gs.open_by_key(SHEET_ID).worksheet("Trading_Logs_v7")
-    HEADERS = ["Дата входа", "Инструмент", "Направление", "Депозит", "Цена входа", "Stop Loss", "Take Profit", "P&L сделки (USDT)", "% к депозиту"]
-    if LOGS_WS.row_values(1) != HEADERS:
-        LOGS_WS.resize(rows=1); LOGS_WS.update('A1', [HEADERS])
-except Exception as e:
-    log.error("Google Sheets init failed: %s", e)
-    LOGS_WS = None
+def setup_google_sheets():
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        gs = gspread.authorize(creds)
+        spreadsheet = gs.open_by_key(SHEET_ID)
+        
+        # ---> ИСПРАВЛЕНО: Автоматическое создание листа <---
+        try:
+            worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
+        except gspread.WorksheetNotFound:
+            log.warning(f"Worksheet '{WORKSHEET_NAME}' not found. Creating it...")
+            worksheet = spreadsheet.add_worksheet(title=WORKSHEET_NAME, rows="1000", cols="20")
+        
+        HEADERS = ["Дата входа", "Инструмент", "Направление", "Депозит", "Цена входа", "Stop Loss", "Take Profit", "P&L сделки (USDT)", "% к депозиту"]
+        if worksheet.row_values(1) != HEADERS:
+            worksheet.clear()
+            worksheet.update('A1', [HEADERS])
+            worksheet.format('A1:I1', {'textFormat': {'bold': True}})
+        return worksheet
+    except Exception as e:
+        log.error("Google Sheets init failed: %s", e)
+        return None
+
+LOGS_WS = setup_google_sheets()
 
 # === STATE MANAGEMENT ===
+# ... (остальной код без изменений)
 STATE_FILE = "scanner_v7_state.json"
-state = {"manual_position": None, "last_alert_times": {}}
-scanner_task = None # <--- ИСПРАВЛЕНИЕ: Храним задачу здесь
+state = {"monitoring": False, "manual_position": None, "last_alert_times": {}}
 
 def save_state():
     with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
@@ -135,7 +149,7 @@ async def scanner_loop(app):
         log.error(f"Failed to fetch dynamic coin list: %s", e)
         await broadcast_message(app, "⚠️ Не удалось сформировать динамический список монет. Проверьте лог."); return
 
-    while True: # Этот цикл будет остановлен командой /stop
+    while state.get('monitoring', False):
         log.info(f"Starting new scan for {len(coin_list)} coins...")
         candidates = []
         for pair in coin_list:
@@ -209,10 +223,10 @@ async def scanner_loop(app):
 
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
-# === COMMANDS and RUN ===
+# === COMMANDS and RUN (включая ручное логирование) ===
+# ... (Этот блок остается без изменений)
 async def broadcast_message(app, text):
     for chat_id in app.chat_ids:
-        # MarkdownV2 требует экранирования спецсимволов
         safe_text = text.replace('.', r'\.').replace('-', r'\-').replace('(', r'\(').replace(')', r'\)').replace('>', r'\>').replace('+', r'\+').replace('=', r'\=').replace('*', r'\*').replace('_', r'\_').replace('`', r'\`').replace('[', r'\[').replace(']', r'\]')
         await app.bot.send_message(chat_id=chat_id, text=safe_text, parse_mode="MarkdownV2")
 
@@ -222,26 +236,32 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not hasattr(ctx.application, 'chat_ids'): ctx.application.chat_ids = set()
     ctx.application.chat_ids.add(chat_id)
     
-    if scanner_task is None or scanner_task.done():
-        await update.message.reply_text("✅ Сканер запущен (v7.2 Task Fix).")
-        scanner_task = asyncio.create_task(scanner_loop(ctx.application))
+    task = state.get("scanner_task")
+    if not task or task.done():
+        state['monitoring'] = True; save_state()
+        await update.message.reply_text("✅ Сканер запущен (v7.3 Auto-Sheet).")
+        state["scanner_task"] = asyncio.create_task(scanner_loop(ctx.application))
     else:
         await update.message.reply_text("ℹ️ Сканер уже запущен.")
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global scanner_task
-    if scanner_task and not scanner_task.done():
-        scanner_task.cancel()
-        scanner_task = None
+    task = state.get("scanner_task")
+    if task and not task.done():
+        task.cancel()
+        state["scanner_task"] = None
+        state['monitoring'] = False; save_state()
         await update.message.reply_text("❌ Мониторинг остановлен.")
     else:
-        await update.message.reply_text("ℹ️ Мониторинг не был запущен.")
+        state['monitoring'] = False; save_state()
+        await update.message.reply_text("ℹ️ Мониторинг не был запущен, но флаг остановлен.")
 
 # ... (Команды /entry и /exit остаются без изменений)
 async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global state
     try:
         pair = ctx.args[0].upper()
+        if "/" not in pair: pair += "/USDT"
         deposit, entry_price, sl, tp = map(float, ctx.args[1:5])
     except (IndexError, ValueError):
         await update.message.reply_text("⚠️ /entry <ТИКЕР> <депозит> <цена> <sl> <tp>"); return
