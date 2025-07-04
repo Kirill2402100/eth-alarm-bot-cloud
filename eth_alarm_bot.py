@@ -1,318 +1,278 @@
 #!/usr/bin/env python3
 # ============================================================================
-# eth_alarm_bot.py — v16.0 "Final Accounting" (25-Jun-2025)
-# • Исправлен запрос баланса для корректной работы с фьючерсным счетом OKX.
-# • Добавлено отклонение сделки при неадекватном R:R от LLM.
+# v7.0 - LLM Ranker
+# • Сканирует топ-N монет, находит кандидатов в "пиле".
+# • Отправляет список кандидатов в LLM для выбора и ранжирования топ-5.
+# • Присылает готовые сигналы с полным расчетом.
+# • Поддерживает ручное логирование сделок.
 # ============================================================================
 
-import os, asyncio, json, logging, math, time
+import os
+import asyncio
+import json
+import logging
 from datetime import datetime
-
-import aiohttp, numpy as np, pandas as pd
+import pandas as pd
 import ccxt.async_support as ccxt
 import gspread
+import aiohttp
+import pandas_ta as ta
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, Defaults, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ────────── ENV ──────────
-BOT_TOKEN   = os.getenv("BOT_TOKEN")
-CHAT_IDS    = {int(c) for c in os.getenv("CHAT_IDS", "0").split(",") if c}
-PAIR_RAW    = os.getenv("PAIR", "BTC-USDT-SWAP")
-INIT_LEV    = int(os.getenv("LEVERAGE", 4))
+# === ENV / Logging ===
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
+SHEET_ID = os.getenv("SHEET_ID")
+COIN_LIST_SIZE = int(os.getenv("COIN_LIST_SIZE", "100"))
 
-LLM_API_KEY  = os.getenv("LLM_API_KEY")
-LLM_API_URL  = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
+LLM_API_KEY = os.getenv("LLM_API_KEY")
+LLM_API_URL = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
 LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "gpt-4.1")
-LLM_THRESHOLD= float(os.getenv("LLM_CONFIDENCE_THRESHOLD", 7.0))
-MIN_RR_RATIO = float(os.getenv("MIN_RR_RATIO", 2.0))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
-for n in ("httpx", "telegram.vendor.httpx", "aiohttp.access"): logging.getLogger(n).setLevel(logging.WARNING)
+for n in ("httpx",): logging.getLogger(n).setLevel(logging.WARNING)
 
-# ────────── Google Sheets (опц.) ──────────
-SHEET_ID = os.getenv("SHEET_ID")
-_gscope  = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-if os.getenv("GOOGLE_CREDENTIALS"):
-    _creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(os.getenv("GOOGLE_CREDENTIALS")), _gscope)
-    _gs    = gspread.authorize(_creds)
-else:
-    _gs=None; log.warning("GOOGLE_CREDENTIALS not set.")
+# === GOOGLE SHEETS ===
+try:
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    gs = gspread.authorize(creds)
+    LOGS_WS = gs.open_by_key(SHEET_ID).worksheet("Trading_Logs_v7")
+    HEADERS = ["Дата входа", "Инструмент", "Направление", "Депозит", "Цена входа", "Stop Loss", "Take Profit", "P&L сделки (USDT)", "% к депозиту"]
+    if LOGS_WS.row_values(1) != HEADERS:
+        LOGS_WS.resize(rows=1); LOGS_WS.update('A1', [HEADERS])
+except Exception as e:
+    log.error("Google Sheets init failed: %s", e)
+    LOGS_WS = None
 
-def _ws(title:str):
-    if not (_gs and SHEET_ID): return None
-    ss=_gs.open_by_key(SHEET_ID)
-    try: return ss.worksheet(title)
-    except gspread.WorksheetNotFound: return ss.add_worksheet(title, rows=1000, cols=20)
+# === STATE MANAGEMENT ===
+STATE_FILE = "scanner_v7_state.json"
+state = {"monitoring": False, "manual_position": None, "last_alert_times": {}}
 
-HEADERS = ["DATE-UTC","SIDE","DEPOSIT","ENTRY","SL","TP","RR","P&L","APR%","LLM","CONF","EXIT_METHOD"]
-WS = _ws("AI-V16")
-if WS and WS.row_values(1)!=HEADERS: WS.clear(); WS.append_row(HEADERS)
+def save_state():
+    with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
 
-# ────────── биржа OKX (swap, isolated) ──────────
-exchange = ccxt.okx({
-    "apiKey": os.getenv("OKX_API_KEY"), "secret": os.getenv("OKX_SECRET"),
-    "password": os.getenv("OKX_PASSWORD"), "options": {"defaultType":"swap"},
-    "enableRateLimit": True,
-})
-PAIR = PAIR_RAW.replace("/", "-").replace(":USDT","").upper()
-if "-SWAP" not in PAIR: PAIR += "-SWAP"
+def load_state():
+    global state
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, 'r') as f: state = json.load(f)
+    log.info("State loaded. Manual Position: %s", state.get("manual_position"))
 
-# ────────── индикаторы ──────────
-SSL_LEN, RSI_LEN = 13, 14
-RSI_LONGT, RSI_SHORTT = 52, 48
+# === EXCHANGE (только для данных) ===
+exchange = ccxt.mexc()
 
-def _ta_rsi(series:pd.Series, length=14):
-    delta=series.diff(); gain=delta.clip(lower=0).rolling(window=length, min_periods=length).mean()
-    loss=(-delta.clip(upper=0)).rolling(window=length, min_periods=length).mean()
-    if loss.empty or loss.iloc[-1] == 0: return 100
-    rs = gain.iloc[-1] / loss.iloc[-1] if loss.iloc[-1] != 0 else float('inf')
-    return 100 - (100 / (1 + rs))
+# === STRATEGY PARAMS ===
+TIMEFRAME = '5m'
+SCAN_INTERVAL_SECONDS = 60 * 15
+ADX_LEN, ADX_THRESHOLD = 14, 20
+BBANDS_LEN, BBANDS_STD = 20, 2.0
+MIN_BB_WIDTH_PCT = 3.0
+RSI_LEN, RSI_OVERSOLD = 14, 30
+ATR_LEN_FOR_SL, SL_ATR_MUL = 14, 0.5
 
-def calc_atr(df:pd.DataFrame, length=14):
-    high_low = df['high'] - df['low']
-    high_close = (df['high'] - df['close'].shift()).abs()
-    low_close = (df['low'] - df['close'].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(window=length, min_periods=length).mean()
+# === LLM ===
+LLM_RANKING_PROMPT = (
+    "Ты — главный аналитик инвестфонда. Тебе предоставлен список активов, показывающих механический сигнал на покупку в боковике (лонг в 'пиле'). "
+    "Твоя задача — проанализировать все сетапы и выбрать из них до 5 самых качественных и надежных. "
+    "Верни ответ ТОЛЬКО в виде JSON-списка. Каждый элемент списка должен быть JSON-объектом с полями 'asset' (тикер актива) и 'reasoning' (RU, краткое и убедительное обоснование, почему этот актив лучше других кандидатов). "
+    "Ранжируй список от лучшего к худшему. Если качественных сетапов нет, верни пустой список [].\n\n"
+    "Кандидаты:\n{candidates}"
+)
 
-def calc_ind(df:pd.DataFrame):
-    df['ema_fast']=df['close'].ewm(span=20, adjust=False).mean()
-    df['ema_slow']=df['close'].ewm(span=50, adjust=False).mean()
-    sma=df['close'].rolling(SSL_LEN).mean()
-    hi=df['high'].rolling(SSL_LEN).max(); lo=df['low'].rolling(SSL_LEN).min()
-    df['ssl_up']=np.where(df['close']>sma, hi, lo)
-    df['ssl_dn']=np.where(df['close']>sma, lo, hi)
-    cross_up  =(df['ssl_up'].shift(1)<df['ssl_dn'].shift(1))&(df['ssl_up']>df['ssl_dn'])
-    cross_dn  =(df['ssl_up'].shift(1)>df['ssl_dn'].shift(1))&(df['ssl_up']<df['ssl_dn'])
-    sig=pd.Series(np.nan,index=df.index)
-    sig.loc[cross_up]=1 ; sig.loc[cross_dn]=-1
-    df['ssl_sig']=sig.ffill().fillna(0).astype(int)
-    df['rsi']=_ta_rsi(df['close'], RSI_LEN)
-    df['atr'] = calc_atr(df, 14)
-    return df
-
-# ────────── глобальное состояние ──────────
-state={"monitor":False,"leverage":INIT_LEV,"position":None,"last_ts":0}
-
-# ────────── helpers ──────────
-async def broadcast(ctx, txt): 
-    for cid in ctx.application.chat_ids:
-        try: await ctx.application.bot.send_message(cid, txt, parse_mode="HTML")
-        except Exception as e: log.warning("tg send %s: %s", cid, e)
-
-# ---> ИСПРАВЛЕННАЯ ФУНКЦИЯ ЗАПРОСА БАЛАНСА <---
-async def free_usdt():
-    try:
-        # Явно указываем, что нам нужен баланс фьючерсного (swap) счета
-        params = {'type': 'swap'}
-        balance = await exchange.fetch_balance(params=params)
-        return balance.get('USDT', {}).get('free', 0) or 0
-    except Exception as e:
-        log.error("Could not fetch SWAP balance: %s", e)
-        return 0
-
-# ────────── LLM ──────────
-LLM_PROMPT = (
-"Ты — трейдер-аналитик 'Сигма'. Дай ответ ТОЛЬКО JSON c полями "
-"decision (APPROVE / REJECT), confidence_score (0–10), reasoning (RU), "
-"suggested_tp, suggested_sl. "
-"Правила для анализа: "
-"1. Для LONG SL должен быть ниже recent_low, а TP - ниже recent_high. "
-"2. Для SHORT SL должен быть выше recent_high, а TP - выше recent_low. "
-f"3. Соотношение Риск/Прибыль для предложенных уровней должно быть не менее 1:{MIN_RR_RATIO} (прибыль в {MIN_RR_RATIO} раза больше риска). "
-"Проанализируй Trade:\n{trade}")
-
-async def ask_llm(trade_data, ctx):
-    if not LLM_API_KEY: return None
-    payload={"model":LLM_MODEL_ID,"messages":[{"role":"user","content":LLM_PROMPT.format(trade=json.dumps(trade_data,ensure_ascii=False))}],"temperature":0.2}
-    headers={"Authorization":f"Bearer {LLM_API_KEY}","Content-Type":"application/json"}
+async def ask_llm_to_rank(candidates_data):
+    if not LLM_API_KEY: return []
+    prompt = LLM_RANKING_PROMPT.format(candidates=json.dumps(candidates_data, indent=2, ensure_ascii=False))
+    payload = {"model": LLM_MODEL_ID, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "response_format": {"type": "json_object"}}
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.post(LLM_API_URL,json=payload,headers=headers,timeout=60) as r:
-                txt=await r.text()
-                if r.status!=200:
-                    await broadcast(ctx,f"⚠️ LLM HTTP{r.status}: {txt[:120]}"); return None
-                try:
-                    msg=json.loads(txt)["choices"][0]["message"]["content"]
-                    clean_msg = msg.strip().replace("```json", "").replace("```", "")
-                    ans=json.loads(clean_msg)
-                except Exception:
-                    log.error("LLM raw response parse error: %s", txt[:500])
-                    await broadcast(ctx,"⚠️ LLM ответ непонятен, сигнал пропущен."); return None
-                await broadcast(ctx, (f"🧠 <b>LLM:</b> {ans.get('decision', 'N/A')} "
-                                      f"(<i>{ans.get('confidence_score', 'N/A')}/10</i>)\n"
-                                      f"<i>{ans.get('reasoning', '')}</i>"))
-                return ans
-    except Exception as e:
-        log.error("LLM req err: %s", e); await broadcast(ctx,f"❌ LLM error: {e}")
-    return None
-
-# ────────── торговые действия ──────────
-async def open_pos(side, price, llm, td, ctx):
-    usdt_balance = await free_usdt()
-    if usdt_balance <= 1:
-        await broadcast(ctx,"❗ Недостаточно средств на торговом SWAP аккаунте."); state['position']=None; return
-
-    # --- ПРОВЕРКА R:R ОТ LLM ---
-    sl = llm.get('suggested_sl')
-    tp = llm.get('suggested_tp')
-    if not (sl and tp):
-        await broadcast(ctx, "🟦 LLM не предоставил уровни SL/TP. Сигнал отклонен."); state['position']=None; return
-    
-    # Проверяем соотношение на адекватность
-    risk = abs(price - sl)
-    reward = abs(tp - price)
-    if risk == 0 or (reward / risk) < (MIN_RR_RATIO - 0.1): # -0.1 для погрешности
-        await broadcast(ctx, f"🟦 LLM предложил невыгодный R:R ({reward/risk:.2f}). Сигнал отклонен."); state['position']=None; return
-    # --- КОНЕЦ ПРОВЕРКИ ---
-
-    try:
-        m = exchange.market(PAIR)
-        contract_value = m.get('contractVal', 1)
-        lot_size = m['limits']['amount']['min'] or 1
-        position_size_usdt = (usdt_balance * 0.99) * state['leverage']
-        num_contracts = position_size_usdt / (price * contract_value)
-        num_contracts = math.floor(num_contracts / lot_size) * lot_size
-        
-        if num_contracts < lot_size:
-            await broadcast(ctx,f"❗ Недостаточно средств для мин. лота ({lot_size})."); state['position']=None; return
-
-        await exchange.set_leverage(state['leverage'], PAIR)
-        order = await exchange.create_market_order(PAIR,'buy' if side=="LONG" else 'sell', num_contracts, params={"tdMode":"isolated"})
-        if not isinstance(order, dict) or 'id' not in order:
-            raise ValueError(f"Invalid order response: {order}")
-
-    except Exception as e:
-        log.error("Failed to create order: %s", e)
-        await broadcast(ctx, f"❌ Биржа отклонила ордер: {e}"); state['position']=None; return
-
-    entry=order.get('average') or order.get('price') or price
-    real_amount = float(order.get('filled', num_contracts))
-    
-    state['position']=dict(side=side,amount=real_amount,entry=entry,sl=sl,tp=tp,opened=time.time(),llm=llm,dep=usdt_balance)
-    
-    try:
-        stop_loss_params = {'tdMode': 'isolated', 'slTriggerPx': f"{sl}", 'slOrdPx': '-1'}
-        await exchange.create_order(PAIR, 'market', 'sell' if side == "LONG" else 'buy', real_amount, None, stop_loss_params)
-
-        take_profit_params = {'tdMode': 'isolated', 'tpTriggerPx': f"{tp}", 'tpOrdPx': '-1'}
-        await exchange.create_order(PAIR, 'market', 'sell' if side == "LONG" else 'buy', real_amount, None, take_profit_params)
-    except Exception as e:
-        log.error("Failed to set SL/TP orders: %s", e)
-        await broadcast(ctx, "⚠️ Не удалось выставить SL/TP на бирже. Закройте позицию вручную!")
-
-    await broadcast(ctx, (f"✅ Открыта {side} qty={real_amount:.4f}\n🔹Entry={entry:.2f}\n"
-                          f"🔻SL={sl:.2f}  🔺TP={tp:.2f}"))
-
-# ... (остальной код остается без изменений, включая close_pos, команды и главный цикл)
-async def close_pos(reason, price, ctx):
-    p=state.pop('position',None); 
-    if not p: return
-    try: # Пытаемся отменить все отложенные ордера (SL/TP) для этой пары
-        await exchange.cancel_all_orders(PAIR)
-    except Exception as e:
-        log.warning("Could not cancel all orders, may fail to close: %s", e)
-    
-    try: # Закрываем позицию по рынку
-        order=await exchange.create_market_order(PAIR,'sell' if p['side']=="LONG" else 'buy',p['amount'],params={"tdMode":"isolated","reduceOnly":True})
-        close_price=order.get('average',price)
-    except Exception as e:
-        log.error("Failed to close position: %s", e)
-        await broadcast(ctx, f"❌ Ошибка закрытия позиции: {e}. Пожалуйста, проверьте биржу."); close_price = price
-        
-    pnl=(close_price-p['entry'])*p['amount']*(1 if p['side']=="LONG" else -1)
-    days=max((time.time()-p['opened'])/86400,1e-9); apr=pnl/p['dep']*(365/days)*100
-    await broadcast(ctx,f"⛔ Закрыта ({reason}) P&L={pnl:.2f}$ APR={apr:.1f}%")
-    if WS:
-        rr=round(abs((p['tp']-p['entry'])/(p['entry']-p['sl'])),2) if p['entry']!=p['sl'] else 0
-        WS.append_row([datetime.utcnow().strftime("%F %T"),p['side'],p['dep'],p['entry'],p['sl'],p['tp'],rr,pnl,round(apr,2),p['llm']['decision'],p['llm']['confidence_score'], p.get('exit_method', 'N/A')])
-
-# ────────── Telegram cmd ──────────
-async def cmd_start(u,ctx):
-    ctx.application.chat_ids.add(u.effective_chat.id); state["monitor"]=True
-    await u.message.reply_text("✅ Monitoring ON (v16.0 Final Accounting)")
-    if not ctx.chat_data.get("task"): ctx.chat_data["task"]=asyncio.create_task(monitor(ctx))
-async def cmd_stop(u,ctx): state["monitor"]=False; await u.message.reply_text("⛔ Monitoring OFF")
-async def cmd_lev(u,ctx):
-    try: lev=int(u.message.text.split()[1]); assert 1<=lev<=100
-    except: return await u.message.reply_text("usage /leverage 5")
-    state['leverage']=lev; await u.message.reply_text(f"Leverage → {lev}x")
-
-# ────────── MONITOR LOOP ──────────
-async def monitor(ctx):
-    while True:
-        await asyncio.sleep(30)
-        if not state['monitor']: continue
-        try:
-            p=state.get('position')
-            if p and p.get('side'):
-                try:
-                    positions = await exchange.fetch_positions([PAIR])
-                    open_positions = [pos for pos in positions if pos.get('unrealizedPnl') is not None and float(pos.get('unrealizedPnl', 0)) != 0.0]
-                    if not open_positions:
-                        log.info("Position seems to be closed manually. Resetting state.")
-                        await broadcast(ctx, "ℹ️ Позиция была закрыта вручную. Сбрасываю состояние.")
-                        state['position'] = None; continue
-                except Exception as e:
-                    log.error("Error checking open position status: %s", e)
-                continue
-
-            ohl=await exchange.fetch_ohlcv(PAIR,'15m',limit=100)
-            df=pd.DataFrame(ohl,columns=['ts','open','high','low','close','volume'])
-            if int(df.iloc[-1]['ts'])==state.get('last_ts', 0): continue
-            state['last_ts']=int(df.iloc[-1]['ts'])
-            
-            df=calc_ind(df); ind=df.iloc[-1]
-            log.info("New 15m candle analyzed (TS: %s)", state['last_ts'])
-
-            if not state.get('position'):
-                sig=int(ind['ssl_sig'])
-                longCond = sig==1  and (ind['close'] > ind['ema_fast'] and ind['close'] > ind['ema_slow']) and ind['rsi']>RSI_LONGT
-                shortCond= sig==-1 and (ind['close'] < ind['ema_fast'] and ind['close'] < ind['ema_slow']) and ind['rsi']<RSI_SHORTT
-                side="LONG" if longCond else "SHORT" if shortCond else None
-                if not side: continue
+            async with s.post(LLM_API_URL, json=payload, headers=headers, timeout=180) as r:
+                txt = await r.text()
+                if r.status != 200:
+                    log.error(f"LLM Ranking HTTP Error {r.status}: {txt}")
+                    return []
                 
-                await broadcast(ctx,f"🔍 Базовый сигнал {side}. Анализ LLM…")
+                response_json = json.loads(txt)
+                content_str = response_json["choices"][0]["message"]["content"]
                 
-                lookback = 50 
-                recent_high = df['high'].tail(lookback).max()
-                recent_low = df['low'].tail(lookback).min()
-
-                td={"asset":PAIR,"tf":"15m","signal":side,"price":ind['close'],
-                    "atr":round(ind['atr'], 4) if not pd.isna(ind['atr']) else 0,
-                    "rsi":round(ind['rsi'],1),
-                    "market_structure": {
-                        "recent_high": round(recent_high, 2),
-                        "recent_low": round(recent_low, 2)
-                    }
-                }
-                
-                state['position']={"opening":True}
-                llm=await ask_llm(td,ctx)
-                if llm and llm.get("decision")=="APPROVE" and llm.get("confidence_score",0)>=LLM_THRESHOLD:
-                    await open_pos(side, ind['close'], llm, td, ctx)
+                # Очистка от Markdown
+                if "```json" in content_str:
+                    json_part = content_str.split("```json")[1].split("```")[0]
+                elif "```" in content_str:
+                    json_part = content_str.split("```")[1]
                 else:
-                    await broadcast(ctx,"🟦 LLM отклонил сигнал."); state['position']=None
-        except Exception as e:
-            log.exception("MAIN LOOP FAILED: %s", e); state['position']=None
+                    json_part = content_str
+                
+                # Ищем сам список внутри ответа
+                if '[' in json_part and ']' in json_part:
+                    list_part = json_part[json_part.find('['):json_part.rfind(']')+1]
+                    return json.loads(list_part)
+                return []
+    except Exception as e:
+        log.error("LLM Ranking request/parse err: %s", e)
+        return []
 
-# ────────── main ──────────
-async def shutdown(app): await exchange.close()
-async def main():
-    app=(ApplicationBuilder().token(BOT_TOKEN).defaults(Defaults(parse_mode="HTML")).post_shutdown(shutdown).build())
-    app.chat_ids=set(CHAT_IDS)
-    app.add_handler(CommandHandler("start",cmd_start)); app.add_handler(CommandHandler("stop",cmd_stop)); app.add_handler(CommandHandler("leverage",cmd_lev))
-    async with app:
-        try: 
-            await exchange.load_markets()
-            bal=await exchange.fetch_balance(params={'type':'swap'}); log.info("USDT SWAP free=%s", bal['USDT']['free'])
-        except Exception as e:
-            log.error("Failed to load markets/balance on startup: %s", e)
-        await app.start(); await app.updater.start_polling()
-        await asyncio.Event().wait()
+# === MAIN SCANNER LOOP ===
+async def scanner_loop(app):
+    await broadcast_message(app, "🤖 Сканер запущен. Начинаю формирование списка топ-монет по объему...")
+    try:
+        await exchange.load_markets()
+        tickers = await exchange.fetch_tickers()
+        usdt_pairs = {s: t for s, t in tickers.items() if s.endswith('/USDT') and t.get('quoteVolume') and all(kw not in s for kw in ['UP/', 'DOWN/', '3S/', '3L/'])}
+        sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
+        coin_list = [item[0] for item in sorted_pairs[:COIN_LIST_SIZE]]
+        await broadcast_message(app, f"✅ Список из {len(coin_list)} монет для сканирования сформирован.")
+    except Exception as e:
+        log.error(f"Failed to fetch dynamic coin list: %s", e)
+        await broadcast_message(app, "⚠️ Не удалось сформировать динамический список монет. Проверьте лог."); return
 
-if __name__=="__main__":
-    try: asyncio.run(main())
-    except (KeyboardInterrupt,SystemExit): log.info("bye")
+    while state.get('monitoring', False):
+        log.info(f"Starting new scan for {len(coin_list)} coins...")
+        candidates = []
+        for pair in coin_list:
+            try:
+                ohlcv = await exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME, limit=100)
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                if len(df) < 50: continue
+
+                df.ta.adx(length=ADX_LEN, append=True)
+                df.ta.bbands(length=BBANDS_LEN, std=BBANDS_STD, append=True)
+                df.ta.rsi(length=RSI_LEN, append=True)
+                df.ta.atr(length=ATR_LEN_FOR_SL, append=True)
+                df.dropna(inplace=True)
+
+                last = df.iloc[-1]
+                
+                is_ranging = last[f'ADX_{ADX_LEN}'] < ADX_THRESHOLD
+                bb_upper = last[f'BBU_{BBANDS_LEN}_{BBANDS_STD}']
+                bb_lower = last[f'BBL_{BBANDS_LEN}_{BBANDS_STD}']
+                is_wide_enough = ((bb_upper - bb_lower) / bb_lower) * 100 > MIN_BB_WIDTH_PCT
+                is_oversold_at_bottom = last['close'] <= bb_lower and last[f'RSI_{RSI_LEN}'] < RSI_OVERSOLD
+                
+                if is_ranging and is_wide_enough and is_oversold_at_bottom:
+                    if (datetime.now().timestamp() - state["last_alert_times"].get(pair, 0)) < 3600 * 4: continue
+                    candidates.append({"pair": pair, "price": last['close'], "atr": last[f'ATRr_{ATR_LEN_FOR_SL}'], "rsi": round(last[f'RSI_{RSI_LEN}'], 1), "bb_lower": bb_lower, "bb_middle": last[f'BBM_{BBANDS_LEN}_{BBANDS_STD}']})
+            except Exception as e:
+                log.error(f"Error processing pair {pair}: {e}")
+
+        if candidates:
+            await broadcast_message(app, f"🔍 Найдено {len(candidates)} кандидатов. Отправляю на ранжирование в LLM...")
+            
+            llm_candidates_data = [{"asset": c["pair"], "rsi": c["rsi"]} for c in candidates]
+            top_rated_assets = await ask_llm_to_rank(llm_candidates_data)
+
+            if top_rated_assets:
+                await broadcast_message(app, f"🏆 LLM отобрал топ-{len(top_rated_assets)} лучших сигналов:")
+                for ranked_asset in top_rated_assets:
+                    asset_name = ranked_asset.get("asset")
+                    original_candidate = next((c for c in candidates if c['pair'] == asset_name), None)
+                    if not original_candidate: continue
+
+                    entry_price = original_candidate['price']
+                    take_profit = original_candidate['bb_middle']
+                    stop_loss = original_candidate['bb_lower'] - (original_candidate['atr'] * SL_ATR_MUL)
+                    
+                    message = (
+                        f"🔔 **СИГНАЛ: LONG (Range Trade)**\n\n"
+                        f"**Монета:** `{asset_name}`\n"
+                        f"**Текущая цена:** `{entry_price:.4f}`\n\n"
+                        f"--- **Параметры сделки** ---\n"
+                        f"*Вход:* `~{entry_price:.4f}`\n"
+                        f"*Take Profit:* `{take_profit:.4f}` (Средняя BB)\n"
+                        f"*Stop Loss:* `{stop_loss:.4f}`\n\n"
+                        f"--- **Анализ LLM** ---\n"
+                        f"_{ranked_asset.get('reasoning')}_"
+                    )
+                    await broadcast_message(app, message)
+                    state["last_alert_times"][asset_name] = datetime.now().timestamp()
+                    save_state()
+                    await asyncio.sleep(1)
+            else:
+                await broadcast_message(app, "ℹ️ LLM не выбрал ни одного кандидата из предложенных.")
+        else:
+            log.info("No valid candidates found in this scan cycle.")
+
+        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+
+
+# === COMMANDS and RUN ===
+async def broadcast_message(app, text):
+    for chat_id in app.chat_ids:
+        safe_text = text.replace('.', r'\.').replace('-', r'\-').replace('(', r'\(').replace(')', r'\)').replace('>', r'\>').replace('+', r'\+').replace('=', r'\=').replace('*', r'\*').replace('_', r'\_').replace('`', r'\`')
+        await app.bot.send_message(chat_id=chat_id, text=safe_text, parse_mode="MarkdownV2")
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not hasattr(ctx.application, 'chat_ids'): ctx.application.chat_ids = set()
+    ctx.application.chat_ids.add(chat_id)
+    
+    if "scanner_task" not in ctx.application.chat_data or ctx.application.chat_data["scanner_task"].done():
+        state['monitoring'] = True; save_state()
+        await update.message.reply_text("✅ Сканер запущен (v7.0 LLM Ranker).")
+        ctx.application.chat_data["scanner_task"] = asyncio.create_task(scanner_loop(ctx.application))
+    else:
+        await update.message.reply_text("ℹ️ Сканер уже запущен.")
+
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    state['monitoring'] = False; save_state()
+    task = ctx.application.chat_data.get("scanner_task")
+    if task and not task.done(): task.cancel()
+    await update.message.reply_text("❌ Мониторинг остановлен.")
+
+async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global state
+    try:
+        pair = ctx.args[0].upper().replace("/", "") # Приводим к формату MEXC
+        if "/" not in pair: pair += "USDT"
+
+        deposit, entry_price, sl, tp = map(float, ctx.args[1:5])
+        
+        state["manual_position"] = {
+            "entry_time": datetime.now(timezone.utc).isoformat(), "deposit": deposit,
+            "entry_price": entry_price, "sl": sl, "tp": tp, "pair": pair, "side": "LONG"
+        }
+        save_state()
+        await update.message.reply_text(f"✅ Вход вручную зафиксирован: {pair} @ {entry_price}")
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ /entry <ТИКЕР> <депозит> <цена> <sl> <tp>"); return
+
+async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global state
+    pos = state.get("manual_position")
+    if not pos: await update.message.reply_text("⚠️ Нет открытой ручной позиции."); return
+    try:
+        exit_price = float(ctx.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ Использование: /exit <цена_выхода>"); return
+
+    pnl = (exit_price - pos['entry_price']) / pos['entry_price'] * pos['deposit']
+    pct_change = (pnl / pos['deposit']) * 100
+    
+    if LOGS_WS:
+        rr = abs((pos['tp'] - pos['entry_price']) / (pos['sl'] - pos['entry_price'])) if (pos['sl'] - pos['entry_price']) != 0 else 0
+        row = [
+            datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), pos['pair'],
+            pos.get("side", "N/A"), pos['deposit'], pos['entry_price'], pos['sl'], pos['tp'], 
+            round(rr, 2), round(pnl, 2), round(pct_change, 2)
+        ]
+        await asyncio.to_thread(LOGS_WS.append_row, row, value_input_option='USER_ENTERED')
+    
+    await update.message.reply_text(f"✅ Сделка по {pos['pair']} закрыта и записана.\nP&L: {pnl:.2f} USDT ({pct_change:.2f}%)")
+    state["manual_position"] = None
+    save_state()
+
+if __name__ == "__main__":
+    load_state()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("entry", cmd_entry))
+    app.add_handler(CommandHandler("exit", cmd_exit))
+
+    log.info("Bot started...")
+    app.run_polling()
