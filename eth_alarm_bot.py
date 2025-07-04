@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v9.0 - Per-Signal LLM Analysis
-# • Бот анализирует КАЖДЫЙ найденный механический сигнал через LLM.
-# • Сигнал отправляется пользователю только после одобрения LLM.
-# • Логика ранжирования убрана в пользу индивидуального анализа.
+# v8.2 - Final Detailed Logging
+# • Биржа: MEXC.
+# • Добавлено детальное пошаговое информирование в Telegram.
 # ============================================================================
 
 import os
@@ -25,7 +24,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID = os.getenv("SHEET_ID")
 COIN_LIST_SIZE = int(os.getenv("COIN_LIST_SIZE", "200"))
-WORKSHEET_NAME = "Trading_Logs_v9"
+WORKSHEET_NAME = "Trading_Logs_v8"
 
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_API_URL = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
@@ -59,7 +58,7 @@ def setup_google_sheets():
 LOGS_WS = setup_google_sheets()
 
 # === STATE MANAGEMENT ===
-STATE_FILE = "scanner_v9_state.json"
+STATE_FILE = "scanner_v8_state.json"
 state = {"monitoring": False, "manual_position": None, "last_alert_times": {}}
 def save_state():
     with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
@@ -90,65 +89,66 @@ def calculate_indicators(df: pd.DataFrame):
     return df.dropna()
 
 # === LLM ===
-LLM_PROMPT = (
-    "Ты — трейдер-аналитик 'Сигма'. Твоя задача — проанализировать предоставленный торговый сетап "
-    "для входа в LONG в боковике и дать свое заключение. Ищи потенциальные риски, которые мог пропустить механический алгоритм. "
-    "Дай ответ ТОЛЬКО в виде JSON-объекта с полями: 'decision' ('APPROVE'/'REJECT'), 'confidence_score' (0-10) и 'reasoning' (RU, краткое обоснование твоего решения).\n\n"
-    "Анализируй сетап:\n{trade_data}"
+LLM_RANKING_PROMPT = (
+    "Ты — главный аналитик инвестфонда. Тебе предоставлен список активов, показывающих механический сигнал на покупку в боковике (лонг в 'пиле'). "
+    "Твоя задача — проанализировать все сетапы и выбрать из них до 5 самых качественных и надежных. "
+    "Верни ответ ТОЛЬКО в виде JSON-списка. Каждый элемент списка должен быть JSON-объектом с полями 'asset' (тикер актива) и 'reasoning' (RU, краткое и убедительное обоснование, почему этот актив лучше других кандидатов). "
+    "Ранжируй список от лучшего к худшему. Если качественных сетапов нет, верни пустой список [].\n\n"
+    "Кандидаты:\n{candidates}"
 )
-
-async def ask_llm(trade_data):
-    if not LLM_API_KEY: return {"decision": "N/A", "reasoning": "LLM не настроен."}
-    prompt = LLM_PROMPT.format(trade_data=json.dumps(trade_data, indent=2, ensure_ascii=False))
+async def ask_llm_to_rank(candidates_data):
+    if not LLM_API_KEY: return []
+    prompt = LLM_RANKING_PROMPT.format(candidates=json.dumps(candidates_data, indent=2, ensure_ascii=False))
     payload = {"model": LLM_MODEL_ID, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "response_format": {"type": "json_object"}}
     headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.post(LLM_API_URL, json=payload, headers=headers, timeout=90) as r:
+            async with s.post(LLM_API_URL, json=payload, headers=headers, timeout=180) as r:
                 txt = await r.text()
                 if r.status != 200:
-                    log.error(f"LLM HTTP Error {r.status}: {txt}")
-                    return {"decision": "ERROR", "reasoning": f"HTTP {r.status}"}
-                
+                    log.error(f"LLM Ranking HTTP Error {r.status}: {txt}"); return []
                 response_json = json.loads(txt)
                 content_str = response_json["choices"][0]["message"]["content"]
-                
-                if "```json" in content_str:
-                    clean_msg = content_str.split("```json")[1].split("```")[0]
-                else:
-                    clean_msg = content_str.strip().strip("`")
-
-                return json.loads(clean_msg)
+                if "```json" in content_str: json_part = content_str.split("```json")[1].split("```")[0]
+                else: json_part = content_str
+                if '[' in json_part and ']' in json_part:
+                    list_part = json_part[json_part.find('['):json_part.rfind(']')+1]
+                    return json.loads(list_part)
+                return []
     except Exception as e:
-        log.error("LLM request/parse err: %s", e)
-        return {"decision": "ERROR", "reasoning": str(e)}
+        log.error("LLM Ranking request/parse err: %s", e); return []
 
 # === MAIN SCANNER LOOP ===
 async def scanner_loop(app):
-    await broadcast_message(app, "🤖 Сканер запущен. Начинаю формирование списка топ-монет по объему...")
+    await broadcast_message(app, "🤖 Сканер запущен...")
     try:
         await exchange.load_markets()
         tickers = await exchange.fetch_tickers()
-        usdt_pairs = {s: t for s, t in tickers.items() if s.endswith('/USDT') and t.get('quoteVolume') and all(kw not in s for kw in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])}
-        sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
+        
+        all_usdt_pairs_spot = {s for s, m in exchange.markets.items() if m.get('spot') and m.get('quote') == 'USDT'}
+        total_usdt_count = len(all_usdt_pairs_spot)
+        
+        liquid_usdt_pairs = {s: t for s, t in tickers.items() if s in all_usdt_pairs_spot and t.get('quoteVolume') and all(kw not in s for kw in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])}
+        sorted_pairs = sorted(liquid_usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
         coin_list = [item[0] for item in sorted_pairs[:COIN_LIST_SIZE]]
-        await broadcast_message(app, f"✅ Список из {len(coin_list)} монет для сканирования сформирован.")
+        
+        # ---> Сообщение 1: Общее количество монет <---
+        await broadcast_message(app, f"1. Найдено {total_usdt_count} монет к USDT. Анализирую топ-{len(coin_list)}.")
+
     except Exception as e:
         log.error(f"Failed to fetch dynamic coin list: %s", e)
         await broadcast_message(app, "⚠️ Не удалось сформировать динамический список монет. Проверьте лог."); return
 
     while state.get('monitoring', False):
         log.info(f"Starting new scan for {len(coin_list)} coins...")
-        found_signals = 0
+        candidates = []
         for pair in coin_list:
             try:
                 ohlcv = await exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME, limit=100)
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 if df.empty: continue
                 df_with_indicators = calculate_indicators(df.copy())
-                if len(df_with_indicators) < 2:
-                    log.warning(f"Not enough data for {pair} after indicator calculation, skipping.")
-                    continue
+                if len(df_with_indicators) < 2: continue
                 
                 last = df_with_indicators.iloc[-1]
                 adx_value = last[f'ADX_{ADX_LEN}']
@@ -157,50 +157,39 @@ async def scanner_loop(app):
                 bb_width_pct = ((bb_upper - bb_lower) / bb_lower) * 100
                 rsi_value = last[f'RSI_{RSI_LEN}']
 
-                is_ranging = adx_value < ADX_THRESHOLD
-                is_wide_enough = bb_width_pct > MIN_BB_WIDTH_PCT
-                is_oversold_at_bottom = last['close'] <= bb_lower and rsi_value < RSI_OVERSOLD
-                
-                if is_ranging and is_wide_enough and is_oversold_at_bottom:
-                    now = datetime.now().timestamp()
-                    if (now - state["last_alert_times"].get(pair, 0)) < 3600 * 4: continue
-
-                    await broadcast_message(app, f"🔍 Найден кандидат: `{pair}`. Отправляю на индивидуальный анализ в LLM...")
-                    
-                    trade_data = {
-                        "asset": pair, "tf": TIMEFRAME, "signal": "Range Long",
-                        "price": last['close'], "rsi": round(rsi_value, 1),
-                        "bb_width_pct": round(bb_width_pct, 1), "adx": round(adx_value, 1)
-                    }
-                    
-                    llm_decision = await ask_llm(trade_data)
-                    
-                    if llm_decision and llm_decision.get("decision") == "APPROVE" and llm_decision.get("confidence_score", 0) >= LLM_THRESHOLD:
-                        found_signals += 1
-                        entry_price = last['close']
-                        take_profit = last[f'BBM_{BBANDS_LEN}_{BBANDS_STD}']
-                        stop_loss = bb_lower - (last[f'ATRr_{ATR_LEN_FOR_SL}'] * SL_ATR_MUL)
-                        
-                        message = (
-                            f"🔔 **СИГНАЛ: LONG (Range Trade) - ОДОБРЕН LLM**\n\n"
-                            f"**Монета:** `{pair}`\n"
-                            f"**Текущая цена:** `{entry_price:.4f}`\n\n"
-                            f"--- **Параметры сделки** ---\n"
-                            f"**Вход:** `~{entry_price:.4f}`\n"
-                            f"**Take Profit:** `{take_profit:.4f}` (Средняя BB)\n"
-                            f"**Stop Loss:** `{stop_loss:.4f}`\n\n"
-                            f"--- **Анализ LLM ({llm_decision.get('confidence_score')}/10)** ---\n"
-                            f"_{llm_decision.get('reasoning')}_"
-                        )
-                        await broadcast_message(app, message)
-                        state["last_alert_times"][pair] = datetime.now().timestamp()
-                        save_state()
-                    else:
-                        await broadcast_message(app, f"ℹ️ LLM отклонил сигнал по `{pair}`. Причина: _{llm_decision.get('reasoning', 'Нет')}_")
+                if (adx_value < ADX_THRESHOLD) and (bb_width_pct > MIN_BB_WIDTH_PCT) and (last['close'] <= bb_lower and rsi_value < RSI_OVERSOLD):
+                    if (datetime.now().timestamp() - state["last_alert_times"].get(pair, 0)) < 3600 * 4: continue
+                    candidates.append({"pair": pair, "price": last['close'], "atr": last[f'ATRr_{ATR_LEN_FOR_SL}'], "rsi": round(rsi_value, 1), "bb_lower": bb_lower, "bb_middle": last[f'BBM_{BBANDS_LEN}_{BBANDS_STD}']})
             except Exception as e:
                 log.error(f"Error processing pair {pair}: {e}")
-        
-        log.info(f"Scan finished. Found {found_signals} approved signals.")
+
+        if candidates:
+            # ---> Сообщение 2: Количество найденных кандидатов <---
+            await broadcast_message(app, f"2. Отобрано по индикаторам {len(candidates)} монет для LLM.")
+            
+            llm_candidates_data = [{"asset": c["pair"], "rsi": c["rsi"]} for c in candidates]
+            top_rated_assets = await ask_llm_to_rank(llm_candidates_data)
+
+            if top_rated_assets:
+                # ---> Сообщение 3: Количество лучших по мнению LLM <---
+                await broadcast_message(app, f"3. Для сигналов отобрано {len(top_rated_assets)} лучших:")
+                for ranked_asset in top_rated_assets:
+                    asset_name = ranked_asset.get("asset")
+                    original_candidate = next((c for c in candidates if c['pair'] == asset_name), None)
+                    if not original_candidate: continue
+                    entry_price = original_candidate['price']
+                    take_profit = original_candidate['bb_middle']
+                    stop_loss = original_candidate['bb_lower'] - (original_candidate['atr'] * SL_ATR_MUL)
+                    
+                    message = (f"🔔 **СИГНАЛ: LONG (Range Trade)**\n\n**Монета:** `{asset_name}`\n**Текущая цена:** `{entry_price:.4f}`\n\n--- **Параметры сделки** ---\n**Вход:** `~{entry_price:.4f}`\n**Take Profit:** `{take_profit:.4f}` (Средняя BB)\n**Stop Loss:** `{stop_loss:.4f}`\n\n--- **Анализ LLM** ---\n_{ranked_asset.get('reasoning')}_")
+                    await broadcast_message(app, message)
+                    state["last_alert_times"][asset_name] = datetime.now().timestamp()
+                    save_state()
+                    await asyncio.sleep(1)
+            else: 
+                await broadcast_message(app, "ℹ️ LLM не одобрил ни одного кандидата.")
+        else:
+            log.info("No valid candidates found in this scan cycle.")
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
 # === COMMANDS and RUN ===
