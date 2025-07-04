@@ -127,10 +127,16 @@ async def scanner_loop(app):
     try:
         await exchange.load_markets()
         tickers = await exchange.fetch_tickers()
-        usdt_pairs = {s: t for s, t in tickers.items() if s.endswith('/USDT') and t.get('quoteVolume') and all(kw not in s for kw in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])}
-        sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
+        
+        all_usdt_pairs_spot = {s for s, m in exchange.markets.items() if m.get('spot') and m.get('quote') == 'USDT'}
+        total_usdt_count = len(all_usdt_pairs_spot)
+        
+        liquid_usdt_pairs = {s: t for s, t in tickers.items() if s in all_usdt_pairs_spot and t.get('quoteVolume') and all(kw not in s for kw in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])}
+        sorted_pairs = sorted(liquid_usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
         coin_list = [item[0] for item in sorted_pairs[:COIN_LIST_SIZE]]
-        await broadcast_message(app, f"1. Найдено {len(usdt_pairs)} монет к USDT. Анализирую топ-{len(coin_list)}.")
+        
+        await broadcast_message(app, f"1. Найдено {total_usdt_count} монет к USDT. Анализирую топ-{len(coin_list)}.")
+
     except Exception as e:
         log.error(f"Failed to fetch dynamic coin list: %s", e)
         await broadcast_message(app, "⚠️ Не удалось сформировать динамический список монет. Проверьте лог."); return
@@ -153,7 +159,11 @@ async def scanner_loop(app):
                 bb_width_pct = ((bb_upper - bb_lower) / bb_lower) * 100
                 rsi_value = last[f'RSI_{RSI_LEN}']
 
-                if (adx_value < ADX_THRESHOLD) and (bb_width_pct > MIN_BB_WIDTH_PCT) and (last['close'] <= bb_lower and rsi_value < RSI_OVERSOLD):
+                is_ranging = adx_value < ADX_THRESHOLD
+                is_wide_enough = bb_width_pct > MIN_BB_WIDTH_PCT
+                is_oversold_at_bottom = last['close'] <= bb_lower and rsi_value < RSI_OVERSOLD
+                
+                if is_ranging and is_wide_enough and is_oversold_at_bottom:
                     if (datetime.now().timestamp() - state["last_alert_times"].get(pair, 0)) < 3600 * 4: continue
                     candidates.append({"pair": pair, "price": last['close'], "atr": last[f'ATRr_{ATR_LEN_FOR_SL}'], "rsi": round(rsi_value, 1), "bb_lower": bb_lower, "bb_middle": last[f'BBM_{BBANDS_LEN}_{BBANDS_STD}']})
             except Exception as e:
@@ -175,12 +185,24 @@ async def scanner_loop(app):
                     take_profit = original_candidate['bb_middle']
                     stop_loss = original_candidate['bb_lower'] - (original_candidate['atr'] * SL_ATR_MUL)
                     
-                    message = (f"🔔 **СИГНАЛ: LONG (Range Trade)**\n\n**Монета:** `{asset_name}`\n**Текущая цена:** `{entry_price:.4f}`\n\n--- **Параметры сделки** ---\n**Вход:** `~{entry_price:.4f}`\n**Take Profit:** `{take_profit:.4f}` (Средняя BB)\n**Stop Loss:** `{stop_loss:.4f}`\n\n--- **Анализ LLM** ---\n_{ranked_asset.get('reasoning')}_")
+                    # ---> ИСПРАВЛЕНИЕ ЗДЕСЬ: Экранируем символ тильды <---
+                    message = (
+                        f"🔔 **СИГНАЛ: LONG (Range Trade)**\n\n"
+                        f"**Монета:** `{asset_name}`\n"
+                        f"**Текущая цена:** `{entry_price:.4f}`\n\n"
+                        f"--- **Параметры сделки** ---\n"
+                        f"**Вход:** `\\~{entry_price:.4f}`\n" # Добавлен двойной слэш
+                        f"**Take Profit:** `{take_profit:.4f}` (Средняя BB)\n"
+                        f"**Stop Loss:** `{stop_loss:.4f}`\n\n"
+                        f"--- **Анализ LLM** ---\n"
+                        f"_{ranked_asset.get('reasoning')}_"
+                    )
                     await broadcast_message(app, message)
                     state["last_alert_times"][asset_name] = datetime.now().timestamp()
                     save_state()
                     await asyncio.sleep(1)
-            else: await broadcast_message(app, "ℹ️ LLM не одобрил ни одного кандидата.")
+            else: 
+                await broadcast_message(app, "ℹ️ LLM не одобрил ни одного кандидата.")
         else:
             log.info("No valid candidates found in this scan cycle.")
             await broadcast_message(app, "ℹ️ Сканирование завершено. Подходящих кандидатов не найдено.")
