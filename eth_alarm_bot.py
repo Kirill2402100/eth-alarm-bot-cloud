@@ -3,6 +3,7 @@
 # v9.3 - LLM Profit Filter
 # • Фильтр минимальной прибыльности теперь применяется к уровням,
 #   предложенным LLM, а не к механическим.
+# • Обновлен промпт для LLM для более точного анализа.
 # ============================================================================
 
 import os
@@ -76,11 +77,11 @@ exchange = ccxt.mexc()
 # === STRATEGY PARAMS ===
 TIMEFRAME = '5m'
 SCAN_INTERVAL_SECONDS = 60 * 15
-ADX_LEN, ADX_THRESHOLD = 14, 40
+ADX_LEN, ADX_THRESHOLD = 14, 25 # Возвращаем более адекватный ADX
 BBANDS_LEN, BBANDS_STD = 20, 2.0
-MIN_BB_WIDTH_PCT = 1.0
-RSI_LEN, RSI_OVERSOLD = 14, 40
-MIN_PROFIT_TARGET_PCT = 3.0 # <-- Наш новый фильтр
+MIN_BB_WIDTH_PCT = 2.0 # И ширина канала
+RSI_LEN, RSI_OVERSOLD = 14, 30
+MIN_PROFIT_TARGET_PCT = 3.0 # Наш главный фильтр
 
 # === INDICATORS ===
 def calculate_indicators(df: pd.DataFrame):
@@ -92,7 +93,7 @@ def calculate_indicators(df: pd.DataFrame):
 # === LLM ===
 LLM_PROMPT = (
     "Ты — профессиональный трейдер-аналитик 'Сигма'. Твоя задача — проанализировать предоставленный торговый сетап "
-    "для входа в LONG в боковике и дать свое заключение. Ищи потенциальные риски, которые мог пропустить механический алгоритм. "
+    "для входа в LONG на откате (покупка на падении). Ищи дополнительные подтверждения силы покупателей и потенциальные риски. "
     "Дай ответ ТОЛЬКО в виде JSON-объекта с полями: 'decision' ('APPROVE'/'REJECT'), 'confidence_score' (0-10), "
     "'reasoning' (RU, краткое обоснование), 'suggested_tp' (число), 'suggested_sl' (число).\n\n"
     "Анализируй сетап:\n{trade_data}"
@@ -174,13 +175,13 @@ async def scanner_loop(app):
                         suggested_tp = llm_decision.get('suggested_tp')
                         entry_price = last['close']
 
-                        if suggested_tp:
+                        if suggested_tp and isinstance(suggested_tp, (int, float)):
                             profit_potential_pct = ((float(suggested_tp) - entry_price) / entry_price) * 100
                             if profit_potential_pct >= MIN_PROFIT_TARGET_PCT:
                                 found_signals += 1
                                 stop_loss = llm_decision.get('suggested_sl', 'N/A')
                                 message = (
-                                    f"🔔 **СИГНАЛ: LONG (Range Trade) - ОДОБРЕН**\n\n"
+                                    f"🔔 **СИГНАЛ: LONG (Buy The Dip) - ОДОБРЕН**\n\n"
                                     f"**Монета:** `{pair}`\n"
                                     f"**Текущая цена:** `{entry_price:.4f}`\n\n"
                                     f"--- **Параметры от LLM** ---\n"
@@ -194,7 +195,7 @@ async def scanner_loop(app):
                             else:
                                 await broadcast_message(app, f"ℹ️ LLM одобрил `{pair}`, но потенциал прибыли ({profit_potential_pct:.1f}%) меньше цели в {MIN_PROFIT_TARGET_PCT}%. Сигнал отфильтрован.")
                         else:
-                            await broadcast_message(app, f"ℹ️ LLM одобрил `{pair}`, но не дал цель по прибыли. Сигнал отфильтрован.")
+                            await broadcast_message(app, f"ℹ️ LLM одобрил `{pair}`, но не дал корректную цель по прибыли. Сигнал отфильтрован.")
                     else:
                         await broadcast_message(app, f"ℹ️ LLM отклонил сигнал по `{pair}`. Причина: _{llm_decision.get('reasoning', 'Нет')}_")
             except Exception as e:
@@ -205,7 +206,7 @@ async def scanner_loop(app):
             await broadcast_message(app, "ℹ️ Сканирование завершено. Подходящих кандидатов не найдено.")
         
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
-        
+
 # === COMMANDS and RUN ===
 async def broadcast_message(app, text):
     for chat_id in app.chat_ids:
@@ -229,7 +230,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     if scanner_task is None or scanner_task.done():
         state['monitoring'] = True; save_state()
-        await update.message.reply_text("✅ Сканер запущен (v9.1 Robust Messaging).")
+        await update.message.reply_text("✅ Сканер запущен (v9.3 LLM Profit Filter).")
         scanner_task = asyncio.create_task(scanner_loop(ctx.application))
     else:
         await update.message.reply_text("ℹ️ Сканер уже запущен.")
@@ -241,7 +242,6 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         scanner_task = None
     state['monitoring'] = False; save_state()
     await update.message.reply_text("❌ Мониторинг остановлен.")
-
 # ... (Команды /entry и /exit без изменений)
 
 if __name__ == "__main__":
