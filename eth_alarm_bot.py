@@ -120,15 +120,17 @@ async def ask_llm_to_rank(candidates_data):
 
 # === MAIN SCANNER LOOP ===
 async def scanner_loop(app):
-    await broadcast_message(app, "🤖 Сканер запущен...")
+    await broadcast_message(app, "🤖 Сканер запущен. Начинаю формирование списка топ-монет по объему...")
     try:
         await exchange.load_markets()
         tickers = await exchange.fetch_tickers()
         
+        # Фильтруем спотовые пары к USDT
         all_usdt_pairs_spot = {s for s, m in exchange.markets.items() if m.get('spot') and m.get('quote') == 'USDT'}
         total_usdt_count = len(all_usdt_pairs_spot)
         
-        liquid_usdt_pairs = {s: t for s, t in tickers.items() if s in all_usdt_pairs_spot and t.get('quoteVolume') and all(kw not in s for kw in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])}
+        # Отбираем ликвидные и убираем токены с плечом
+        liquid_usdt_pairs = {s: t for s, t in tickers.items() if s in all_usdt_pairs_spot and t.get('quoteVolume') and all(kw not in s for kw in ['UP/', 'DOWN/', 'BEAR/', 'BULL/', '3S/', '3L/', '2S/', '2L/', '4S/', '4L/', '5S/', '5L/'])}
         sorted_pairs = sorted(liquid_usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
         coin_list = [item[0] for item in sorted_pairs[:COIN_LIST_SIZE]]
         
@@ -157,7 +159,11 @@ async def scanner_loop(app):
                 bb_width_pct = ((bb_upper - bb_lower) / bb_lower) * 100
                 rsi_value = last[f'RSI_{RSI_LEN}']
 
-                if (adx_value < ADX_THRESHOLD) and (bb_width_pct > MIN_BB_WIDTH_PCT) and (last['close'] <= bb_lower and rsi_value < RSI_OVERSOLD):
+                is_ranging = adx_value < ADX_THRESHOLD
+                is_wide_enough = bb_width_pct > MIN_BB_WIDTH_PCT
+                is_oversold_at_bottom = last['close'] <= bb_lower and rsi_value < RSI_OVERSOLD
+                
+                if is_ranging and is_wide_enough and is_oversold_at_bottom:
                     if (datetime.now().timestamp() - state["last_alert_times"].get(pair, 0)) < 3600 * 4: continue
                     candidates.append({"pair": pair, "price": last['close'], "atr": last[f'ATRr_{ATR_LEN_FOR_SL}'], "rsi": round(rsi_value, 1), "bb_lower": bb_lower, "bb_middle": last[f'BBM_{BBANDS_LEN}_{BBANDS_STD}']})
             except Exception as e:
@@ -185,13 +191,16 @@ async def scanner_loop(app):
                     await broadcast_message(app, message)
                     state["last_alert_times"][asset_name] = datetime.now().timestamp()
                     save_state()
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(1) # Пауза между отправкой сигналов
             else: 
                 await broadcast_message(app, "ℹ️ LLM не одобрил ни одного кандидата.")
         else:
             log.info("No valid candidates found in this scan cycle.")
+            # ---> Сообщение для вашего спокойствия <---
+            await broadcast_message(app, "ℹ️ Сканирование завершено. Подходящих кандидатов не найдено.")
+        
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
-
+        
 # === COMMANDS and RUN ===
 async def broadcast_message(app, text):
     for chat_id in app.chat_ids:
