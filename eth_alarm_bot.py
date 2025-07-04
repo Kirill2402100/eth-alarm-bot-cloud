@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v9.3 - LLM Profit Filter
-# • Фильтр минимальной прибыльности теперь применяется к уровням,
-#   предложенным LLM, а не к механическим.
-# • Обновлен промпт для LLM для более точного анализа.
+# v10.1 - Balance-Based P&L
+# • Расчет P&L в команде /exit теперь основан на разнице депозитов.
 # ============================================================================
 
 import os
@@ -26,7 +24,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID = os.getenv("SHEET_ID")
 COIN_LIST_SIZE = int(os.getenv("COIN_LIST_SIZE", "200"))
-WORKSHEET_NAME = "Trading_Logs_v9"
+WORKSHEET_NAME = "Trading_Logs_v10"
 
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_API_URL = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
@@ -60,7 +58,7 @@ def setup_google_sheets():
 LOGS_WS = setup_google_sheets()
 
 # === STATE MANAGEMENT ===
-STATE_FILE = "scanner_v9_state.json"
+STATE_FILE = "scanner_v10_state.json"
 state = {"monitoring": False, "manual_position": None, "last_alert_times": {}}
 scanner_task = None
 def save_state():
@@ -77,11 +75,13 @@ exchange = ccxt.mexc()
 # === STRATEGY PARAMS ===
 TIMEFRAME = '5m'
 SCAN_INTERVAL_SECONDS = 60 * 15
-ADX_LEN, ADX_THRESHOLD = 14, 40 # Возвращаем более адекватный ADX
+ADX_LEN = 14
+ADX_MIN_THRESHOLD = 20.0
+ADX_MAX_THRESHOLD = 40.0
 BBANDS_LEN, BBANDS_STD = 20, 2.0
-MIN_BB_WIDTH_PCT = 1.0 # И ширина канала
-RSI_LEN, RSI_OVERSOLD = 14, 40
-MIN_PROFIT_TARGET_PCT = 3.0 # Наш главный фильтр
+MIN_BB_WIDTH_PCT = 1.0
+RSI_LEN, RSI_OVERSOLD = 14, 35
+MIN_PROFIT_TARGET_PCT = 3.0
 
 # === INDICATORS ===
 def calculate_indicators(df: pd.DataFrame):
@@ -114,11 +114,8 @@ async def ask_llm(trade_data):
                 response_json = json.loads(txt)
                 content_str = response_json["choices"][0]["message"]["content"]
                 
-                if "```json" in content_str:
-                    clean_msg = content_str.split("```json")[1].split("```")[0]
-                else:
-                    clean_msg = content_str.strip().strip("`")
-
+                if "```json" in content_str: clean_msg = content_str.split("```json")[1].split("```")[0]
+                else: clean_msg = content_str.strip().strip("`")
                 return json.loads(clean_msg)
     except Exception as e:
         log.error("LLM request/parse err: %s", e)
@@ -158,17 +155,17 @@ async def scanner_loop(app):
                 if any(v is None for v in [adx_value, bb_upper, bb_lower, rsi_value]): continue
 
                 bb_width_pct = ((bb_upper - bb_lower) / bb_lower) * 100
-                is_ranging = adx_value < ADX_THRESHOLD
+                is_in_perfect_range = (adx_value > ADX_MIN_THRESHOLD) and (adx_value < ADX_MAX_THRESHOLD)
                 is_wide_enough = bb_width_pct > MIN_BB_WIDTH_PCT
                 is_oversold_at_bottom = last['close'] <= bb_lower and rsi_value < RSI_OVERSOLD
                 
-                if is_ranging and is_wide_enough and is_oversold_at_bottom:
+                if is_in_perfect_range and is_wide_enough and is_oversold_at_bottom:
                     now = datetime.now().timestamp()
                     if (now - state["last_alert_times"].get(pair, 0)) < 3600 * 4: continue
 
                     await broadcast_message(app, f"🔍 Найден кандидат: `{pair}`. Отправляю на анализ в LLM...")
                     
-                    trade_data = { "asset": pair, "tf": TIMEFRAME, "price": last['close'], "rsi": round(rsi_value, 1), "bb_width_pct": round(bb_width_pct, 1), "adx": round(adx_value, 1) }
+                    trade_data = { "asset": pair, "tf": TIMEFRAME, "price": last['close'], "rsi": round(rsi_value, 1), "adx": round(adx_value, 1) }
                     llm_decision = await ask_llm(trade_data)
                     
                     if llm_decision and llm_decision.get("decision") == "APPROVE" and llm_decision.get("confidence_score", 0) >= LLM_THRESHOLD:
@@ -193,9 +190,9 @@ async def scanner_loop(app):
                                 await broadcast_message(app, message)
                                 state["last_alert_times"][pair] = now; save_state()
                             else:
-                                await broadcast_message(app, f"ℹ️ LLM одобрил `{pair}`, но потенциал прибыли ({profit_potential_pct:.1f}%) меньше цели в {MIN_PROFIT_TARGET_PCT}%. Сигнал отфильтрован.")
+                                await broadcast_message(app, f"ℹ️ LLM для `{pair}` предложил недостаточный профит ({profit_potential_pct:.1f}%) < {MIN_PROFIT_TARGET_PCT}%. Сигнал отфильтрован.")
                         else:
-                            await broadcast_message(app, f"ℹ️ LLM одобрил `{pair}`, но не дал корректную цель по прибыли. Сигнал отфильтрован.")
+                            await broadcast_message(app, f"ℹ️ LLM для `{pair}` не дал корректную цель по прибыли. Сигнал отфильтрован.")
                     else:
                         await broadcast_message(app, f"ℹ️ LLM отклонил сигнал по `{pair}`. Причина: _{llm_decision.get('reasoning', 'Нет')}_")
             except Exception as e:
@@ -230,7 +227,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     if scanner_task is None or scanner_task.done():
         state['monitoring'] = True; save_state()
-        await update.message.reply_text("✅ Сканер запущен (v9.3 LLM Profit Filter).")
+        await update.message.reply_text("✅ Сканер запущен (v10.1 Balance P&L).")
         scanner_task = asyncio.create_task(scanner_loop(ctx.application))
     else:
         await update.message.reply_text("ℹ️ Сканер уже запущен.")
@@ -242,14 +239,74 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         scanner_task = None
     state['monitoring'] = False; save_state()
     await update.message.reply_text("❌ Мониторинг остановлен.")
-# ... (Команды /entry и /exit без изменений)
+
+async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global state
+    try:
+        pair = ctx.args[0].upper()
+        if "/" not in pair: pair += "/USDT"
+        deposit, entry_price, sl, tp = map(float, ctx.args[1:5])
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ /entry <ТИКЕР> <депозит> <цена> <sl> <tp>"); return
+
+    state["manual_position"] = {
+        "entry_time": datetime.now(timezone.utc).isoformat(), "deposit": deposit,
+        "entry_price": entry_price, "sl": sl, "tp": tp, "pair": pair, "side": "LONG"
+    }
+    save_state()
+    await update.message.reply_text(f"✅ Вход вручную зафиксирован: {pair} @ {entry_price}")
+
+# ---> ИЗМЕНЕННАЯ КОМАНДА /exit <---
+async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global state
+    pos = state.get("manual_position")
+    if not pos:
+        await update.message.reply_text("⚠️ Нет открытой ручной позиции для закрытия.")
+        return
+    try:
+        # Теперь ожидаем только итоговый депозит
+        exit_deposit = float(ctx.args[0])
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ Неверный формат. Используйте: `/exit <итоговый_депозит>`", parse_mode="MarkdownV2")
+        return
+
+    # Расчет P&L как разница депозитов
+    pnl = exit_deposit - pos['deposit']
+    # Расчет % к депозиту на входе
+    pct_change = (pnl / pos['deposit']) * 100
+    
+    if LOGS_WS:
+        try:
+            rr = abs((pos['tp'] - pos['entry_price']) / (pos['sl'] - pos['entry_price'])) if (pos['sl'] - pos['entry_price']) != 0 else 0
+            row = [
+                datetime.fromisoformat(pos['entry_time']).strftime('%Y-%m-%d %H:%M:%S'),
+                pos['pair'],
+                pos.get("side", "N/A"),
+                pos['deposit'],
+                pos['entry_price'],
+                pos['sl'],
+                pos['tp'], 
+                round(rr, 2),
+                round(pnl, 2),
+                round(pct_change, 2)
+            ]
+            await asyncio.to_thread(LOGS_WS.append_row, row, value_input_option='USER_ENTERED')
+        except Exception as e:
+            log.error("Failed to write to Google Sheets: %s", e)
+            await update.message.reply_text("⚠️ Ошибка записи в Google Таблицу.")
+
+    await update.message.reply_text(f"✅ Сделка по **{pos['pair']}** закрыта и записана.\n**P&L: {pnl:+.2f} USDT ({pct_change:+.2f}%)**", parse_mode="HTML")
+    state["manual_position"] = None
+    save_state()
 
 if __name__ == "__main__":
     load_state()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
-    # app.add_handler(CommandHandler("entry", cmd_entry))
-    # app.add_handler(CommandHandler("exit", cmd_exit))
+    app.add_handler(CommandHandler("entry", cmd_entry))
+    app.add_handler(CommandHandler("exit", cmd_exit))
+
     log.info("Bot started...")
     app.run_polling()
