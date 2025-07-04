@@ -77,10 +77,10 @@ exchange = ccxt.mexc()
 # === STRATEGY PARAMS ===
 TIMEFRAME = '5m'
 SCAN_INTERVAL_SECONDS = 60 * 15
-ADX_LEN, ADX_THRESHOLD = 14, 25 # Возвращаем более адекватный ADX
+ADX_LEN, ADX_THRESHOLD = 14, 40 # Возвращаем более адекватный ADX
 BBANDS_LEN, BBANDS_STD = 20, 2.0
-MIN_BB_WIDTH_PCT = 2.0 # И ширина канала
-RSI_LEN, RSI_OVERSOLD = 14, 30
+MIN_BB_WIDTH_PCT = 1.0 # И ширина канала
+RSI_LEN, RSI_OVERSOLD = 14, 40
 MIN_PROFIT_TARGET_PCT = 3.0 # Наш главный фильтр
 
 # === INDICATORS ===
