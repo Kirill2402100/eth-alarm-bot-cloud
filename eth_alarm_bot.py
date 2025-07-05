@@ -152,29 +152,38 @@ async def scanner_loop(app):
                 if len(df_with_indicators) < 2: continue
                 
                 last = df_with_indicators.iloc[-1]
-                adx_value = last[f'ADX_{ADX_LEN}']
-                bb_lower = last[f'BBL_{BBANDS_LEN}_{BBANDS_STD}']
-                bb_width_pct = ((last[f'BBU_{BBANDS_LEN}_{BBANDS_STD}'] - bb_lower) / bb_lower) * 100
-                rsi_value = last[f'RSI_{RSI_LEN}']
+                adx_value = last.get(f'ADX_{ADX_LEN}')
+                bb_upper = last.get(f'BBU_{BBANDS_LEN}_{BBANDS_STD}')
+                bb_lower = last.get(f'BBL_{BBANDS_LEN}_{BBANDS_STD}')
+                rsi_value = last.get(f'RSI_{RSI_LEN}')
 
-                if (adx_value < ADX_THRESHOLD) and (bb_width_pct > MIN_BB_WIDTH_PCT) and (last['close'] <= bb_lower and rsi_value < RSI_OVERSOLD):
-                    
-                    entry_price = last['close']
-                    stop_loss = bb_lower - (last[f'ATRr_{ATR_LEN_FOR_SL}'] * SL_ATR_MUL)
-                    
-                    risk_distance = entry_price - stop_loss
-                    if risk_distance <= 0: continue
+                if any(v is None for v in [adx_value, bb_upper, bb_lower, rsi_value]): continue
 
-                    reward_distance = risk_distance * MIN_RR_RATIO
-                    take_profit = entry_price + reward_distance
-                    
+                bb_width_pct = ((bb_upper - bb_lower) / bb_lower) * 100
+                is_in_perfect_range = (adx_value > ADX_MIN_THRESHOLD) and (adx_value < ADX_MAX_THRESHOLD)
+                is_wide_enough = bb_width_pct > MIN_BB_WIDTH_PCT
+                is_oversold_at_bottom = last['close'] <= bb_lower and rsi_value < RSI_OVERSOLD
+                
+                if is_in_perfect_range and is_wide_enough and is_oversold_at_bottom:
                     if (datetime.now().timestamp() - state["last_alert_times"].get(pair, 0)) < 3600 * 4: continue
-                    candidates.append({"pair": pair, "price": entry_price, "rsi": round(rsi_value, 1), "sl": stop_loss, "tp": take_profit})
+                    
+                    # ---> ЛОГИКА БЕЗ ФИЛЬТРА R:R <---
+                    # Просто рассчитываем механические уровни и добавляем в кандидаты
+                    entry_price = last['close']
+                    take_profit = last[f'BBM_{BBANDS_LEN}_{BBANDS_STD}']
+                    stop_loss = bb_lower - (last[f'ATRr_{ATR_LEN_FOR_SL}'] * SL_ATR_MUL)
+
+                    candidates.append({
+                        "pair": pair, "price": entry_price, "rsi": round(rsi_value, 1),
+                        "sl": stop_loss, "tp": take_profit
+                    })
+
             except Exception as e:
                 log.error(f"Error processing pair {pair}: {e}")
 
         if candidates:
             await broadcast_message(app, f"🔍 Найдено {len(candidates)} кандидатов. Отправляю на ранжирование в LLM...")
+            
             llm_candidates_data = [{"asset": c["pair"], "rsi": c["rsi"]} for c in candidates]
             top_rated_assets = await ask_llm_to_rank(llm_candidates_data)
 
@@ -189,8 +198,8 @@ async def scanner_loop(app):
                         f"🔔 **СИГНАЛ: LONG (Range Trade)**\n\n"
                         f"**Монета:** `{asset_name}`\n"
                         f"**Цена входа:** `~{original_candidate['price']:.4f}`\n\n"
-                        f"--- **Параметры сделки (R:R ~1:{int(MIN_RR_RATIO)})** ---\n"
-                        f"**Take Profit:** `{original_candidate['tp']:.4f}`\n"
+                        f"--- **Параметры сделки** ---\n"
+                        f"**Take Profit:** `{original_candidate['tp']:.4f}` (Средняя BB)\n"
                         f"**Stop Loss:** `{original_candidate['sl']:.4f}`\n\n"
                         f"--- **Анализ LLM** ---\n"
                         f"_{ranked_asset.get('reasoning')}_"
@@ -199,7 +208,8 @@ async def scanner_loop(app):
                     state["last_alert_times"][asset_name] = datetime.now().timestamp()
                     save_state()
                     await asyncio.sleep(1)
-            else: await broadcast_message(app, "ℹ️ LLM не одобрил ни одного кандидата.")
+            else: 
+                await broadcast_message(app, "ℹ️ LLM не одобрил ни одного кандидата.")
         else:
             log.info("No valid candidates found in this scan cycle.")
             await broadcast_message(app, "ℹ️ Сканирование завершено. Подходящих кандидатов не найдено.")
