@@ -8,7 +8,7 @@ import os
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
 import ccxt.async_support as ccxt
 import gspread
@@ -276,13 +276,13 @@ async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     state["manual_position"] = {
-        "entry_time": datetime.now(timezone.utc).isoformat(),
+        "entry_time": datetime.now(timezone.utc).isoformat(), # <-- Здесь была ошибка
         "deposit": deposit,
         "entry_price": entry_price,
         "sl": sl,
         "tp": tp,
         "pair": pair,
-        "side": "LONG" # Для этого бота все сделки - LONG
+        "side": "LONG"
     }
     save_state()
     await update.message.reply_text(f"✅ Вход вручную зафиксирован: **{pair}** @ **{entry_price}**", parse_mode="HTML")
