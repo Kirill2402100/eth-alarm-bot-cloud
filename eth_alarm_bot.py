@@ -78,10 +78,10 @@ exchange = ccxt.mexc()
 TIMEFRAME = '5m'
 SCAN_INTERVAL_SECONDS = 60 * 15
 ADX_LEN = 14
-ADX_THRESHOLD = 25.0
+ADX_THRESHOLD = 35.0
 BBANDS_LEN, BBANDS_STD = 20, 2.0
 MIN_BB_WIDTH_PCT = 0.8
-RSI_LEN, RSI_OVERSOLD = 14, 45 
+RSI_LEN, RSI_OVERSOLD = 14, 40 
 ATR_LEN_FOR_SL, SL_ATR_MUL = 14, 0.5
 MIN_RR_RATIO = 0.5
 
@@ -243,9 +243,11 @@ async def scanner_loop(app):
                 await broadcast_message(app, "ℹ️ LLM не одобрил ни одного кандидата.")
         else:
             log.info("No valid candidates found in this scan cycle.")
-            
+            # ---> ДОБАВЬТЕ ЭТУ СТРОКУ <---
+            await broadcast_message(app, "ℹ️ Сканирование завершено. Подходящих кандидатов не найдено.")
+        
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
-
+        
 # === COMMANDS and RUN ===
 async def broadcast_message(app, text):
     # Исправлено: Функция переведена на более надежный HTML-парсер
