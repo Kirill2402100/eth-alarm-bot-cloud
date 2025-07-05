@@ -73,20 +73,21 @@ def load_state():
 # === EXCHANGE ===
 exchange = ccxt.mexc()
 
-# === STRATEGY PARAMS ===
+# === STRATEGY PARAMS (Мягкие настройки) ===
 TIMEFRAME = '5m'
 SCAN_INTERVAL_SECONDS = 60 * 15
 ADX_LEN = 14
-# Ваши "мягкие" настройки для ADX
-ADX_MIN_THRESHOLD = 20.0 
-ADX_MAX_THRESHOLD = 40.0 
-# Ваши "мягкие" настройки для BB и RSI
+# Порог для ADX. Увеличили с 20 до 25, чтобы ловить не только полный флэт.
+ADX_THRESHOLD = 25.0
+# Параметры Полос Боллинджера и RSI
 BBANDS_LEN, BBANDS_STD = 20, 2.0
-MIN_BB_WIDTH_PCT = 1.0 
-RSI_LEN, RSI_OVERSOLD = 14, 40
+# Минимальная ширина канала в %. Уменьшили, чтобы брать менее волатильные монеты.
+MIN_BB_WIDTH_PCT = 0.8
+# Порог перепроданности. Увеличили, чтобы сигнал появлялся раньше.
+RSI_LEN, RSI_OVERSOLD = 14, 45 
 # Новые обязательные параметры для расчета SL и TP
-ATR_LEN_FOR_SL, SL_ATR_MUL = 14, 0.5 
-MIN_RR_RATIO = 0.5  # Наша цель по соотношению Риск/Прибыль 1:2
+ATR_LEN_FOR_SL, SL_ATR_MUL = 14, 0.5
+MIN_RR_RATIO = 0.5
 
 # === INDICATORS ===
 def calculate_indicators(df: pd.DataFrame):
