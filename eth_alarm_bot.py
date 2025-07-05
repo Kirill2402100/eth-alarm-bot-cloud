@@ -78,15 +78,10 @@ exchange = ccxt.mexc()
 TIMEFRAME = '5m'
 SCAN_INTERVAL_SECONDS = 60 * 15
 ADX_LEN = 14
-# Порог для ADX. Увеличили с 20 до 25, чтобы ловить не только полный флэт.
 ADX_THRESHOLD = 25.0
-# Параметры Полос Боллинджера и RSI
 BBANDS_LEN, BBANDS_STD = 20, 2.0
-# Минимальная ширина канала в %. Уменьшили, чтобы брать менее волатильные монеты.
 MIN_BB_WIDTH_PCT = 0.8
-# Порог перепроданности. Увеличили, чтобы сигнал появлялся раньше.
 RSI_LEN, RSI_OVERSOLD = 14, 45 
-# Новые обязательные параметры для расчета SL и TP
 ATR_LEN_FOR_SL, SL_ATR_MUL = 14, 0.5
 MIN_RR_RATIO = 0.5
 
@@ -95,7 +90,7 @@ def calculate_indicators(df: pd.DataFrame):
     df.ta.adx(length=ADX_LEN, append=True)
     df.ta.bbands(length=BBANDS_LEN, std=BBANDS_STD, append=True)
     df.ta.rsi(length=RSI_LEN, append=True)
-    # --- > ДОБАВЬТЕ ЭТУ СТРОЧКУ < ---
+    # Исправлено: Добавлен расчет ATR
     df.ta.atr(length=ATR_LEN_FOR_SL, append=True)
     return df.dropna()
 
@@ -194,7 +189,7 @@ async def scanner_loop(app):
             except Exception as e:
                 log.error(f"Error processing pair {pair}: {e}")
         
-        # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА (ОТСТУПЫ ВЫРОВНЕНЫ) ---
+        # Исправлено: Корректный цикл обработки кандидатов и отправки сигналов
         if candidates:
             log.info(f"Found {len(candidates)} candidates. Sending to LLM for analysis...")
             await broadcast_message(app, f"🔍 Найдено {len(candidates)} кандидатов. Отправляю на анализ в LLM...")
@@ -203,89 +198,79 @@ async def scanner_loop(app):
 
             for candidate in candidates:
                 try:
-                    # Формируем данные для анализа одного кандидата
                     trade_data_for_llm = {
-                        "asset": candidate["pair"],
-                        "entry_price": candidate["price"],
-                        "rsi": candidate["rsi"],
-                        "bb_lower": candidate["bb_lower"],
+                        "asset": candidate["pair"], "entry_price": candidate["price"],
+                        "rsi": candidate["rsi"], "bb_lower": candidate["bb_lower"],
                         "atr": candidate["atr"]
                     }
                     
-                    # Отправляем одного кандидата в LLM
                     llm_response = await ask_llm(trade_data_for_llm)
                     log.info(f"LLM response for {candidate['pair']}: {llm_response.get('decision')}")
 
-                    # Проверяем, одобрила ли нейросеть сделку
                     if llm_response and llm_response.get('decision') == 'APPROVE':
-                        # Если одобрено, добавляем ответ LLM к данным кандидата
                         candidate['llm_analysis'] = llm_response
                         approved_signals.append(candidate)
                         
                 except Exception as e:
                     log.error(f"Error during LLM analysis for {candidate['pair']}: {e}")
 
-            # Теперь отправляем только одобренные сигналы
             if approved_signals:
                 await broadcast_message(app, f"🏆 LLM одобрил {len(approved_signals)} сигнал(а):")
                 for signal in approved_signals:
                     asset_name = signal['pair']
                     llm_analysis = signal['llm_analysis']
                     
-                    # Берем TP и SL из ответа нейросети
                     suggested_tp = llm_analysis.get('suggested_tp', signal['bb_middle'])
                     suggested_sl = llm_analysis.get('suggested_sl', signal['price'] - (signal['atr'] * SL_ATR_MUL))
 
+                    # Исправлено: Формат сообщения переведен на HTML
                     message = (
-                        f"🔔 **СИГНАЛ: LONG (Range Trade)**\n\n"
-                        f"**Монета:** `{asset_name}`\n"
-                        f"**Цена входа:** `~{signal['price']:.4f}`\n\n"
-                        f"--- **Параметры сделки (от LLM)** ---\n"
-                        f"**Take Profit:** `{suggested_tp:.4f}`\n"
-                        f"**Stop Loss:** `{suggested_sl:.4f}`\n\n"
-                        f"--- **Анализ LLM** ---\n"
-                        f"_{llm_analysis.get('reasoning', 'Нет обоснования.')}_"
+                        f"🔔 <b>СИГНАЛ: LONG (Range Trade)</b>\n\n"
+                        f"<b>Монета:</b> <code>{asset_name}</code>\n"
+                        f"<b>Цена входа:</b> <code>{signal['price']:.4f}</code>\n\n"
+                        f"--- <b>Параметры сделки (от LLM)</b> ---\n"
+                        f"<b>Take Profit:</b> <code>{suggested_tp:.4f}</code>\n"
+                        f"<b>Stop Loss:</b> <code>{suggested_sl:.4f}</code>\n\n"
+                        f"--- <b>Анализ LLM</b> ---\n"
+                        f"<i>{llm_analysis.get('reasoning', 'Нет обоснования.')}</i>"
                     )
                     await broadcast_message(app, message)
                     state["last_alert_times"][asset_name] = datetime.now().timestamp()
                     save_state()
-                    await asyncio.sleep(1) # Небольшая задержка между сообщениями
+                    await asyncio.sleep(1)
             else:
                 log.info("LLM did not approve any candidates.")
                 await broadcast_message(app, "ℹ️ LLM не одобрил ни одного кандидата.")
         else:
             log.info("No valid candidates found in this scan cycle.")
-        # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
             
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
-        
+
 # === COMMANDS and RUN ===
 async def broadcast_message(app, text):
+    # Исправлено: Функция переведена на более надежный HTML-парсер
     for chat_id in app.chat_ids:
-        # MarkdownV2 требует экранирования спецсимволов
-        safe_text = text.replace('.', r'\.').replace('-', r'\-').replace('(', r'\(').replace(')', r'\)').replace('>', r'\>').replace('+', r'\+').replace('=', r'\=').replace('*', r'\*').replace('_', r'\_').replace('`', r'\`').replace('[', r'\[').replace(']', r'\]')
         try:
-            await app.bot.send_message(chat_id=chat_id, text=safe_text, parse_mode="MarkdownV2")
+            if hasattr(app, 'chat_ids') and chat_id in app.chat_ids:
+                 await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
         except BadRequest as e:
-            if 'can\'t parse entities' in str(e):
-                log.warning(f"Markdown parse failed. Sending as plain text. Error: {e}")
-                await app.bot.send_message(chat_id=chat_id, text=text)
-            else:
-                log.error(f"Failed to send message to {chat_id}: {e}")
+            log.error(f"HTML parse failed or other BadRequest for chat {chat_id}: {e}")
+            await app.bot.send_message(chat_id=chat_id, text=text) # Fallback to plain text
         except Exception as e:
-            log.error(f"An unexpected error occurred in broadcast_message: {e}")
+            log.error(f"An unexpected error occurred in broadcast_message to {chat_id}: {e}")
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global scanner_task
     chat_id = update.effective_chat.id
+    # Используем application.chat_ids, который должен быть инициализирован при запуске
     if not hasattr(ctx.application, 'chat_ids'):
-        ctx.application.chat_ids = set()
+        ctx.application.chat_ids = CHAT_IDS
     ctx.application.chat_ids.add(chat_id)
     
     if scanner_task is None or scanner_task.done():
         state['monitoring'] = True
         save_state()
-        await update.message.reply_text("✅ Сканер запущен (v10.1 Balance P&L).")
+        await update.message.reply_text("✅ Сканер запущен.")
         scanner_task = asyncio.create_task(scanner_loop(ctx.application))
     else:
         await update.message.reply_text("ℹ️ Сканер уже запущен.")
@@ -302,17 +287,22 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global state
     try:
-        # Формат: /entry ТИКЕР депозит цена_входа sl tp
         pair = ctx.args[0].upper()
         if "/" not in pair: pair += "/USDT"
         
         deposit, entry_price, sl, tp = map(float, ctx.args[1:5])
     except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ Неверный формат. Используйте:\n`/entry <ТИКЕР> <депозит> <цена> <sl> <tp>`\n\n*Пример:*\n`/entry SOL/USDT 500 135.5 134.8 138.0`", parse_mode="MarkdownV2")
+        await update.message.reply_text(
+            "⚠️ Неверный формат. Используйте:\n"
+            "<code>/entry &lt;ТИКЕР&gt; &lt;депозит&gt; &lt;цена&gt; &lt;sl&gt; &lt;tp&gt;</code>\n\n"
+            "<b>Пример:</b>\n"
+            "<code>/entry SOL/USDT 500 135.5 134.8 138.0</code>", 
+            parse_mode="HTML"
+        )
         return
 
     state["manual_position"] = {
-        "entry_time": datetime.now(timezone.utc).isoformat(), # <-- Здесь была ошибка
+        "entry_time": datetime.now(timezone.utc).isoformat(),
         "deposit": deposit,
         "entry_price": entry_price,
         "sl": sl,
@@ -321,7 +311,7 @@ async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "side": "LONG"
     }
     save_state()
-    await update.message.reply_text(f"✅ Вход вручную зафиксирован: **{pair}** @ **{entry_price}**", parse_mode="HTML")
+    await update.message.reply_text(f"✅ Вход вручную зафиксирован: <b>{pair}</b> @ <b>{entry_price}</b>", parse_mode="HTML")
 
 async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global state
@@ -330,17 +320,17 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Нет открытой ручной позиции для закрытия.")
         return
     try:
-        # Ожидаем только итоговый депозит
         exit_deposit = float(ctx.args[0])
     except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ Неверный формат. Используйте: `/exit <итоговый_депозит>`", parse_mode="MarkdownV2")
+        await update.message.reply_text(
+            "⚠️ Неверный формат. Используйте: <code>/exit &lt;итоговый_депозит&gt;</code>", 
+            parse_mode="HTML"
+        )
         return
 
-    # --- ЕДИНЫЙ И ПРАВИЛЬНЫЙ РАСЧЕТ ---
     initial_deposit = pos.get('deposit', 0)
     pnl = exit_deposit - initial_deposit
     pct_change = (pnl / initial_deposit) * 100 if initial_deposit != 0 else 0
-    # --- КОНЕЦ РАСЧЕТА ---
     
     if LOGS_WS:
         try:
@@ -357,19 +347,28 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 round(pnl, 2),
                 round(pct_change, 2)
             ]
+            # Запускаем в отдельном потоке, чтобы не блокировать основной цикл
             await asyncio.to_thread(LOGS_WS.append_row, row, value_input_option='USER_ENTERED')
         except Exception as e:
             log.error("Failed to write to Google Sheets: %s", e)
             await update.message.reply_text("⚠️ Ошибка записи в Google Таблицу.")
 
-    await update.message.reply_text(f"✅ Сделка по **{pos.get('pair', 'N/A')}** закрыта и записана.\n**P&L: {pnl:+.2f} USDT ({pct_change:+.2f}%)**", parse_mode="HTML")
+    await update.message.reply_text(
+        f"✅ Сделка по <b>{pos.get('pair', 'N/A')}</b> закрыта и записана.\n"
+        f"<b>P&L: {pnl:+.2f} USDT ({pct_change:+.2f}%)</b>", 
+        parse_mode="HTML"
+    )
     
     state["manual_position"] = None
     save_state()
 
 if __name__ == "__main__":
     load_state()
+    
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Инициализируем chat_ids при запуске, чтобы broadcast_message работал сразу
+    app.chat_ids = CHAT_IDS
     
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
