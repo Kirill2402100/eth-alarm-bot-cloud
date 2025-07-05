@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v11.1 - Single Target R:R
-# • Возвращена логика с одним Take Profit.
-# • TP теперь жестко рассчитывается от SL для обеспечения R:R 1:2.
+# v12.0 - Advanced Analysis
+# • Добавлен индикатор Stochastic для более точного определения перепроданности.
+# • Улучшен промпт LLM для анализа дивергенций, свечных паттернов и объемов.
 # ============================================================================
 
 import os
@@ -74,14 +74,15 @@ def load_state():
 # === EXCHANGE ===
 exchange = ccxt.mexc()
 
-# === STRATEGY PARAMS (Мягкие настройки) ===
+# === STRATEGY PARAMS ===
 TIMEFRAME = '5m'
 SCAN_INTERVAL_SECONDS = 60 * 15
 ADX_LEN = 14
-ADX_THRESHOLD = 35.0
+ADX_THRESHOLD = 25.0
 BBANDS_LEN, BBANDS_STD = 20, 2.0
 MIN_BB_WIDTH_PCT = 0.8
-RSI_LEN, RSI_OVERSOLD = 14, 40 
+RSI_LEN, RSI_OVERSOLD = 14, 45 
+STOCH_OVERSOLD = 25.0 # Новый параметр для Стохастика
 ATR_LEN_FOR_SL, SL_ATR_MUL = 14, 0.5
 MIN_RR_RATIO = 0.5
 
@@ -90,17 +91,23 @@ def calculate_indicators(df: pd.DataFrame):
     df.ta.adx(length=ADX_LEN, append=True)
     df.ta.bbands(length=BBANDS_LEN, std=BBANDS_STD, append=True)
     df.ta.rsi(length=RSI_LEN, append=True)
-    # Исправлено: Добавлен расчет ATR
     df.ta.atr(length=ATR_LEN_FOR_SL, append=True)
+    df.ta.stoch(append=True) # Добавлен расчет стохастика
     return df.dropna()
 
 # === LLM ===
 LLM_PROMPT = (
-    "Ты — профессиональный трейдер-аналитик 'Сигма'. Твоя задача — проанализировать предоставленный торговый сетап "
-    "для входа в LONG на откате (покупка на падении). Ищи дополнительные подтверждения силы покупателей и потенциальные риски. "
-    "Дай ответ ТОЛЬКО в виде JSON-объекта с полями: 'decision' ('APPROVE'/'REJECT'), 'confidence_score' (0-10), "
-    "'reasoning' (RU, краткое обоснование), 'suggested_tp' (число), 'suggested_sl' (число).\n\n"
-    "Анализируй сетап:\n{trade_data}"
+    "Ты — элитный трейдер-аналитик 'Сигма'. Твоя задача — провести глубокий технический анализ предоставленного сетапа "
+    "для входа в LONG на отскоке. Используй все предоставленные данные.\n\n"
+    "ПЛАН АНАЛИЗА:\n"
+    "1.  **Индикаторы:** RSI и Stochastic (STOCHk) в зоне перепроданности? Есть ли признаки выхода из нее?\n"
+    "2.  **Бычья дивергенция:** Сравни последние 2-3 минимума цены с минимумами на RSI и Stochastic. Есть ли скрытая или явная бычья дивергенция (цена падает, а индикатор растет)?\n"
+    "3.  **Свечной анализ:** Проанализируй данные `last_candles`. Есть ли на последней или предпоследней свече бычьи разворотные паттерны (молот, дожи, бычье поглощение)?\n"
+    "4.  **Объемы:** Сопровождается ли падение цены снижением объема, а потенциальный разворот — его увеличением?\n"
+    "5.  **Риски:** Какие очевидные риски для входа в сделку прямо сейчас?\n\n"
+    "Дай ответ ТОЛЬКО в виде JSON-объекта с полями: 'decision' ('APPROVE'/'REJECT'), 'confidence_score' (0-10, где 10 - максимальная уверенность), "
+    "'reasoning' (RU, краткое, но емкое обоснование на основе твоего плана анализа), 'suggested_tp' (число), 'suggested_sl' (число).\n\n"
+    "АНАЛИЗИРУЙ СЕТАП:\n{trade_data}"
 )
 async def ask_llm(trade_data):
     if not LLM_API_KEY: return {"decision": "N/A", "reasoning": "LLM не настроен."}
@@ -114,10 +121,8 @@ async def ask_llm(trade_data):
                 if r.status != 200:
                     log.error(f"LLM HTTP Error {r.status}: {txt}")
                     return {"decision": "ERROR", "reasoning": f"HTTP {r.status}"}
-                
                 response_json = json.loads(txt)
                 content_str = response_json["choices"][0]["message"]["content"]
-                
                 if "```json" in content_str: clean_msg = content_str.split("```json")[1].split("```")[0]
                 else: clean_msg = content_str.strip().strip("`")
                 return json.loads(clean_msg)
@@ -169,41 +174,46 @@ async def scanner_loop(app):
                 is_wide_enough = bb_width_pct > MIN_BB_WIDTH_PCT
                 is_oversold_at_bottom = last['close'] <= bb_lower and rsi_value < RSI_OVERSOLD
 
+                stoch_k_col = next((col for col in last.index if 'STOCHk' in col), None)
+                if not stoch_k_col: continue
+                stoch_k_value = last.get(stoch_k_col)
+                is_stoch_oversold = stoch_k_value < STOCH_OVERSOLD
+
                 if DEBUG_MODE:
                     log.info(
                         f"[DEBUG] {pair:<12} | "
                         f"Ranging (ADX < {ADX_THRESHOLD}): {is_ranging} (ADX={adx_value:.1f}) | "
-                        f"Wide (BBW > {MIN_BB_WIDTH_PCT}): {is_wide_enough} (BBW={bb_width_pct:.1f}%) | "
-                        f"Oversold (RSI < {RSI_OVERSOLD}): {is_oversold_at_bottom} (RSI={rsi_value:.1f}, Close={last['close']:.4f} <= BB_L={bb_lower:.4f})"
+                        f"Oversold (RSI < {RSI_OVERSOLD}): {is_oversold_at_bottom} (RSI={rsi_value:.1f}) | "
+                        f"Stoch Oversold (STOCHk < {STOCH_OVERSOLD}): {is_stoch_oversold} (STOCHk={stoch_k_value:.1f})"
                     )
                 
-                if is_ranging and is_wide_enough and is_oversold_at_bottom:
+                if is_ranging and is_wide_enough and is_oversold_at_bottom and is_stoch_oversold:
                     now = datetime.now().timestamp()
                     if (now - state["last_alert_times"].get(pair, 0)) < 3600 * 4: continue
 
                     candidates.append({
                         "pair": pair, "price": last['close'], "atr": atr_value, 
                         "rsi": round(rsi_value, 1), "bb_lower": bb_lower, 
-                        "bb_middle": last[f'BBM_{BBANDS_LEN}_{BBANDS_STD}']
+                        "bb_middle": last[f'BBM_{BBANDS_LEN}_{BBANDS_STD}'],
+                        "stoch_k": round(stoch_k_value, 1),
+                        "last_candles": df.tail(3)[['open', 'high', 'low', 'close', 'volume']].to_dict('records')
                     })
             except Exception as e:
                 log.error(f"Error processing pair {pair}: {e}")
         
-        # Исправлено: Корректный цикл обработки кандидатов и отправки сигналов
         if candidates:
             log.info(f"Found {len(candidates)} candidates. Sending to LLM for analysis...")
             await broadcast_message(app, f"🔍 Найдено {len(candidates)} кандидатов. Отправляю на анализ в LLM...")
             
             approved_signals = []
-
             for candidate in candidates:
                 try:
                     trade_data_for_llm = {
                         "asset": candidate["pair"], "entry_price": candidate["price"],
-                        "rsi": candidate["rsi"], "bb_lower": candidate["bb_lower"],
-                        "atr": candidate["atr"]
+                        "rsi": candidate["rsi"], "stochastic_k": candidate["stoch_k"],
+                        "bb_lower": candidate["bb_lower"], "atr": candidate["atr"],
+                        "last_candles": candidate["last_candles"]
                     }
-                    
                     llm_response = await ask_llm(trade_data_for_llm)
                     log.info(f"LLM response for {candidate['pair']}: {llm_response.get('decision')}")
 
@@ -219,11 +229,9 @@ async def scanner_loop(app):
                 for signal in approved_signals:
                     asset_name = signal['pair']
                     llm_analysis = signal['llm_analysis']
-                    
                     suggested_tp = llm_analysis.get('suggested_tp', signal['bb_middle'])
                     suggested_sl = llm_analysis.get('suggested_sl', signal['price'] - (signal['atr'] * SL_ATR_MUL))
 
-                    # Исправлено: Формат сообщения переведен на HTML
                     message = (
                         f"🔔 <b>СИГНАЛ: LONG (Range Trade)</b>\n\n"
                         f"<b>Монета:</b> <code>{asset_name}</code>\n"
@@ -243,28 +251,25 @@ async def scanner_loop(app):
                 await broadcast_message(app, "ℹ️ LLM не одобрил ни одного кандидата.")
         else:
             log.info("No valid candidates found in this scan cycle.")
-            # ---> ДОБАВЬТЕ ЭТУ СТРОКУ <---
             await broadcast_message(app, "ℹ️ Сканирование завершено. Подходящих кандидатов не найдено.")
-        
+            
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
-        
+
 # === COMMANDS and RUN ===
 async def broadcast_message(app, text):
-    # Исправлено: Функция переведена на более надежный HTML-парсер
     for chat_id in app.chat_ids:
         try:
             if hasattr(app, 'chat_ids') and chat_id in app.chat_ids:
                  await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
         except BadRequest as e:
             log.error(f"HTML parse failed or other BadRequest for chat {chat_id}: {e}")
-            await app.bot.send_message(chat_id=chat_id, text=text) # Fallback to plain text
+            await app.bot.send_message(chat_id=chat_id, text=text)
         except Exception as e:
             log.error(f"An unexpected error occurred in broadcast_message to {chat_id}: {e}")
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global scanner_task
     chat_id = update.effective_chat.id
-    # Используем application.chat_ids, который должен быть инициализирован при запуске
     if not hasattr(ctx.application, 'chat_ids'):
         ctx.application.chat_ids = CHAT_IDS
     ctx.application.chat_ids.add(chat_id)
@@ -291,7 +296,6 @@ async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         pair = ctx.args[0].upper()
         if "/" not in pair: pair += "/USDT"
-        
         deposit, entry_price, sl, tp = map(float, ctx.args[1:5])
     except (IndexError, ValueError):
         await update.message.reply_text(
@@ -305,12 +309,8 @@ async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     state["manual_position"] = {
         "entry_time": datetime.now(timezone.utc).isoformat(),
-        "deposit": deposit,
-        "entry_price": entry_price,
-        "sl": sl,
-        "tp": tp,
-        "pair": pair,
-        "side": "LONG"
+        "deposit": deposit, "entry_price": entry_price,
+        "sl": sl, "tp": tp, "pair": pair, "side": "LONG"
     }
     save_state()
     await update.message.reply_text(f"✅ Вход вручную зафиксирован: <b>{pair}</b> @ <b>{entry_price}</b>", parse_mode="HTML")
@@ -339,17 +339,11 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             rr = abs((pos['tp'] - pos['entry_price']) / (pos['sl'] - pos['entry_price'])) if (pos.get('sl') and pos.get('entry_price') and (pos['sl'] - pos['entry_price']) != 0) else 0
             row = [
                 datetime.fromisoformat(pos['entry_time']).strftime('%Y-%m-%d %H:%M:%S'),
-                pos.get('pair', 'N/A'),
-                pos.get("side", "N/A"),
-                initial_deposit,
-                pos.get('entry_price', 'N/A'),
-                pos.get('sl', 'N/A'),
-                pos.get('tp', 'N/A'),
-                round(rr, 2),
-                round(pnl, 2),
-                round(pct_change, 2)
+                pos.get('pair', 'N/A'), pos.get("side", "N/A"),
+                initial_deposit, pos.get('entry_price', 'N/A'),
+                pos.get('sl', 'N/A'), pos.get('tp', 'N/A'),
+                round(rr, 2), round(pnl, 2), round(pct_change, 2)
             ]
-            # Запускаем в отдельном потоке, чтобы не блокировать основной цикл
             await asyncio.to_thread(LOGS_WS.append_row, row, value_input_option='USER_ENTERED')
         except Exception as e:
             log.error("Failed to write to Google Sheets: %s", e)
@@ -360,16 +354,12 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"<b>P&L: {pnl:+.2f} USDT ({pct_change:+.2f}%)</b>", 
         parse_mode="HTML"
     )
-    
     state["manual_position"] = None
     save_state()
 
 if __name__ == "__main__":
     load_state()
-    
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    
-    # Инициализируем chat_ids при запуске, чтобы broadcast_message работал сразу
     app.chat_ids = CHAT_IDS
     
     app.add_handler(CommandHandler("start", cmd_start))
