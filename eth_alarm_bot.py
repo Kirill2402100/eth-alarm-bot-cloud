@@ -264,41 +264,46 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Нет открытой ручной позиции для закрытия.")
         return
     try:
-        # Теперь ожидаем только итоговый депозит
+        # Ожидаем только итоговый депозит
         exit_deposit = float(ctx.args[0])
     except (IndexError, ValueError):
         await update.message.reply_text("⚠️ Неверный формат. Используйте: `/exit <итоговый_депозит>`", parse_mode="MarkdownV2")
         return
 
-    # Расчет P&L как разница депозитов
-    pnl = exit_deposit - pos['deposit']
-    # Расчет % к депозиту на входе
-    pct_change = (pnl / pos['deposit']) * 100
+    # --- ЕДИНЫЙ И ПРАВИЛЬНЫЙ РАСЧЕТ ---
+    initial_deposit = pos.get('deposit', 0)
+    pnl = exit_deposit - initial_deposit
+    pct_change = (pnl / initial_deposit) * 100 if initial_deposit != 0 else 0
+    # --- КОНЕЦ РАСЧЕТА ---
     
+    # Запись в Google Таблицу (теперь с правильными данными)
     if LOGS_WS:
         try:
-            rr = abs((pos['tp'] - pos['entry_price']) / (pos['sl'] - pos['entry_price'])) if (pos['sl'] - pos['entry_price']) != 0 else 0
+            rr = abs((pos['tp'] - pos['entry_price']) / (pos['sl'] - pos['entry_price'])) if (pos.get('sl') and pos.get('entry_price') and (pos['sl'] - pos['entry_price']) != 0) else 0
             row = [
                 datetime.fromisoformat(pos['entry_time']).strftime('%Y-%m-%d %H:%M:%S'),
-                pos['pair'],
+                pos.get('pair', 'N/A'),
                 pos.get("side", "N/A"),
-                pos['deposit'],
-                pos['entry_price'],
-                pos['sl'],
-                pos['tp'], 
+                initial_deposit,
+                pos.get('entry_price', 'N/A'),
+                pos.get('sl', 'N/A'),
+                pos.get('tp', 'N/A'),
                 round(rr, 2),
                 round(pnl, 2),
                 round(pct_change, 2)
             ]
+            # Используем to_thread для асинхронной работы с gspread
             await asyncio.to_thread(LOGS_WS.append_row, row, value_input_option='USER_ENTERED')
         except Exception as e:
             log.error("Failed to write to Google Sheets: %s", e)
             await update.message.reply_text("⚠️ Ошибка записи в Google Таблицу.")
 
-    await update.message.reply_text(f"✅ Сделка по **{pos['pair']}** закрыта и записана.\n**P&L: {pnl:+.2f} USDT ({pct_change:+.2f}%)**", parse_mode="HTML")
+    # Отправка сообщения в Telegram (теперь данные совпадают с таблицей)
+    await update.message.reply_text(f"✅ Сделка по **{pos.get('pair', 'N/A')}** закрыта и записана.\n**P&L: {pnl:+.2f} USDT ({pct_change:+.2f}%)**", parse_mode="HTML")
+    
     state["manual_position"] = None
     save_state()
-
+    
 if __name__ == "__main__":
     load_state()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
