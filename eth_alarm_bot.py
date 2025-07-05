@@ -26,6 +26,7 @@ CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID = os.getenv("SHEET_ID")
 COIN_LIST_SIZE = int(os.getenv("COIN_LIST_SIZE", "200"))
 WORKSHEET_NAME = "Trading_Logs_v10"
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_API_URL = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
@@ -155,9 +156,8 @@ async def scanner_loop(app):
                 
                 last = df_with_indicators.iloc[-1]
                 
-                # --- ИСПРАВЛЕНИЕ: Более надежный поиск столбцов ---
                 atr_col_name = next((col for col in last.index if 'ATRr' in col), None)
-                if not atr_col_name: continue # Если столбец ATR не найден, пропускаем монету
+                if not atr_col_name: continue
 
                 adx_value = last.get(f'ADX_{ADX_LEN}')
                 bb_upper = last.get(f'BBU_{BBANDS_LEN}_{BBANDS_STD}')
@@ -166,12 +166,21 @@ async def scanner_loop(app):
                 atr_value = last.get(atr_col_name)
 
                 if any(v is None for v in [adx_value, bb_upper, bb_lower, rsi_value, atr_value]): continue
-                # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
                 bb_width_pct = ((bb_upper - bb_lower) / bb_lower) * 100
                 is_ranging = adx_value < ADX_THRESHOLD
                 is_wide_enough = bb_width_pct > MIN_BB_WIDTH_PCT
                 is_oversold_at_bottom = last['close'] <= bb_lower and rsi_value < RSI_OVERSOLD
+
+                # <--- НАЧАЛО НОВОГО КОДА ДЛЯ ОТЛАДКИ --->
+                if DEBUG_MODE:
+                    log.info(
+                        f"[DEBUG] {pair:<12} | "
+                        f"Ranging (ADX < {ADX_THRESHOLD}): {is_ranging} (ADX={adx_value:.1f}) | "
+                        f"Wide (BBW > {MIN_BB_WIDTH_PCT}): {is_wide_enough} (BBW={bb_width_pct:.1f}%) | "
+                        f"Oversold (RSI < {RSI_OVERSOLD}): {is_oversold_at_bottom} (RSI={rsi_value:.1f}, Close={last['close']:.4f} <= BB_L={bb_lower:.4f})"
+                    )
+                # <--- КОНЕЦ НОВОГО КОДА ДЛЯ ОТЛАДКИ --->
                 
                 if is_ranging and is_wide_enough and is_oversold_at_bottom:
                     now = datetime.now().timestamp()
