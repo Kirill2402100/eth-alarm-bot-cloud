@@ -147,40 +147,43 @@ async def scanner_loop(app):
             try:
                 ohlcv = await exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME, limit=100)
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                if df.empty: continue
+                if len(df) < 50: continue
+
                 df_with_indicators = calculate_indicators(df.copy())
                 if len(df_with_indicators) < 2: continue
                 
                 last = df_with_indicators.iloc[-1]
+                
+                # --- ИСПРАВЛЕНИЕ: Более надежный поиск столбцов ---
+                atr_col_name = next((col for col in last.index if 'ATRr' in col), None)
+                if not atr_col_name: continue # Если столбец ATR не найден, пропускаем монету
+
                 adx_value = last.get(f'ADX_{ADX_LEN}')
                 bb_upper = last.get(f'BBU_{BBANDS_LEN}_{BBANDS_STD}')
                 bb_lower = last.get(f'BBL_{BBANDS_LEN}_{BBANDS_STD}')
                 rsi_value = last.get(f'RSI_{RSI_LEN}')
+                atr_value = last.get(atr_col_name)
 
-                if any(v is None for v in [adx_value, bb_upper, bb_lower, rsi_value]): continue
+                if any(v is None for v in [adx_value, bb_upper, bb_lower, rsi_value, atr_value]): continue
+                # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
                 bb_width_pct = ((bb_upper - bb_lower) / bb_lower) * 100
-                is_in_perfect_range = (adx_value > ADX_MIN_THRESHOLD) and (adx_value < ADX_MAX_THRESHOLD)
+                is_ranging = adx_value < ADX_THRESHOLD
                 is_wide_enough = bb_width_pct > MIN_BB_WIDTH_PCT
                 is_oversold_at_bottom = last['close'] <= bb_lower and rsi_value < RSI_OVERSOLD
                 
-                if is_in_perfect_range and is_wide_enough and is_oversold_at_bottom:
-                    if (datetime.now().timestamp() - state["last_alert_times"].get(pair, 0)) < 3600 * 4: continue
-                    
-                    # ---> ЛОГИКА БЕЗ ФИЛЬТРА R:R <---
-                    # Просто рассчитываем механические уровни и добавляем в кандидаты
-                    entry_price = last['close']
-                    take_profit = last[f'BBM_{BBANDS_LEN}_{BBANDS_STD}']
-                    stop_loss = bb_lower - (last[f'ATRr_{ATR_LEN_FOR_SL}'] * SL_ATR_MUL)
+                if is_ranging and is_wide_enough and is_oversold_at_bottom:
+                    now = datetime.now().timestamp()
+                    if (now - state["last_alert_times"].get(pair, 0)) < 3600 * 4: continue
 
                     candidates.append({
-                        "pair": pair, "price": entry_price, "rsi": round(rsi_value, 1),
-                        "sl": stop_loss, "tp": take_profit
+                        "pair": pair, "price": last['close'], "atr": atr_value, 
+                        "rsi": round(rsi_value, 1), "bb_lower": bb_lower, 
+                        "bb_middle": last[f'BBM_{BBANDS_LEN}_{BBANDS_STD}']
                     })
-
             except Exception as e:
                 log.error(f"Error processing pair {pair}: {e}")
-
+                
         if candidates:
             await broadcast_message(app, f"🔍 Найдено {len(candidates)} кандидатов. Отправляю на ранжирование в LLM...")
             
