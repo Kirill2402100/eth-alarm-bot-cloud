@@ -95,6 +95,8 @@ def calculate_indicators(df: pd.DataFrame):
     df.ta.adx(length=ADX_LEN, append=True)
     df.ta.bbands(length=BBANDS_LEN, std=BBANDS_STD, append=True)
     df.ta.rsi(length=RSI_LEN, append=True)
+    # --- > ДОБАВЬТЕ ЭТУ СТРОЧКУ < ---
+    df.ta.atr(length=ATR_LEN_FOR_SL, append=True)
     return df.dropna()
 
 # === LLM ===
