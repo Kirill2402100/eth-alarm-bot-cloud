@@ -196,39 +196,67 @@ async def scanner_loop(app):
             except Exception as e:
                 log.error(f"Error processing pair {pair}: {e}")
                 
-        if candidates:
-            await broadcast_message(app, f"🔍 Найдено {len(candidates)} кандидатов. Отправляю на ранжирование в LLM...")
+             if candidates:
+            log.info(f"Found {len(candidates)} candidates. Sending to LLM for analysis...")
+            await broadcast_message(app, f"🔍 Найдено {len(candidates)} кандидатов. Отправляю на анализ в LLM...")
             
-            llm_candidates_data = [{"asset": c["pair"], "rsi": c["rsi"]} for c in candidates]
-            top_rated_assets = await ask_llm_to_rank(llm_candidates_data)
+            approved_signals = []
 
-            if top_rated_assets:
-                await broadcast_message(app, f"🏆 LLM отобрал топ-{len(top_rated_assets)} лучших сигналов:")
-                for ranked_asset in top_rated_assets:
-                    asset_name = ranked_asset.get("asset")
-                    original_candidate = next((c for c in candidates if c['pair'] == asset_name), None)
-                    if not original_candidate: continue
+            for candidate in candidates:
+                try:
+                    # Формируем данные для анализа одного кандидата
+                    trade_data_for_llm = {
+                        "asset": candidate["pair"],
+                        "entry_price": candidate["price"],
+                        "rsi": candidate["rsi"],
+                        "bb_lower": candidate["bb_lower"],
+                        "atr": candidate["atr"]
+                    }
                     
+                    # Отправляем одного кандидата в LLM
+                    llm_response = await ask_llm(trade_data_for_llm)
+                    log.info(f"LLM response for {candidate['pair']}: {llm_response.get('decision')}")
+
+                    # Проверяем, одобрила ли нейросеть сделку
+                    if llm_response and llm_response.get('decision') == 'APPROVE':
+                        # Если одобрено, добавляем ответ LLM к данным кандидата
+                        candidate['llm_analysis'] = llm_response
+                        approved_signals.append(candidate)
+                        
+                except Exception as e:
+                    log.error(f"Error during LLM analysis for {candidate['pair']}: {e}")
+
+            # Теперь отправляем только одобренные сигналы
+            if approved_signals:
+                await broadcast_message(app, f"🏆 LLM одобрил {len(approved_signals)} сигнал(а):")
+                for signal in approved_signals:
+                    asset_name = signal['pair']
+                    llm_analysis = signal['llm_analysis']
+                    
+                    # Берем TP и SL из ответа нейросети
+                    suggested_tp = llm_analysis.get('suggested_tp', signal['bb_middle'])
+                    suggested_sl = llm_analysis.get('suggested_sl', signal['price'] - (signal['atr'] * SL_ATR_MUL))
+
                     message = (
                         f"🔔 **СИГНАЛ: LONG (Range Trade)**\n\n"
                         f"**Монета:** `{asset_name}`\n"
-                        f"**Цена входа:** `~{original_candidate['price']:.4f}`\n\n"
-                        f"--- **Параметры сделки** ---\n"
-                        f"**Take Profit:** `{original_candidate['tp']:.4f}` (Средняя BB)\n"
-                        f"**Stop Loss:** `{original_candidate['sl']:.4f}`\n\n"
+                        f"**Цена входа:** `~{signal['price']:.4f}`\n\n"
+                        f"--- **Параметры сделки (от LLM)** ---\n"
+                        f"**Take Profit:** `{suggested_tp:.4f}`\n"
+                        f"**Stop Loss:** `{suggested_sl:.4f}`\n\n"
                         f"--- **Анализ LLM** ---\n"
-                        f"_{ranked_asset.get('reasoning')}_"
+                        f"_{llm_analysis.get('reasoning', 'Нет обоснования.')}_"
                     )
                     await broadcast_message(app, message)
                     state["last_alert_times"][asset_name] = datetime.now().timestamp()
                     save_state()
-                    await asyncio.sleep(1)
-            else: 
+                    await asyncio.sleep(1) # Небольшая задержка между сообщениями
+            else:
+                log.info("LLM did not approve any candidates.")
                 await broadcast_message(app, "ℹ️ LLM не одобрил ни одного кандидата.")
         else:
             log.info("No valid candidates found in this scan cycle.")
-            await broadcast_message(app, "ℹ️ Сканирование завершено. Подходящих кандидатов не найдено.")
-        
+            
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
         
 # === COMMANDS and RUN ===
