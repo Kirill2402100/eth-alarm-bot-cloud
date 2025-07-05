@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v8.4 - Symbol Matching Fix
-# • Исправлена логика сопоставления спотовых и фьючерсных рынков.
+# v11.1 - Single Target R:R
+# • Возвращена логика с одним Take Profit.
+# • TP теперь жестко рассчитывается от SL для обеспечения R:R 1:2.
 # ============================================================================
 
 import os
@@ -17,6 +18,7 @@ import pandas_ta as ta
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.error import BadRequest
 
 # === ENV / Logging ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -75,12 +77,16 @@ exchange = ccxt.mexc()
 TIMEFRAME = '5m'
 SCAN_INTERVAL_SECONDS = 60 * 15
 ADX_LEN = 14
-ADX_MIN_THRESHOLD = 20.0
-ADX_MAX_THRESHOLD = 40.0
+# Ваши "мягкие" настройки для ADX
+ADX_MIN_THRESHOLD = 20.0 
+ADX_MAX_THRESHOLD = 40.0 
+# Ваши "мягкие" настройки для BB и RSI
 BBANDS_LEN, BBANDS_STD = 20, 2.0
-MIN_BB_WIDTH_PCT = 1.0
+MIN_BB_WIDTH_PCT = 1.0 
 RSI_LEN, RSI_OVERSOLD = 14, 40
-MIN_PROFIT_TARGET_PCT = 2.5
+# Новые обязательные параметры для расчета SL и TP
+ATR_LEN_FOR_SL, SL_ATR_MUL = 14, 0.5 
+MIN_RR_RATIO = 2.0  # Наша цель по соотношению Риск/Прибыль 1:2
 
 # === INDICATORS ===
 def calculate_indicators(df: pd.DataFrame):
@@ -121,42 +127,22 @@ async def ask_llm(trade_data):
         return {"decision": "ERROR", "reasoning": str(e)}
 
 # === MAIN SCANNER LOOP ===
-
 async def scanner_loop(app):
-    await broadcast_message(app, "🤖 Сканер запущен. Начинаю формирование списка торгуемых монет...")
+    await broadcast_message(app, "🤖 Сканер запущен. Начинаю формирование списка топ-монет по объему...")
     try:
         await exchange.load_markets()
         tickers = await exchange.fetch_tickers()
-        
-        # ---> ИЗМЕНЕННАЯ ЛОГИКА ФОРМИРОВАНИЯ СПИСКА <---
-        
-        # 1. Получаем БАЗОВЫЕ активы, у которых есть спотовая пара к USDT
-        spot_bases = {m['base'] for m in exchange.markets.values() if m.get('spot') and m.get('quote') == 'USDT'}
-        
-        # 2. Получаем БАЗОВЫЕ активы, у которых есть фьючерсная пара к USDT
-        swap_bases = {m['base'] for m in exchange.markets.values() if m.get('swap') and m.get('quote') == 'USDT'}
-        
-        # 3. Находим пересечение БАЗОВЫХ активов
-        tradeable_bases = spot_bases.intersection(swap_bases)
-        
-        # 4. Восстанавливаем полные имена спотовых пар для сканирования
-        tradeable_symbols = {f"{base}/USDT" for base in tradeable_bases}
-        total_tradeable_count = len(tradeable_symbols)
-
-        # 5. Фильтруем тикеры по этому списку и по объему
-        liquid_tradeable_pairs = {s: t for s, t in tickers.items() if s in tradeable_symbols and t.get('quoteVolume') and all(kw not in s for kw in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])}
-        sorted_pairs = sorted(liquid_tradeable_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
+        usdt_pairs = {s: t for s, t in tickers.items() if s.endswith('/USDT') and t.get('quoteVolume') and all(kw not in s for kw in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])}
+        sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
         coin_list = [item[0] for item in sorted_pairs[:COIN_LIST_SIZE]]
-        
-        await broadcast_message(app, f"✅ Найдено {total_tradeable_count} монет, торгуемых на споте и фьючерсах. Анализирую топ-{len(coin_list)} по объему.")
-
+        await broadcast_message(app, f"✅ Список из {len(coin_list)} монет для сканирования сформирован.")
     except Exception as e:
         log.error(f"Failed to fetch dynamic coin list: %s", e)
         await broadcast_message(app, "⚠️ Не удалось сформировать динамический список монет. Проверьте лог."); return
-        
+
     while state.get('monitoring', False):
         log.info(f"Starting new scan for {len(coin_list)} coins...")
-        found_signals = 0
+        candidates = []
         for pair in coin_list:
             try:
                 ohlcv = await exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME, limit=100)
@@ -166,63 +152,60 @@ async def scanner_loop(app):
                 if len(df_with_indicators) < 2: continue
                 
                 last = df_with_indicators.iloc[-1]
-                adx_value = last.get(f'ADX_{ADX_LEN}')
-                bb_upper = last.get(f'BBU_{BBANDS_LEN}_{BBANDS_STD}')
-                bb_lower = last.get(f'BBL_{BBANDS_LEN}_{BBANDS_STD}')
-                rsi_value = last.get(f'RSI_{RSI_LEN}')
+                adx_value = last[f'ADX_{ADX_LEN}']
+                bb_lower = last[f'BBL_{BBANDS_LEN}_{BBANDS_STD}']
+                bb_width_pct = ((last[f'BBU_{BBANDS_LEN}_{BBANDS_STD}'] - bb_lower) / bb_lower) * 100
+                rsi_value = last[f'RSI_{RSI_LEN}']
 
-                if any(v is None for v in [adx_value, bb_upper, bb_lower, rsi_value]): continue
-
-                bb_width_pct = ((bb_upper - bb_lower) / bb_lower) * 100
-                is_in_perfect_range = (adx_value > ADX_MIN_THRESHOLD) and (adx_value < ADX_MAX_THRESHOLD)
-                is_wide_enough = bb_width_pct > MIN_BB_WIDTH_PCT
-                is_oversold_at_bottom = last['close'] <= bb_lower and rsi_value < RSI_OVERSOLD
-                
-                if is_in_perfect_range and is_wide_enough and is_oversold_at_bottom:
-                    now = datetime.now().timestamp()
-                    if (now - state["last_alert_times"].get(pair, 0)) < 3600 * 4: continue
-
-                    await broadcast_message(app, f"🔍 Найден кандидат: `{pair}`. Отправляю на анализ в LLM...")
+                if (adx_value < ADX_THRESHOLD) and (bb_width_pct > MIN_BB_WIDTH_PCT) and (last['close'] <= bb_lower and rsi_value < RSI_OVERSOLD):
                     
-                    trade_data = { "asset": pair, "tf": TIMEFRAME, "price": last['close'], "rsi": round(rsi_value, 1), "adx": round(adx_value, 1) }
-                    llm_decision = await ask_llm(trade_data)
+                    entry_price = last['close']
+                    stop_loss = bb_lower - (last[f'ATRr_{ATR_LEN_FOR_SL}'] * SL_ATR_MUL)
                     
-                    if llm_decision and llm_decision.get("decision") == "APPROVE" and llm_decision.get("confidence_score", 0) >= LLM_THRESHOLD:
-                        suggested_tp = llm_decision.get('suggested_tp')
-                        entry_price = last['close']
+                    risk_distance = entry_price - stop_loss
+                    if risk_distance <= 0: continue
 
-                        if suggested_tp and isinstance(suggested_tp, (int, float)):
-                            profit_potential_pct = ((float(suggested_tp) - entry_price) / entry_price) * 100
-                            if profit_potential_pct >= MIN_PROFIT_TARGET_PCT:
-                                found_signals += 1
-                                stop_loss = llm_decision.get('suggested_sl', 'N/A')
-                                message = (
-                                    f"🔔 **СИГНАЛ: LONG (Buy The Dip) - ОДОБРЕН**\n\n"
-                                    f"**Монета:** `{pair}`\n"
-                                    f"**Текущая цена:** `{entry_price:.4f}`\n\n"
-                                    f"--- **Параметры от LLM** ---\n"
-                                    f"**Take Profit:** `{suggested_tp}` (Потенциал: {profit_potential_pct:.1f}%)\n"
-                                    f"**Stop Loss:** `{stop_loss}`\n\n"
-                                    f"--- **Анализ LLM ({llm_decision.get('confidence_score')}/10)** ---\n"
-                                    f"_{llm_decision.get('reasoning')}_"
-                                )
-                                await broadcast_message(app, message)
-                                state["last_alert_times"][pair] = now; save_state()
-                            else:
-                                await broadcast_message(app, f"ℹ️ LLM для `{pair}` предложил недостаточный профит ({profit_potential_pct:.1f}%) < {MIN_PROFIT_TARGET_PCT}%. Сигнал отфильтрован.")
-                        else:
-                            await broadcast_message(app, f"ℹ️ LLM для `{pair}` не дал корректную цель по прибыли. Сигнал отфильтрован.")
-                    else:
-                        await broadcast_message(app, f"ℹ️ LLM отклонил сигнал по `{pair}`. Причина: _{llm_decision.get('reasoning', 'Нет')}_")
+                    reward_distance = risk_distance * MIN_RR_RATIO
+                    take_profit = entry_price + reward_distance
+                    
+                    if (datetime.now().timestamp() - state["last_alert_times"].get(pair, 0)) < 3600 * 4: continue
+                    candidates.append({"pair": pair, "price": entry_price, "rsi": round(rsi_value, 1), "sl": stop_loss, "tp": take_profit})
             except Exception as e:
                 log.error(f"Error processing pair {pair}: {e}")
-        
-        log.info(f"Scan finished. Found {found_signals} approved signals.")
-        if found_signals == 0:
+
+        if candidates:
+            await broadcast_message(app, f"🔍 Найдено {len(candidates)} кандидатов. Отправляю на ранжирование в LLM...")
+            llm_candidates_data = [{"asset": c["pair"], "rsi": c["rsi"]} for c in candidates]
+            top_rated_assets = await ask_llm_to_rank(llm_candidates_data)
+
+            if top_rated_assets:
+                await broadcast_message(app, f"🏆 LLM отобрал топ-{len(top_rated_assets)} лучших сигналов:")
+                for ranked_asset in top_rated_assets:
+                    asset_name = ranked_asset.get("asset")
+                    original_candidate = next((c for c in candidates if c['pair'] == asset_name), None)
+                    if not original_candidate: continue
+                    
+                    message = (
+                        f"🔔 **СИГНАЛ: LONG (Range Trade)**\n\n"
+                        f"**Монета:** `{asset_name}`\n"
+                        f"**Цена входа:** `~{original_candidate['price']:.4f}`\n\n"
+                        f"--- **Параметры сделки (R:R ~1:{int(MIN_RR_RATIO)})** ---\n"
+                        f"**Take Profit:** `{original_candidate['tp']:.4f}`\n"
+                        f"**Stop Loss:** `{original_candidate['sl']:.4f}`\n\n"
+                        f"--- **Анализ LLM** ---\n"
+                        f"_{ranked_asset.get('reasoning')}_"
+                    )
+                    await broadcast_message(app, message)
+                    state["last_alert_times"][asset_name] = datetime.now().timestamp()
+                    save_state()
+                    await asyncio.sleep(1)
+            else: await broadcast_message(app, "ℹ️ LLM не одобрил ни одного кандидата.")
+        else:
+            log.info("No valid candidates found in this scan cycle.")
             await broadcast_message(app, "ℹ️ Сканирование завершено. Подходящих кандидатов не найдено.")
         
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
-
+        
 # === COMMANDS and RUN ===
 async def broadcast_message(app, text):
     for chat_id in app.chat_ids:
