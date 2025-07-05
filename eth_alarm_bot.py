@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v8.3 - Futures Filter
-# • Добавлена проверка на наличие фьючерсного контракта для каждой монеты.
+# v8.4 - Symbol Matching Fix
+# • Исправлена логика сопоставления спотовых и фьючерсных рынков.
 # ============================================================================
 
 import os
@@ -130,17 +130,20 @@ async def scanner_loop(app):
         
         # ---> ИЗМЕНЕННАЯ ЛОГИКА ФОРМИРОВАНИЯ СПИСКА <---
         
-        # 1. Находим все спотовые пары к USDT
-        all_usdt_pairs_spot = {m['symbol'] for m in exchange.markets.values() if m.get('spot') and m.get('quote') == 'USDT'}
+        # 1. Получаем БАЗОВЫЕ активы, у которых есть спотовая пара к USDT
+        spot_bases = {m['base'] for m in exchange.markets.values() if m.get('spot') and m.get('quote') == 'USDT'}
         
-        # 2. Находим все фьючерсные (SWAP) пары к USDT
-        all_usdt_pairs_swap = {m['symbol'] for m in exchange.markets.values() if m.get('swap') and m.get('quote') == 'USDT'}
+        # 2. Получаем БАЗОВЫЕ активы, у которых есть фьючерсная пара к USDT
+        swap_bases = {m['base'] for m in exchange.markets.values() if m.get('swap') and m.get('quote') == 'USDT'}
         
-        # 3. Находим их пересечение - монеты, которые есть и там, и там
-        tradeable_symbols = all_usdt_pairs_spot.intersection(all_usdt_pairs_swap)
+        # 3. Находим пересечение БАЗОВЫХ активов
+        tradeable_bases = spot_bases.intersection(swap_bases)
+        
+        # 4. Восстанавливаем полные имена спотовых пар для сканирования
+        tradeable_symbols = {f"{base}/USDT" for base in tradeable_bases}
         total_tradeable_count = len(tradeable_symbols)
 
-        # 4. Фильтруем тикеры по этому списку и по объему
+        # 5. Фильтруем тикеры по этому списку и по объему
         liquid_tradeable_pairs = {s: t for s, t in tickers.items() if s in tradeable_symbols and t.get('quoteVolume') and all(kw not in s for kw in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])}
         sorted_pairs = sorted(liquid_tradeable_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
         coin_list = [item[0] for item in sorted_pairs[:COIN_LIST_SIZE]]
