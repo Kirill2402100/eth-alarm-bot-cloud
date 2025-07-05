@@ -226,6 +226,7 @@ async def scanner_loop(app):
 # === COMMANDS and RUN ===
 async def broadcast_message(app, text):
     for chat_id in app.chat_ids:
+        # MarkdownV2 требует экранирования спецсимволов
         safe_text = text.replace('.', r'\.').replace('-', r'\-').replace('(', r'\(').replace(')', r'\)').replace('>', r'\>').replace('+', r'\+').replace('=', r'\=').replace('*', r'\*').replace('_', r'\_').replace('`', r'\`').replace('[', r'\[').replace(']', r'\]')
         try:
             await app.bot.send_message(chat_id=chat_id, text=safe_text, parse_mode="MarkdownV2")
@@ -241,11 +242,13 @@ async def broadcast_message(app, text):
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global scanner_task
     chat_id = update.effective_chat.id
-    if not hasattr(ctx.application, 'chat_ids'): ctx.application.chat_ids = set()
+    if not hasattr(ctx.application, 'chat_ids'):
+        ctx.application.chat_ids = set()
     ctx.application.chat_ids.add(chat_id)
     
     if scanner_task is None or scanner_task.done():
-        state['monitoring'] = True; save_state()
+        state['monitoring'] = True
+        save_state()
         await update.message.reply_text("✅ Сканер запущен (v10.1 Balance P&L).")
         scanner_task = asyncio.create_task(scanner_loop(ctx.application))
     else:
@@ -256,26 +259,10 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if scanner_task and not scanner_task.done():
         scanner_task.cancel()
         scanner_task = None
-    state['monitoring'] = False; save_state()
+    state['monitoring'] = False
+    save_state()
     await update.message.reply_text("❌ Мониторинг остановлен.")
 
-async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global state
-    try:
-        pair = ctx.args[0].upper()
-        if "/" not in pair: pair += "/USDT"
-        deposit, entry_price, sl, tp = map(float, ctx.args[1:5])
-    except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ /entry <ТИКЕР> <депозит> <цена> <sl> <tp>"); return
-
-    state["manual_position"] = {
-        "entry_time": datetime.now(timezone.utc).isoformat(), "deposit": deposit,
-        "entry_price": entry_price, "sl": sl, "tp": tp, "pair": pair, "side": "LONG"
-    }
-    save_state()
-    await update.message.reply_text(f"✅ Вход вручную зафиксирован: {pair} @ {entry_price}")
-
-# ---> ИЗМЕНЕННАЯ КОМАНДА /exit <---
 async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global state
     try:
@@ -342,8 +329,8 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Сделка по **{pos.get('pair', 'N/A')}** закрыта и записана.\n**P&L: {pnl:+.2f} USDT ({pct_change:+.2f}%)**", parse_mode="HTML")
     
     state["manual_position"] = None
-    save_state()  
-    
+    save_state()
+
 if __name__ == "__main__":
     load_state()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
