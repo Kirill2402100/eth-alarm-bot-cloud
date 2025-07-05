@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v10.1 - Balance-Based P&L
-# • Расчет P&L в команде /exit теперь основан на разнице депозитов.
+# v8.3 - Futures Filter
+# • Добавлена проверка на наличие фьючерсного контракта для каждой монеты.
 # ============================================================================
 
 import os
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 import pandas as pd
 import ccxt.async_support as ccxt
 import gspread
@@ -17,7 +17,6 @@ import pandas_ta as ta
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from telegram.error import BadRequest
 
 # === ENV / Logging ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -122,19 +121,36 @@ async def ask_llm(trade_data):
         return {"decision": "ERROR", "reasoning": str(e)}
 
 # === MAIN SCANNER LOOP ===
+
 async def scanner_loop(app):
-    await broadcast_message(app, "🤖 Сканер запущен. Начинаю формирование списка топ-монет по объему...")
+    await broadcast_message(app, "🤖 Сканер запущен. Начинаю формирование списка торгуемых монет...")
     try:
         await exchange.load_markets()
         tickers = await exchange.fetch_tickers()
-        usdt_pairs = {s: t for s, t in tickers.items() if s.endswith('/USDT') and t.get('quoteVolume') and all(kw not in s for kw in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])}
-        sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
+        
+        # ---> ИЗМЕНЕННАЯ ЛОГИКА ФОРМИРОВАНИЯ СПИСКА <---
+        
+        # 1. Находим все спотовые пары к USDT
+        all_usdt_pairs_spot = {m['symbol'] for m in exchange.markets.values() if m.get('spot') and m.get('quote') == 'USDT'}
+        
+        # 2. Находим все фьючерсные (SWAP) пары к USDT
+        all_usdt_pairs_swap = {m['symbol'] for m in exchange.markets.values() if m.get('swap') and m.get('quote') == 'USDT'}
+        
+        # 3. Находим их пересечение - монеты, которые есть и там, и там
+        tradeable_symbols = all_usdt_pairs_spot.intersection(all_usdt_pairs_swap)
+        total_tradeable_count = len(tradeable_symbols)
+
+        # 4. Фильтруем тикеры по этому списку и по объему
+        liquid_tradeable_pairs = {s: t for s, t in tickers.items() if s in tradeable_symbols and t.get('quoteVolume') and all(kw not in s for kw in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])}
+        sorted_pairs = sorted(liquid_tradeable_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
         coin_list = [item[0] for item in sorted_pairs[:COIN_LIST_SIZE]]
-        await broadcast_message(app, f"✅ Список из {len(coin_list)} монет для сканирования сформирован.")
+        
+        await broadcast_message(app, f"✅ Найдено {total_tradeable_count} монет, торгуемых на споте и фьючерсах. Анализирую топ-{len(coin_list)} по объему.")
+
     except Exception as e:
         log.error(f"Failed to fetch dynamic coin list: %s", e)
         await broadcast_message(app, "⚠️ Не удалось сформировать динамический список монет. Проверьте лог."); return
-
+        
     while state.get('monitoring', False):
         log.info(f"Starting new scan for {len(coin_list)} coins...")
         found_signals = 0
@@ -257,6 +273,30 @@ async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Вход вручную зафиксирован: {pair} @ {entry_price}")
 
 # ---> ИЗМЕНЕННАЯ КОМАНДА /exit <---
+async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global state
+    try:
+        # Формат: /entry ТИКЕР депозит цена_входа sl tp
+        pair = ctx.args[0].upper()
+        if "/" not in pair: pair += "/USDT"
+        
+        deposit, entry_price, sl, tp = map(float, ctx.args[1:5])
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ Неверный формат. Используйте:\n`/entry <ТИКЕР> <депозит> <цена> <sl> <tp>`\n\n*Пример:*\n`/entry SOL/USDT 500 135.5 134.8 138.0`", parse_mode="MarkdownV2")
+        return
+
+    state["manual_position"] = {
+        "entry_time": datetime.now(timezone.utc).isoformat(),
+        "deposit": deposit,
+        "entry_price": entry_price,
+        "sl": sl,
+        "tp": tp,
+        "pair": pair,
+        "side": "LONG" # Для этого бота все сделки - LONG
+    }
+    save_state()
+    await update.message.reply_text(f"✅ Вход вручную зафиксирован: **{pair}** @ **{entry_price}**", parse_mode="HTML")
+
 async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global state
     pos = state.get("manual_position")
@@ -276,7 +316,6 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pct_change = (pnl / initial_deposit) * 100 if initial_deposit != 0 else 0
     # --- КОНЕЦ РАСЧЕТА ---
     
-    # Запись в Google Таблицу (теперь с правильными данными)
     if LOGS_WS:
         try:
             rr = abs((pos['tp'] - pos['entry_price']) / (pos['sl'] - pos['entry_price'])) if (pos.get('sl') and pos.get('entry_price') and (pos['sl'] - pos['entry_price']) != 0) else 0
@@ -292,17 +331,15 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 round(pnl, 2),
                 round(pct_change, 2)
             ]
-            # Используем to_thread для асинхронной работы с gspread
             await asyncio.to_thread(LOGS_WS.append_row, row, value_input_option='USER_ENTERED')
         except Exception as e:
             log.error("Failed to write to Google Sheets: %s", e)
             await update.message.reply_text("⚠️ Ошибка записи в Google Таблицу.")
 
-    # Отправка сообщения в Telegram (теперь данные совпадают с таблицей)
     await update.message.reply_text(f"✅ Сделка по **{pos.get('pair', 'N/A')}** закрыта и записана.\n**P&L: {pnl:+.2f} USDT ({pct_change:+.2f}%)**", parse_mode="HTML")
     
     state["manual_position"] = None
-    save_state()
+    save_state()  
     
 if __name__ == "__main__":
     load_state()
