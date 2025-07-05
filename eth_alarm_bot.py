@@ -174,7 +174,6 @@ async def scanner_loop(app):
                 is_wide_enough = bb_width_pct > MIN_BB_WIDTH_PCT
                 is_oversold_at_bottom = last['close'] <= bb_lower and rsi_value < RSI_OVERSOLD
 
-                # <--- НАЧАЛО НОВОГО КОДА ДЛЯ ОТЛАДКИ --->
                 if DEBUG_MODE:
                     log.info(
                         f"[DEBUG] {pair:<12} | "
@@ -182,7 +181,6 @@ async def scanner_loop(app):
                         f"Wide (BBW > {MIN_BB_WIDTH_PCT}): {is_wide_enough} (BBW={bb_width_pct:.1f}%) | "
                         f"Oversold (RSI < {RSI_OVERSOLD}): {is_oversold_at_bottom} (RSI={rsi_value:.1f}, Close={last['close']:.4f} <= BB_L={bb_lower:.4f})"
                     )
-                # <--- КОНЕЦ НОВОГО КОДА ДЛЯ ОТЛАДКИ --->
                 
                 if is_ranging and is_wide_enough and is_oversold_at_bottom:
                     now = datetime.now().timestamp()
@@ -195,8 +193,9 @@ async def scanner_loop(app):
                     })
             except Exception as e:
                 log.error(f"Error processing pair {pair}: {e}")
-                
-             if candidates:
+        
+        # --- НАЧАЛО ИСПРАВЛЕННОГО БЛОКА (ОТСТУПЫ ВЫРОВНЕНЫ) ---
+        if candidates:
             log.info(f"Found {len(candidates)} candidates. Sending to LLM for analysis...")
             await broadcast_message(app, f"🔍 Найдено {len(candidates)} кандидатов. Отправляю на анализ в LLM...")
             
@@ -256,6 +255,7 @@ async def scanner_loop(app):
                 await broadcast_message(app, "ℹ️ LLM не одобрил ни одного кандидата.")
         else:
             log.info("No valid candidates found in this scan cycle.")
+        # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА ---
             
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
         
