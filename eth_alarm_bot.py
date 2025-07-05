@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v13.0 - Advanced Logging & Analysis
-# • Добавлен индикатор Stochastic.
-# • Улучшен промпт LLM для анализа дивергенций, свечей и риск-менеджмента.
-# • Добавлены уведомления об отклоненных LLM сигналах с указанием причины.
+# v14.0 - Global Trend Filter & Bounce Confirmation
+# • Добавлен фильтр по EMA 200 для торговли только в глобальном аптренде.
+# • Изменена логика входа: теперь бот ждет подтверждения отскока.
+# • Улучшен промпт LLM для учета глобального тренда.
 # ============================================================================
 
 import os
@@ -32,7 +32,6 @@ DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_API_URL = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
 LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "gpt-4.1")
-LLM_THRESHOLD = float(os.getenv("LLM_CONFIDENCE_THRESHOLD", 7.0))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
@@ -84,30 +83,29 @@ BBANDS_LEN, BBANDS_STD = 20, 2.0
 MIN_BB_WIDTH_PCT = 0.8
 RSI_LEN, RSI_OVERSOLD = 14, 45 
 STOCH_OVERSOLD = 25.0
-ATR_LEN_FOR_SL, SL_ATR_MUL = 14, 0.5
-MIN_RR_RATIO = 1.5 # Минимально допустимое R:R для LLM
+EMA_LEN = 200 # Длина для фильтра глобального тренда
+MIN_RR_RATIO = 1.2 # Снизили требование до 1.2
 
 # === INDICATORS ===
 def calculate_indicators(df: pd.DataFrame):
     df.ta.adx(length=ADX_LEN, append=True)
     df.ta.bbands(length=BBANDS_LEN, std=BBANDS_STD, append=True)
     df.ta.rsi(length=RSI_LEN, append=True)
-    df.ta.atr(length=ATR_LEN_FOR_SL, append=True)
     df.ta.stoch(append=True)
+    df.ta.ema(length=EMA_LEN, append=True)
+    # ATR считаем последним, т.к. он не нужен для основного анализа
+    df.ta.atr(length=14, append=True)
     return df.dropna()
 
 # === LLM ===
 LLM_PROMPT = (
-    "Ты — элитный трейдер-аналитик и риск-менеджер 'Сигма'. Твоя задача — не просто проанализировать сетап, а рассчитать для него оптимальные параметры и принять решение о входе.\n\n"
-    "ТВОЙ АЛГОРИТМ ПРИНЯТИЯ РЕШЕНИЙ:\n"
-    "1.  **Определи консервативный Take Profit (TP):** Найди ближайший разумный уровень сопротивления. Это может быть средняя линия Боллинджера (`bb_middle`), но если рядом есть другой сильный уровень — используй его. Запиши это значение.\n"
-    "2.  **Определи логичный Stop Loss (SL):** Найди последний значимый минимум цены (swing low) в данных `last_candles`. Установи SL немного НИЖЕ этого минимума. Он должен быть технически обоснован, а не просто рассчитан по ATR. Запиши это значение.\n"
-    "3.  **Рассчитай Risk/Reward (R:R):** Рассчитай соотношение `(TP - Цена входа) / (Цена входа - SL)`.\n"
-    "4.  **Финальное решение (Фильтр):**\n"
-    f"    - **ЕСЛИ R:R >= {MIN_RR_RATIO} И сетап выглядит убедительно (есть дивергенции, бычьи свечи), ТО решение 'APPROVE'.**\n"
-    "    - **ИНАЧЕ, решение 'REJECT'.** Если причина в низком R:R, укажи это в `reasoning`.\n\n"
-    "Дай ответ ТОЛЬКО в виде JSON-объекта с полями: 'decision' ('APPROVE'/'REJECT'), 'confidence_score' (0-10), "
-    "'reasoning' (RU, краткое обоснование твоего решения), 'suggested_tp' (рассчитанный тобой TP), 'suggested_sl' (рассчитанный тобой SL).\n\n"
+    "Ты — элитный трейдер-аналитик 'Сигма'. Твоя главная задача — отфильтровать ложные сигналы на покупку в нисходящем тренде.\n\n"
+    "АЛГОРИТМ АНАЛИЗА:\n"
+    "1.  **Проверка глобального тренда:** Цена входа (`entry_price`) находится выше `ema_200`? Если нет, это очень рискованный сигнал против тренда. Упомяни это как главный риск.\n"
+    "2.  **Подтверждение отскока:** Данные `last_candles` показывают, что цена действительно отскочила от нижней границы Боллинджера (например, последняя свеча закрылась выше предыдущей)? Есть ли бычьи свечные паттерны или дивергенции?\n"
+    "3.  **Расчет Risk/Reward:** На основе логичного SL (под минимумом) и консервативного TP (ближайшее сопротивление/`bb_middle`) рассчитай R:R.\n"
+    f"4.  **Решение:** Одобряй сделку (`APPROVE`) **только если глобальный тренд восходящий (цена > ema_200), есть подтверждение отскока И R:R >= {MIN_RR_RATIO}**. В противном случае — `REJECT`.\n\n"
+    "Дай ответ ТОЛЬКО в виде JSON-объекта с полями: 'decision', 'confidence_score', 'reasoning', 'suggested_tp', 'suggested_sl'.\n\n"
     "АНАЛИЗИРУЙ СЕТАП:\n{trade_data}"
 )
 async def ask_llm(trade_data):
@@ -150,54 +148,60 @@ async def scanner_loop(app):
         candidates = []
         for pair in coin_list:
             try:
-                ohlcv = await exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME, limit=100)
+                # Берем больше данных для корректного расчета EMA 200
+                ohlcv = await exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME, limit=250)
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                if len(df) < 50: continue
+                if len(df) < 210: continue
 
                 df_with_indicators = calculate_indicators(df.copy())
                 if len(df_with_indicators) < 2: continue
                 
+                prev = df_with_indicators.iloc[-2]
                 last = df_with_indicators.iloc[-1]
                 
-                atr_col_name = next((col for col in last.index if 'ATRr' in col), None)
-                if not atr_col_name: continue
-
                 adx_value = last.get(f'ADX_{ADX_LEN}')
-                bb_upper = last.get(f'BBU_{BBANDS_LEN}_{BBANDS_STD}')
-                bb_lower = last.get(f'BBL_{BBANDS_LEN}_{BBANDS_STD}')
+                last_ema = last.get(f'EMA_{EMA_LEN}')
+                bb_lower_last = last.get(f'BBL_{BBANDS_LEN}_{BBANDS_STD}')
+                bb_lower_prev = prev.get(f'BBL_{BBANDS_LEN}_{BBANDS_STD}')
                 rsi_value = last.get(f'RSI_{RSI_LEN}')
-                atr_value = last.get(atr_col_name)
-
-                if any(v is None for v in [adx_value, bb_upper, bb_lower, rsi_value, atr_value]): continue
-
-                bb_width_pct = ((bb_upper - bb_lower) / bb_lower) * 100
-                is_ranging = adx_value < ADX_THRESHOLD
-                is_wide_enough = bb_width_pct > MIN_BB_WIDTH_PCT
-                is_oversold_at_bottom = last['close'] <= bb_lower and rsi_value < RSI_OVERSOLD
-
                 stoch_k_col = next((col for col in last.index if 'STOCHk' in col), None)
                 if not stoch_k_col: continue
                 stoch_k_value = last.get(stoch_k_col)
-                is_stoch_oversold = stoch_k_value < STOCH_OVERSOLD
+
+                if any(v is None for v in [adx_value, last_ema, bb_lower_last, bb_lower_prev, rsi_value, stoch_k_value]): continue
+
+                # --- Новая, более строгая логика фильтрации ---
+                is_global_uptrend = last['close'] > last_ema
+                is_ranging = adx_value < ADX_THRESHOLD
+                is_oversold = rsi_value < RSI_OVERSOLD and stoch_k_value < STOCH_OVERSOLD
+                bounce_confirmed = prev['close'] <= bb_lower_prev and last['close'] > bb_lower_last
 
                 if DEBUG_MODE:
                     log.info(
                         f"[DEBUG] {pair:<12} | "
-                        f"Ranging (ADX < {ADX_THRESHOLD}): {is_ranging} (ADX={adx_value:.1f}) | "
-                        f"Oversold (RSI < {RSI_OVERSOLD}): {is_oversold_at_bottom} (RSI={rsi_value:.1f}) | "
-                        f"Stoch Oversold (STOCHk < {STOCH_OVERSOLD}): {is_stoch_oversold} (STOCHk={stoch_k_value:.1f})"
+                        f"Uptrend (C>EMA{EMA_LEN}): {is_global_uptrend} | "
+                        f"Ranging (ADX<{ADX_THRESHOLD}): {is_ranging} | "
+                        f"Oversold: {is_oversold} | "
+                        f"Bounce: {bounce_confirmed}"
                     )
                 
-                if is_ranging and is_wide_enough and is_oversold_at_bottom and is_stoch_oversold:
+                if is_global_uptrend and is_ranging and is_oversold and bounce_confirmed:
                     now = datetime.now().timestamp()
                     if (now - state["last_alert_times"].get(pair, 0)) < 3600 * 4: continue
+                    
+                    atr_col = next((col for col in last.index if 'ATRr' in col), 'ATRr_14')
+                    atr_value = last.get(atr_col, 0)
 
                     candidates.append({
-                        "pair": pair, "price": last['close'], "atr": atr_value, 
-                        "rsi": round(rsi_value, 1), "bb_lower": bb_lower, 
-                        "bb_middle": last[f'BBM_{BBANDS_LEN}_{BBANDS_STD}'],
+                        "pair": pair, "price": last['close'], 
+                        "rsi": round(rsi_value, 1),
                         "stoch_k": round(stoch_k_value, 1),
-                        "last_candles": df.tail(3)[['open', 'high', 'low', 'close', 'volume']].to_dict('records')
+                        "bb_lower": bb_lower_last,
+                        "bb_middle": last[f'BBM_{BBANDS_LEN}_{BBANDS_STD}'],
+                        "bb_upper": last[f'BBU_{BBANDS_LEN}_{BBANDS_STD}'],
+                        "ema_200": last_ema,
+                        "atr": atr_value,
+                        "last_candles": df_with_indicators.tail(5)[['open', 'high', 'low', 'close', 'volume']].to_dict('records')
                     })
             except Exception as e:
                 log.error(f"Error processing pair {pair}: {e}")
@@ -213,6 +217,7 @@ async def scanner_loop(app):
                         "asset": candidate["pair"], "entry_price": candidate["price"],
                         "rsi": candidate["rsi"], "stochastic_k": candidate["stoch_k"],
                         "bb_lower": candidate["bb_lower"], "bb_middle": candidate["bb_middle"],
+                        "bb_upper": candidate["bb_upper"], "ema_200": candidate["ema_200"],
                         "atr": candidate["atr"], "last_candles": candidate["last_candles"]
                     }
                     llm_response = await ask_llm(trade_data_for_llm)
@@ -222,7 +227,7 @@ async def scanner_loop(app):
                         approved_signals_count += 1
                         asset_name = candidate['pair']
                         suggested_tp = llm_response.get('suggested_tp', candidate['bb_middle'])
-                        suggested_sl = llm_response.get('suggested_sl', candidate['price'] - (candidate['atr'] * SL_ATR_MUL))
+                        suggested_sl = llm_response.get('suggested_sl', candidate['price'] - (candidate['atr'] * 1.0))
 
                         message = (
                             f"🔔 <b>СИГНАЛ: LONG (Range Trade)</b>\n\n"
@@ -238,7 +243,6 @@ async def scanner_loop(app):
                         state["last_alert_times"][asset_name] = datetime.now().timestamp()
                         save_state()
                     
-                    # НОВОЕ: Отправляем сообщение, если LLM отклонил сигнал
                     elif llm_response and llm_response.get('decision') == 'REJECT':
                         reason = llm_response.get('reasoning', 'Причина не указана.')
                         message = (
@@ -247,13 +251,10 @@ async def scanner_loop(app):
                             f"<b>Причина:</b> <i>{reason}</i>"
                         )
                         await broadcast_message(app, message)
-
-                    await asyncio.sleep(1) # Небольшая задержка между обработкой кандидатов
-                        
+                    await asyncio.sleep(1)
                 except Exception as e:
                     log.error(f"Error during LLM analysis for {candidate['pair']}: {e}")
 
-            # Отправляем итоговое сообщение только если были одобренные сигналы
             if approved_signals_count > 0:
                 await broadcast_message(app, f"✅ Анализ завершен. Одобрено сигналов: {approved_signals_count}.")
         else:
