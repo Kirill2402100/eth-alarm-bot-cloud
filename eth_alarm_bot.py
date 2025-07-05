@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v12.0 - Advanced Analysis
-# • Добавлен индикатор Stochastic для более точного определения перепроданности.
-# • Улучшен промпт LLM для анализа дивергенций, свечных паттернов и объемов.
+# v13.0 - Advanced Logging & Analysis
+# • Добавлен индикатор Stochastic.
+# • Улучшен промпт LLM для анализа дивергенций, свечей и риск-менеджмента.
+# • Добавлены уведомления об отклоненных LLM сигналах с указанием причины.
 # ============================================================================
 
 import os
@@ -82,9 +83,9 @@ ADX_THRESHOLD = 25.0
 BBANDS_LEN, BBANDS_STD = 20, 2.0
 MIN_BB_WIDTH_PCT = 0.8
 RSI_LEN, RSI_OVERSOLD = 14, 45 
-STOCH_OVERSOLD = 25.0 # Новый параметр для Стохастика
+STOCH_OVERSOLD = 25.0
 ATR_LEN_FOR_SL, SL_ATR_MUL = 14, 0.5
-MIN_RR_RATIO = 0.5
+MIN_RR_RATIO = 1.5 # Минимально допустимое R:R для LLM
 
 # === INDICATORS ===
 def calculate_indicators(df: pd.DataFrame):
@@ -92,21 +93,21 @@ def calculate_indicators(df: pd.DataFrame):
     df.ta.bbands(length=BBANDS_LEN, std=BBANDS_STD, append=True)
     df.ta.rsi(length=RSI_LEN, append=True)
     df.ta.atr(length=ATR_LEN_FOR_SL, append=True)
-    df.ta.stoch(append=True) # Добавлен расчет стохастика
+    df.ta.stoch(append=True)
     return df.dropna()
 
 # === LLM ===
 LLM_PROMPT = (
-    "Ты — элитный трейдер-аналитик 'Сигма'. Твоя задача — провести глубокий технический анализ предоставленного сетапа "
-    "для входа в LONG на отскоке. Используй все предоставленные данные.\n\n"
-    "ПЛАН АНАЛИЗА:\n"
-    "1.  **Индикаторы:** RSI и Stochastic (STOCHk) в зоне перепроданности? Есть ли признаки выхода из нее?\n"
-    "2.  **Бычья дивергенция:** Сравни последние 2-3 минимума цены с минимумами на RSI и Stochastic. Есть ли скрытая или явная бычья дивергенция (цена падает, а индикатор растет)?\n"
-    "3.  **Свечной анализ:** Проанализируй данные `last_candles`. Есть ли на последней или предпоследней свече бычьи разворотные паттерны (молот, дожи, бычье поглощение)?\n"
-    "4.  **Объемы:** Сопровождается ли падение цены снижением объема, а потенциальный разворот — его увеличением?\n"
-    "5.  **Риски:** Какие очевидные риски для входа в сделку прямо сейчас?\n\n"
-    "Дай ответ ТОЛЬКО в виде JSON-объекта с полями: 'decision' ('APPROVE'/'REJECT'), 'confidence_score' (0-10, где 10 - максимальная уверенность), "
-    "'reasoning' (RU, краткое, но емкое обоснование на основе твоего плана анализа), 'suggested_tp' (число), 'suggested_sl' (число).\n\n"
+    "Ты — элитный трейдер-аналитик и риск-менеджер 'Сигма'. Твоя задача — не просто проанализировать сетап, а рассчитать для него оптимальные параметры и принять решение о входе.\n\n"
+    "ТВОЙ АЛГОРИТМ ПРИНЯТИЯ РЕШЕНИЙ:\n"
+    "1.  **Определи консервативный Take Profit (TP):** Найди ближайший разумный уровень сопротивления. Это может быть средняя линия Боллинджера (`bb_middle`), но если рядом есть другой сильный уровень — используй его. Запиши это значение.\n"
+    "2.  **Определи логичный Stop Loss (SL):** Найди последний значимый минимум цены (swing low) в данных `last_candles`. Установи SL немного НИЖЕ этого минимума. Он должен быть технически обоснован, а не просто рассчитан по ATR. Запиши это значение.\n"
+    "3.  **Рассчитай Risk/Reward (R:R):** Рассчитай соотношение `(TP - Цена входа) / (Цена входа - SL)`.\n"
+    "4.  **Финальное решение (Фильтр):**\n"
+    f"    - **ЕСЛИ R:R >= {MIN_RR_RATIO} И сетап выглядит убедительно (есть дивергенции, бычьи свечи), ТО решение 'APPROVE'.**\n"
+    "    - **ИНАЧЕ, решение 'REJECT'.** Если причина в низком R:R, укажи это в `reasoning`.\n\n"
+    "Дай ответ ТОЛЬКО в виде JSON-объекта с полями: 'decision' ('APPROVE'/'REJECT'), 'confidence_score' (0-10), "
+    "'reasoning' (RU, краткое обоснование твоего решения), 'suggested_tp' (рассчитанный тобой TP), 'suggested_sl' (рассчитанный тобой SL).\n\n"
     "АНАЛИЗИРУЙ СЕТАП:\n{trade_data}"
 )
 async def ask_llm(trade_data):
@@ -205,50 +206,56 @@ async def scanner_loop(app):
             log.info(f"Found {len(candidates)} candidates. Sending to LLM for analysis...")
             await broadcast_message(app, f"🔍 Найдено {len(candidates)} кандидатов. Отправляю на анализ в LLM...")
             
-            approved_signals = []
+            approved_signals_count = 0
             for candidate in candidates:
                 try:
                     trade_data_for_llm = {
                         "asset": candidate["pair"], "entry_price": candidate["price"],
                         "rsi": candidate["rsi"], "stochastic_k": candidate["stoch_k"],
-                        "bb_lower": candidate["bb_lower"], "atr": candidate["atr"],
-                        "last_candles": candidate["last_candles"]
+                        "bb_lower": candidate["bb_lower"], "bb_middle": candidate["bb_middle"],
+                        "atr": candidate["atr"], "last_candles": candidate["last_candles"]
                     }
                     llm_response = await ask_llm(trade_data_for_llm)
                     log.info(f"LLM response for {candidate['pair']}: {llm_response.get('decision')}")
 
                     if llm_response and llm_response.get('decision') == 'APPROVE':
-                        candidate['llm_analysis'] = llm_response
-                        approved_signals.append(candidate)
+                        approved_signals_count += 1
+                        asset_name = candidate['pair']
+                        suggested_tp = llm_response.get('suggested_tp', candidate['bb_middle'])
+                        suggested_sl = llm_response.get('suggested_sl', candidate['price'] - (candidate['atr'] * SL_ATR_MUL))
+
+                        message = (
+                            f"🔔 <b>СИГНАЛ: LONG (Range Trade)</b>\n\n"
+                            f"<b>Монета:</b> <code>{asset_name}</code>\n"
+                            f"<b>Цена входа:</b> <code>{candidate['price']:.4f}</code>\n\n"
+                            f"--- <b>Параметры сделки (от LLM)</b> ---\n"
+                            f"<b>Take Profit:</b> <code>{suggested_tp:.4f}</code>\n"
+                            f"<b>Stop Loss:</b> <code>{suggested_sl:.4f}</code>\n\n"
+                            f"--- <b>Анализ LLM</b> ---\n"
+                            f"<i>{llm_response.get('reasoning', 'Нет обоснования.')}</i>"
+                        )
+                        await broadcast_message(app, message)
+                        state["last_alert_times"][asset_name] = datetime.now().timestamp()
+                        save_state()
+                    
+                    # НОВОЕ: Отправляем сообщение, если LLM отклонил сигнал
+                    elif llm_response and llm_response.get('decision') == 'REJECT':
+                        reason = llm_response.get('reasoning', 'Причина не указана.')
+                        message = (
+                            f"🚫 <b>СИГНАЛ ОТКЛОНЕН LLM</b>\n\n"
+                            f"<b>Монета:</b> <code>{candidate['pair']}</code>\n"
+                            f"<b>Причина:</b> <i>{reason}</i>"
+                        )
+                        await broadcast_message(app, message)
+
+                    await asyncio.sleep(1) # Небольшая задержка между обработкой кандидатов
                         
                 except Exception as e:
                     log.error(f"Error during LLM analysis for {candidate['pair']}: {e}")
 
-            if approved_signals:
-                await broadcast_message(app, f"🏆 LLM одобрил {len(approved_signals)} сигнал(а):")
-                for signal in approved_signals:
-                    asset_name = signal['pair']
-                    llm_analysis = signal['llm_analysis']
-                    suggested_tp = llm_analysis.get('suggested_tp', signal['bb_middle'])
-                    suggested_sl = llm_analysis.get('suggested_sl', signal['price'] - (signal['atr'] * SL_ATR_MUL))
-
-                    message = (
-                        f"🔔 <b>СИГНАЛ: LONG (Range Trade)</b>\n\n"
-                        f"<b>Монета:</b> <code>{asset_name}</code>\n"
-                        f"<b>Цена входа:</b> <code>{signal['price']:.4f}</code>\n\n"
-                        f"--- <b>Параметры сделки (от LLM)</b> ---\n"
-                        f"<b>Take Profit:</b> <code>{suggested_tp:.4f}</code>\n"
-                        f"<b>Stop Loss:</b> <code>{suggested_sl:.4f}</code>\n\n"
-                        f"--- <b>Анализ LLM</b> ---\n"
-                        f"<i>{llm_analysis.get('reasoning', 'Нет обоснования.')}</i>"
-                    )
-                    await broadcast_message(app, message)
-                    state["last_alert_times"][asset_name] = datetime.now().timestamp()
-                    save_state()
-                    await asyncio.sleep(1)
-            else:
-                log.info("LLM did not approve any candidates.")
-                await broadcast_message(app, "ℹ️ LLM не одобрил ни одного кандидата.")
+            # Отправляем итоговое сообщение только если были одобренные сигналы
+            if approved_signals_count > 0:
+                await broadcast_message(app, f"✅ Анализ завершен. Одобрено сигналов: {approved_signals_count}.")
         else:
             log.info("No valid candidates found in this scan cycle.")
             await broadcast_message(app, "ℹ️ Сканирование завершено. Подходящих кандидатов не найдено.")
