@@ -86,7 +86,7 @@ MIN_BB_WIDTH_PCT = 1.0
 RSI_LEN, RSI_OVERSOLD = 14, 40
 # Новые обязательные параметры для расчета SL и TP
 ATR_LEN_FOR_SL, SL_ATR_MUL = 14, 0.5 
-MIN_RR_RATIO = 2.0  # Наша цель по соотношению Риск/Прибыль 1:2
+MIN_RR_RATIO = 0.8  # Наша цель по соотношению Риск/Прибыль 1:2
 
 # === INDICATORS ===
 def calculate_indicators(df: pd.DataFrame):
