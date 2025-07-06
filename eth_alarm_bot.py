@@ -72,7 +72,11 @@ def load_state():
     log.info("State loaded. Manual Position: %s", state.get("manual_position"))
 
 # === EXCHANGE ===
-exchange = ccxt.mexc()
+exchange = ccxt.mexc({
+    'options': {
+        'defaultType': 'swap',
+    },
+})
 
 # === STRATEGY PARAMS ===
 TIMEFRAME_TREND = '1h'
@@ -135,8 +139,7 @@ async def scanner_loop(app):
     try:
         await exchange.load_markets()
         tickers = await exchange.fetch_tickers()
-        usdt_pairs = {s: t for s, t in tickers.items() if s.endswith('/USDT') and t.get('quoteVolume') and all(kw not in s for kw in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])}
-        sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
+        usdt_pairs = {s: t for s, t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume') and all(kw not in s for kw in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])}        sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
         coin_list = [item[0] for item in sorted_pairs[:COIN_LIST_SIZE]]
         await broadcast_message(app, f"✅ Список из {len(coin_list)} монет для сканирования сформирован.")
     except Exception as e:
