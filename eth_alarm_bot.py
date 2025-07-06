@@ -139,13 +139,22 @@ async def scanner_loop(app):
     try:
         await exchange.load_markets()
         tickers = await exchange.fetch_tickers()
-        usdt_pairs = {s: t for s, t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume') and all(kw not in s for kw in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])}        sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
+        
+        # --- НАЧАЛО БЛОКА ДЛЯ ЗАМЕНЫ ---
+        
+        # Фильтр для фьючерсных пар вида "BTC/USDT:USDT"
+        usdt_pairs = {s: t for s, t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume') and all(kw not in s for kw in ['UP/', 'DOWN/', 'BEAR/', 'BULL/'])}
+        
+        sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
         coin_list = [item[0] for item in sorted_pairs[:COIN_LIST_SIZE]]
+        
+        # --- КОНЕЦ БЛОКА ДЛЯ ЗАМЕНЫ ---
+
         await broadcast_message(app, f"✅ Список из {len(coin_list)} монет для сканирования сформирован.")
     except Exception as e:
         log.error(f"Failed to fetch dynamic coin list: %s", e)
         await broadcast_message(app, "⚠️ Не удалось сформировать динамический список монет. Проверьте лог."); return
-
+        
     while state.get('monitoring', False):
         log.info(f"Starting new scan for {len(coin_list)} coins...")
         candidates = []
