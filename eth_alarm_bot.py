@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v2.0 - Staged Analysis Interactive Assistant
-# • Полностью переработана логика поиска цели в три этапа.
-# • 1. Быстрый отбор по индикаторам на H1.
-# • 2. Сбор "глубоких данных" для отобранных кандидатов.
-# • 3. Финальный выбор одной цели с помощью LLM.
-# • Добавлено подробное информирование в Telegram на каждом этапе.
+# v2.1 - Staged Analysis Interactive Assistant
+# • Таймаут для мониторинга цели увеличен до 40 минут.
 # ============================================================================
 
 import os
@@ -82,7 +78,7 @@ exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
 # === LLM PROMPTS & FUNCTION ===
 PROMPT_SELECT_FOCUS = (
     "Ты — главный трейдер-аналитик. Тебе предоставлен короткий список лучших кандидатов, уже отобранных по индикаторам. "
-    "Твоя задача — провести финальный анализ и выбрать из этого списка ОДНУ самую лучшую монету для пристального наблюдения в ближайшее время. "
+    "Твоя задача — провести финальный анализ и выбрать из этого списка ОДНУ самую лучшую монету для пристального наблюдения. "
     "Оцени всю совокупность факторов: силу тренда (h1_adx), глубину отката (h1_price_to_ema_dist_pct), текущую волатильность (m5_volatility_atr_pct) и недавний импульс (m5_price_change_pct). "
     "Ответь ТОЛЬКО в виде JSON-объекта с одним полем: 'focus_coin'.\n\n"
     "Данные для финального выбора:\n{asset_data}"
@@ -124,7 +120,7 @@ async def main_loop(app):
         try:
             if state['mode'] == 'SEARCHING':
                 await run_searching_phase(app)
-                await asyncio.sleep(60 * 20) # Ищем новую цель раз в 20 минут
+                await asyncio.sleep(60 * 20)
             elif state['mode'] == 'FOCUSED':
                 await run_focused_phase(app)
                 await asyncio.sleep(30)
@@ -142,8 +138,6 @@ async def main_loop(app):
 
 async def run_searching_phase(app):
     log.info("--- Mode: SEARCHING (Indicator-Filtered) ---")
-    
-    # Этап 1: Быстрый отбор по индикаторам
     await broadcast_message(app, f"<b>Этап 1:</b> Отбираю монеты из топ-{COIN_LIST_SIZE} по индикаторам...")
     pre_candidates = []
     try:
@@ -180,7 +174,6 @@ async def run_searching_phase(app):
         await broadcast_message(app, "ℹ️ Сканирование завершено. Не найдено монет в стадии отката по тренду.")
         return
 
-    # Этап 2: Сбор глубоких данных
     await broadcast_message(app, f"<b>Этап 2:</b> Отобрано {len(pre_candidates)} кандидатов. Собираю по ним глубокие данные...")
     deep_data_candidates = []
     try:
@@ -208,7 +201,6 @@ async def run_searching_phase(app):
         await broadcast_message(app, f"⚠️ Ошибка на этапе 2: {e}")
         return
 
-    # Этап 3: Финальный выбор LLM
     if not deep_data_candidates:
         await broadcast_message(app, "ℹ️ Не удалось собрать глубокие данные по кандидатам.")
         return
@@ -248,8 +240,8 @@ async def run_focused_phase(app):
         state['mode'] = 'SEARCHING'
         return
         
-    if (datetime.now().timestamp() - state.get('last_focus_time', 0)) > 60 * 20: # Увеличиваем таймаут до 20 минут
-        await broadcast_message(app, f"⚠️ Не найдено подходящего сетапа по {state['focus_coin']} за 20 минут. Ищу новую цель.")
+    if (datetime.now().timestamp() - state.get('last_focus_time', 0)) > 60 * 40: # Увеличенный таймаут
+        await broadcast_message(app, f"⚠️ Не найдено подходящего сетапа по {state['focus_coin']} за 40 минут. Ищу новую цель.")
         state['mode'] = 'SEARCHING'
         save_state()
         return
@@ -379,7 +371,6 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pct_change = (pnl / initial_deposit) * 100 if initial_deposit != 0 else 0
         
         if LOGS_WS:
-            # Заполняем строку для Google Sheets
             row = [
                 datetime.fromisoformat(pos['entry_time']).strftime('%Y-%m-%d %H:%M:%S'),
                 pos.get('pair'), pos.get("side"), initial_deposit,
