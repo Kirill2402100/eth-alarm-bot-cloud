@@ -146,8 +146,8 @@ async def main_loop(app):
             await asyncio.sleep(60)
 
 async def run_searching_phase(app):
-    log.info("--- Mode: SEARCHING (Indicator-Filtered) ---")
-    await broadcast_message(app, f"<b>Этап 1:</b> Отбираю монеты из топ-{COIN_LIST_SIZE} по индикаторам...")
+    log.info("--- Mode: SEARCHING (Dual-Filter) ---")
+    await broadcast_message(app, f"<b>Этап 1:</b> Отбираю монеты из топ-{COIN_LIST_SIZE} по двум фильтрам (Откат/Импульс)...")
     pre_candidates = []
     try:
         tickers = await exchange.fetch_tickers()
@@ -158,26 +158,59 @@ async def run_searching_phase(app):
         for pair in coin_list:
             if len(pre_candidates) >= 7: break
             try:
-                ohlcv = await exchange.fetch_ohlcv(pair, timeframe='1h', limit=50)
-                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                if len(df) < 25: continue
-                
-                df.ta.adx(length=14, append=True)
-                df.ta.ema(length=21, append=True)
-                last = df.iloc[-1]
-                adx = last.get('ADX_14'); ema = last.get('EMA_21')
-                if adx is None or ema is None: continue
+                # Сначала всегда проверяем тренд на H1
+                ohlcv_h1 = await exchange.fetch_ohlcv(pair, timeframe='1h', limit=50)
+                df_h1 = pd.DataFrame(ohlcv_h1, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                if len(df_h1) < 25: continue
 
-                if adx > 25 and abs(last['close'] - ema) / ema < 0.02:
-                    pre_candidates.append({"pair": pair})
+                df_h1.ta.adx(length=14, append=True)
+                df_h1.ta.ema(length=21, append=True)
+                last_h1 = df_h1.iloc[-1]
+                adx_h1 = last_h1.get('ADX_14')
+                ema_h1 = last_h1.get('EMA_21')
+                
+                if adx_h1 is None or ema_h1 is None: continue
+
+                # Если тренд на H1 сильный, начинаем проверку
+                if adx_h1 > 25:
+                    # Критерий А: Проверка на откат на H1
+                    is_near_ema_h1 = abs(last_h1['close'] - ema_h1) / ema_h1 < 0.02
+                    if is_near_ema_h1:
+                        pre_candidates.append({"pair": pair, "reason": "Trend Pullback H1"})
+                        log.info(f"Found pre-candidate by PULLBACK: {pair}")
+                        continue # Нашли по первому критерию, переходим к следующей монете
+
+                    # Критерий Б: Проверка на начало импульса на 5M
+                    ohlcv_5m = await exchange.fetch_ohlcv(pair, timeframe='5m', limit=50)
+                    df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    if len(df_5m) < 22: continue
+
+                    df_5m.ta.ema(length=9, append=True)
+                    df_5m.ta.ema(length=21, append=True)
+                    prev_5m = df_5m.iloc[-2]
+                    last_5m = df_5m.iloc[-1]
+
+                    ema_short = last_5m.get('EMA_9')
+                    ema_long = last_5m.get('EMA_21')
+                    prev_ema_short = prev_5m.get('EMA_9')
+                    prev_ema_long = prev_5m.get('EMA_21')
+
+                    if any(v is None for v in [ema_short, ema_long, prev_ema_short, prev_ema_long]): continue
+
+                    # Проверяем пересечение вверх (для лонга) или вниз (для шорта)
+                    if (prev_ema_short <= prev_ema_long and ema_short > ema_long) or \
+                       (prev_ema_short >= prev_ema_long and ema_short < ema_long):
+                        pre_candidates.append({"pair": pair, "reason": "Momentum Cross 5M"})
+                        log.info(f"Found pre-candidate by CROSSOVER: {pair}")
+
                 await asyncio.sleep(0.3)
             except Exception as e:
-                log.warning(f"Could not fetch data for {pair} during initial scan: {e}")
+                log.warning(f"Could not process {pair} during initial scan: {e}")
     except Exception as e:
         log.error(f"Critical error in Stage 1 (Indicator Scan): {e}", exc_info=True)
         await broadcast_message(app, f"⚠️ Ошибка на этапе 1: {e}")
         return
-
+        
     if not pre_candidates:
         log.info("No pre-candidates found.")
         await broadcast_message(app, "ℹ️ Сканирование завершено. Не найдено монет в стадии отката по тренду.")
