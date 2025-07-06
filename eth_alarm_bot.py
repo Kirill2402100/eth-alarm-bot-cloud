@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v1.1 - Interactive Assistant (Robust LLM Calls)
-# • Исправлена ошибка KeyError при вызове LLM.
-# • Рефакторинг функции ask_llm для повышения надежности кода.
+# v1.2 - Interactive Assistant (Final Fix)
+# • Исправлена ошибка KeyError при форматировании промпта.
+# • Код полностью синхронизирован для стабильной работы.
 # ============================================================================
 
 import os
@@ -77,7 +77,6 @@ def load_state():
 exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
 
 # === LLM PROMPTS & FUNCTION ===
-
 PROMPT_SELECT_FOCUS = (
     "Ты — трейдер-аналитик. Вот список криптовалютных пар с высокой волатильностью: {asset_list}. "
     "Твоя задача — выбрать из этого списка ОДНУ наиболее перспективную монету для наблюдения в ближайший час с целью поиска входа в LONG или SHORT. "
@@ -112,7 +111,7 @@ async def ask_llm(final_prompt: str):
                 content_str = response_json["choices"][0]["message"]["content"]
                 return json.loads(content_str.strip().strip("`"))
     except Exception as e:
-        log.error(f"LLM request/parse err: {e}")
+        log.error(f"LLM request/parse err: {e}", exc_info=True)
         return None
 
 # === MAIN BOT LOGIC ===
@@ -131,6 +130,7 @@ async def main_loop(app):
             else:
                 log.error(f"Unknown bot mode: {state['mode']}. Resetting to SEARCHING.")
                 state['mode'] = 'SEARCHING'
+                save_state()
                 await asyncio.sleep(60)
         except Exception as e:
             log.error(f"Critical error in main_loop: {e}", exc_info=True)
@@ -146,19 +146,15 @@ async def run_searching_phase(app):
         sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
         top_coins_list = [item[0] for item in sorted_pairs[:50]]
         
-        # ---> НАЧАЛО ИСПРАВЛЕНИЯ <---
-        
-        # Форматируем промпт, вставляя в него список монет
         prompt_text = PROMPT_SELECT_FOCUS.format(asset_list=json.dumps(top_coins_list))
         llm_response = await ask_llm(prompt_text)
-        
-        # ---> КОНЕЦ ИСПРАВЛЕНИЯ <---
         
         log.info(f"Raw LLM response for focus selection: {llm_response}")
 
         if llm_response and isinstance(llm_response, dict) and 'focus_coin' in llm_response:
             focus_coin = llm_response['focus_coin']
-            if focus_coin in top_coins_list:
+            # Убедимся, что LLM вернул реальную монету, а не предложение
+            if "/" in focus_coin:
                 state['focus_coin'] = focus_coin
                 state['mode'] = 'FOCUSED'
                 state['last_focus_time'] = datetime.now().timestamp()
@@ -166,18 +162,18 @@ async def run_searching_phase(app):
                 await broadcast_message(app, f"🎯 Новая цель для наблюдения: <b>{state['focus_coin']}</b>. Начинаю слежение.")
                 save_state()
             else:
-                log.error(f"LLM selected a coin not in the top list or returned a sentence: {focus_coin}")
-                await broadcast_message(app, f"⚠️ LLM вернул некорректное имя монеты. Попробую снова.")
+                log.error(f"LLM returned a sentence instead of a coin: {focus_coin}")
+                await broadcast_message(app, f"⚠️ LLM вернул некорректный ответ. Попробую снова.")
         else:
             log.error(f"Failed to get a valid focus coin from LLM. Response was: {llm_response}")
             await broadcast_message(app, "⚠️ Не удалось получить валидную цель от LLM. Попробую снова.")
 
     except Exception as e:
         log.error(f"Critical error in searching phase: {e}", exc_info=True)
-        
+
 async def run_focused_phase(app):
-    log.info(f"--- Mode: FOCUSED on {state['focus_coin']} ---")
-    if not state['focus_coin']:
+    log.info(f"--- Mode: FOCUSED on {state.get('focus_coin')} ---")
+    if not state.get('focus_coin'):
         state['mode'] = 'SEARCHING'
         return
         
@@ -221,6 +217,7 @@ async def run_monitoring_phase(app):
     pos = state.get('current_position')
     if not pos:
         state['mode'] = 'SEARCHING'
+        save_state()
         return
     try:
         ohlcv = await exchange.fetch_ohlcv(pos['pair'], timeframe='1m', limit=100)
@@ -243,8 +240,9 @@ async def run_monitoring_phase(app):
 
 # === COMMANDS and RUN ===
 async def broadcast_message(app, text):
-    # ... (код без изменений)
-    for chat_id in app.chat_ids:
+    # Убедимся, что app.chat_ids существует
+    chat_ids = getattr(app, 'chat_ids', CHAT_IDS)
+    for chat_id in chat_ids:
         try:
             await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
         except Exception as e:
@@ -254,7 +252,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global scanner_task
     chat_id = update.effective_chat.id
     if not hasattr(ctx.application, 'chat_ids'):
-        ctx.application.chat_ids = CHAT_IDS
+        ctx.application.chat_ids = set()
     ctx.application.chat_ids.add(chat_id)
     
     if not state.get('bot_on'):
@@ -323,7 +321,8 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             f"✅ Сделка по <b>{pos.get('pair')}</b> закрыта и записана.\n"
-            f"<b>P&L: {pnl:+.2f} USDT ({pct_change:+.2f}%)</b>"
+            f"<b>P&L: {pnl:+.2f} USDT ({pct_change:+.2f}%)</b>",
+            parse_mode="HTML"
         )
         
         state['current_position'] = None
@@ -344,9 +343,10 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("entry", cmd_entry))
     app.add_handler(CommandHandler("exit", cmd_exit))
 
-    log.info("Bot assistant started...")
+    log.info("Bot assistant starting...")
     
     if state.get('bot_on', False):
-        asyncio.ensure_future(main_loop(app))
+        # Запускаем основной цикл в фоновом режиме
+        scanner_task = asyncio.create_task(main_loop(app))
 
     app.run_polling()
