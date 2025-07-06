@@ -93,15 +93,14 @@ exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
 
 # === LLM PROMPTS & FUNCTION ===
 PROMPT_ANALYZE_AND_SELECT = (
-    "Ты — главный трейдер-аналитик. Тебе предоставлен список кандидатов, отобранных по сигналу 'пересечение EMA'.\n\n"
+    "Ты — главный трейдер-аналитик. Тебе предоставлен список кандидатов, отобранных по сигналу 'пересечение EMA', с их ключевыми показателями.\n\n"
     "ТВОЯ ЗАДАЧА:\n"
-    "1.  Проанализируй **каждого** кандидата из списка `candidates`.\n"
-    "2.  Выбери из них **ОДНОГО, самого лучшего и надежного**. Критерии выбора: чистота сигнала, подтверждение объемами, отсутствие близких сильных уровней, хороший потенциал движения.\n"
-    "3.  Для этого лучшего кандидата рассчитай логичный SL (за локальным экстремумом) и TP (перед следующим уровнем) так, чтобы **R:R был >= 1.5**.\n\n"
+    "1.  Проанализируй **каждого** кандидата из списка.\n"
+    "2.  Выбери из них **ОДНОГО, самого лучшего**. Критерии выбора: тренд на H1 должен соответствовать направлению, RSI не в экстремальной зоне, ADX показывает силу, хороший R:R потенциал.\n"
+    "3.  Для этого лучшего кандидата сгенерируй SL и TP с R:R >= 1.5.\n\n"
     "ТРЕБОВАНИЯ К ОТВЕТУ:\n"
-    "- Если ты нашел идеального кандидата, ответь `{ 'decision': 'APPROVE', 'setup': { 'pair': '...', 'side': '...', 'reason': '...', 'sl': ..., 'tp': ... } }`.\n"
-    "- Если НИ ОДИН из кандидатов не выглядит достаточно надежным или не проходит по R:R, ответь `{ 'decision': 'REJECT', 'reason': 'Не найдено сетапов с достаточной надежностью и R:R' }`.\n"
-    "- Твой ответ **обязательно** должен быть в формате **JSON**."
+    "- Если нашел идеального кандидата, верни JSON: `{'decision': 'APPROVE', 'setup': { 'pair': '...', 'side': '...', 'reason': '...', 'sl': ..., 'tp': ... }}`.\n"
+    "- Если НИ ОДИН не подходит, верни JSON: `{'decision': 'REJECT', 'reason': 'Не найдено сетапов с достаточной надежностью'}`."
 )
 PROMPT_MANAGE_POSITION = (
     "Ты — риск-менеджер. Ты ведешь открытую позицию {side} по {asset} от цены {entry_price}. "
@@ -153,6 +152,7 @@ async def run_searching_phase(app):
     await broadcast_message(app, f"<b>Этап 1:</b> Ищу монеты с пересечением 9/21 EMA...")
     pre_candidates = []
     try:
+        # ... (код поиска pre_candidates по пересечению остается таким же) ...
         tickers = await exchange.fetch_tickers()
         usdt_pairs = {s: t for s, t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume')}
         sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
@@ -170,12 +170,18 @@ async def run_searching_phase(app):
                 ema_short = last_5m.get('EMA_9'); ema_long = last_5m.get('EMA_21')
                 prev_ema_short = prev_5m.get('EMA_9'); prev_ema_long = prev_5m.get('EMA_21')
                 if any(v is None for v in [ema_short, ema_long, prev_ema_short, prev_ema_long]): continue
-                if (prev_ema_short <= prev_ema_long and ema_short > ema_long) or \
-                   (prev_ema_short >= prev_ema_long and ema_short < ema_long):
-                    pre_candidates.append(pair)
+                
+                side = None
+                if prev_ema_short <= prev_ema_long and ema_short > ema_long: side = 'LONG'
+                elif prev_ema_short >= prev_ema_long and ema_short < ema_long: side = 'SHORT'
+                
+                if side:
+                    pre_candidates.append({"pair": pair, "side": side})
+
                 await asyncio.sleep(0.5)
             except Exception as e:
                 log.warning(f"Could not process {pair} in initial scan: {e}")
+
     except Exception as e:
         log.error(f"Critical error in Stage 1 (Indicator Scan): {e}", exc_info=True)
         return
@@ -186,30 +192,52 @@ async def run_searching_phase(app):
         return
 
     await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Собираю и отправляю данные в LLM для выбора лучшего...")
+    
+    # ---> НАЧАЛО НОВОГО БЛОКА: Сбор компактных "глубоких данных" <---
     deep_data_for_llm = []
     try:
-        for pair in pre_candidates:
+        for candidate in pre_candidates:
+            pair = candidate['pair']
+            side = candidate['side']
+
+            # Получаем H1 данные для тренда
             ohlcv_h1 = await exchange.fetch_ohlcv(pair, timeframe='1h', limit=100)
             df_h1 = pd.DataFrame(ohlcv_h1, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df_h1.ta.ema(length=50, append=True)
+            last_h1 = df_h1.iloc[-1]
+            ema_h1 = last_h1.get('EMA_50')
             
+            # Получаем 5M данные для индикаторов
             ohlcv_5m = await exchange.fetch_ohlcv(pair, timeframe='5m', limit=100)
             df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_5m.ta.rsi(length=14, append=True); df_5m.ta.adx(length=14, append=True)
+            df_5m.ta.rsi(length=14, append=True)
+            df_5m.ta.adx(length=14, append=True)
+            last_5m = df_5m.iloc[-1]
+            
+            if ema_h1 is None: continue
 
             deep_data_for_llm.append({
                 "pair": pair,
-                "h1_data": df_h1.to_dict('records'),
-                "m5_data": df_5m.to_dict('records')
+                "side": side,
+                "h1_trend": "UP" if last_h1['close'] > ema_h1 else "DOWN",
+                "m5_rsi": round(last_5m.get('RSI_14'), 2),
+                "m5_adx": round(last_5m.get('ADX_14'), 2)
             })
             await asyncio.sleep(0.5)
     except Exception as e:
         log.error(f"Critical error in Stage 2 (Deep Data): {e}", exc_info=True)
         return
-
+    # ---> КОНЕЦ НОВОГО БЛОКА <---
+    
+    if not deep_data_for_llm:
+        await broadcast_message(app, "ℹ️ Не удалось собрать глубокие данные по кандидатам.")
+        return
+    
     prompt_text = PROMPT_ANALYZE_AND_SELECT + "\n\nКандидаты:\n" + json.dumps(deep_data_for_llm)
     llm_response = await ask_llm(prompt_text)
 
+    # ... (остальная часть функции с обработкой ответа LLM остается без изменений) ...
+    
     log.info(f"LLM decision on batch: {llm_response}")
 
     if llm_response and llm_response.get('decision') == 'APPROVE':
