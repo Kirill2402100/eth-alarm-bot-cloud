@@ -152,19 +152,33 @@ async def run_searching_phase(app):
         tickers = await exchange.fetch_tickers()
         usdt_pairs = {s: t for s, t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume')}
         sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
-        top_coins = [item[0] for item in sorted_pairs[:50]] # Берем 50 самых ликвидных
+        top_coins = [item[0] for item in sorted_pairs[:50]]
         
+        # Запрашиваем фокусную монету у LLM
         llm_response = await ask_llm(PROMPT_SELECT_FOCUS, {"asset_list": top_coins})
-        if llm_response and 'focus_coin' in llm_response:
+        
+        # ---> НАЧАЛО НОВОГО БЛОКА ПРОВЕРОК И ЛОГИРОВАНИЯ <---
+        
+        # Логируем сырой ответ от LLM, чтобы видеть, что он присылает
+        log.info(f"Raw LLM response for focus selection: {llm_response}")
+
+        # Делаем проверки более надежными
+        if llm_response and isinstance(llm_response, dict) and 'focus_coin' in llm_response:
             state['focus_coin'] = llm_response['focus_coin']
             state['mode'] = 'FOCUSED'
             state['last_focus_time'] = datetime.now().timestamp()
             log.info(f"LLM selected new focus coin: {state['focus_coin']}")
-            await broadcast_message(app, f"🎯 Новая цель для наблюдения: <b>{state['focus_coin']}</b>. Начинаю слежение в реальном времени.",)
+            await broadcast_message(app, f"🎯 Новая цель для наблюдения: <b>{state['focus_coin']}</b>. Начинаю слежение в реальном времени.")
             save_state()
-    except Exception as e:
-        log.error(f"Error in searching phase: {e}")
+        else:
+            log.error(f"Failed to get a valid focus coin from LLM. Response was: {llm_response}")
+            await broadcast_message(app, "⚠️ Не удалось получить валидную цель от LLM. Попробую снова через некоторое время.")
 
+        # ---> КОНЕЦ НОВОГО БЛОКА <---
+
+    except Exception as e:
+        log.error(f"Critical error in searching phase: {e}", exc_info=True) # Добавляем полный traceback для лучшей диагностики
+        
 async def run_focused_phase(app):
     log.info(f"--- Mode: FOCUSED on {state['focus_coin']} ---")
     if not state['focus_coin']:
