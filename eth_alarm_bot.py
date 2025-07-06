@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v1.2 - Interactive Assistant (Final Fix)
-# • Исправлена ошибка KeyError при форматировании промпта.
-# • Код полностью синхронизирован для стабильной работы.
+# v2.0 - Staged Analysis Interactive Assistant
+# • Полностью переработана логика поиска цели в три этапа.
+# • 1. Быстрый отбор по индикаторам на H1.
+# • 2. Сбор "глубоких данных" для отобранных кандидатов.
+# • 3. Финальный выбор одной цели с помощью LLM.
+# • Добавлено подробное информирование в Telegram на каждом этапе.
 # ============================================================================
 
 import os
@@ -24,6 +27,7 @@ from telegram.error import BadRequest
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID = os.getenv("SHEET_ID")
+COIN_LIST_SIZE = int(os.getenv("COIN_LIST_SIZE", "300"))
 WORKSHEET_NAME = "Trading_Logs_v10"
 
 LLM_API_KEY = os.getenv("LLM_API_KEY")
@@ -67,9 +71,8 @@ def load_state():
         with open(STATE_FILE, 'r') as f: state = json.load(f)
     if 'mode' not in state:
         state.update({
-            "bot_on": False, "mode": "SEARCHING",
-            "focus_coin": None, "current_position": None,
-            "last_signal": None, "last_focus_time": 0
+            "bot_on": False, "mode": "SEARCHING", "focus_coin": None,
+            "current_position": None, "last_signal": None, "last_focus_time": 0
         })
     log.info(f"State loaded: {state}")
 
@@ -77,15 +80,13 @@ def load_state():
 exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
 
 # === LLM PROMPTS & FUNCTION ===
-
 PROMPT_SELECT_FOCUS = (
-    "Ты — главный трейдер-аналитик. Тебе предоставлен короткий список лучших кандидатов, уже отобранных по индикаторам (сильный тренд + откат). "
+    "Ты — главный трейдер-аналитик. Тебе предоставлен короткий список лучших кандидатов, уже отобранных по индикаторам. "
     "Твоя задача — провести финальный анализ и выбрать из этого списка ОДНУ самую лучшую монету для пристального наблюдения в ближайшее время. "
-    "Оцени общую структуру, близость к ключевым уровням и потенциал для чистого импульса. "
+    "Оцени всю совокупность факторов: силу тренда (h1_adx), глубину отката (h1_price_to_ema_dist_pct), текущую волатильность (m5_volatility_atr_pct) и недавний импульс (m5_price_change_pct). "
     "Ответь ТОЛЬКО в виде JSON-объекта с одним полем: 'focus_coin'.\n\n"
-    "Список кандидатов для финального выбора:\n{asset_data}"
+    "Данные для финального выбора:\n{asset_data}"
 )
-
 PROMPT_FIND_ENTRY = (
     "Ты — снайпер, следящий за монетой {asset}. Твоя задача — дать сигнал на вход в тот самый момент, когда формируется идеальный сетап. "
     "Анализируй последние свечи, объемы, ищи паттерны, дивергенции, пробои или отскоки от уровней. "
@@ -123,7 +124,7 @@ async def main_loop(app):
         try:
             if state['mode'] == 'SEARCHING':
                 await run_searching_phase(app)
-                await asyncio.sleep(60 * 15)
+                await asyncio.sleep(60 * 20) # Ищем новую цель раз в 20 минут
             elif state['mode'] == 'FOCUSED':
                 await run_focused_phase(app)
                 await asyncio.sleep(30)
@@ -132,8 +133,7 @@ async def main_loop(app):
                 await asyncio.sleep(30)
             else:
                 log.error(f"Unknown bot mode: {state['mode']}. Resetting to SEARCHING.")
-                state['mode'] = 'SEARCHING'
-                save_state()
+                state['mode'] = 'SEARCHING'; save_state()
                 await asyncio.sleep(60)
         except Exception as e:
             log.error(f"Critical error in main_loop: {e}", exc_info=True)
@@ -142,75 +142,120 @@ async def main_loop(app):
 
 async def run_searching_phase(app):
     log.info("--- Mode: SEARCHING (Indicator-Filtered) ---")
-    await broadcast_message(app, "🔍 Этап 1: Сканирую рынок индикаторами для поиска кандидатов...")
+    
+    # Этап 1: Быстрый отбор по индикаторам
+    await broadcast_message(app, f"<b>Этап 1:</b> Отбираю монеты из топ-{COIN_LIST_SIZE} по индикаторам...")
+    pre_candidates = []
     try:
         tickers = await exchange.fetch_tickers()
         usdt_pairs = {s: t for s, t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume')}
         sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
-        coin_list = [item[0] for item in sorted_pairs[:200]]
+        coin_list = [item[0] for item in sorted_pairs[:COIN_LIST_SIZE]]
         
-        pre_candidates = []
         for pair in coin_list:
-            if len(pre_candidates) >= 7: break # Ограничиваем список до 7 лучших
+            if len(pre_candidates) >= 7: break
             try:
                 ohlcv = await exchange.fetch_ohlcv(pair, timeframe='1h', limit=50)
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 if len(df) < 25: continue
                 
-                # Рассчитываем индикаторы для фильтра
                 df.ta.adx(length=14, append=True)
                 df.ta.ema(length=21, append=True)
                 last = df.iloc[-1]
-
-                adx = last.get('ADX_14')
-                ema = last.get('EMA_21')
-                
+                adx = last.get('ADX_14'); ema = last.get('EMA_21')
                 if adx is None or ema is None: continue
 
-                # Условия фильтра: сильный тренд и цена близко к EMA (откат)
-                is_strong_trend = adx > 25
-                is_near_ema = abs(last['close'] - ema) / ema < 0.02 # Цена в пределах 2% от EMA
-
-                if is_strong_trend and is_near_ema:
-                    pre_candidates.append({
-                        "pair": pair,
-                        "adx": round(adx, 2),
-                        "price_to_ema_dist_pct": round(abs(last['close'] - ema) / ema * 100, 2)
-                    })
+                if adx > 25 and abs(last['close'] - ema) / ema < 0.02:
+                    pre_candidates.append({"pair": pair})
                 await asyncio.sleep(0.3)
             except Exception as e:
                 log.warning(f"Could not fetch data for {pair} during initial scan: {e}")
-
-        if not pre_candidates:
-            log.info("No pre-candidates found after indicator scan.")
-            await broadcast_message(app, "ℹ️ Сканирование завершено. Не найдено монет в стадии отката по тренду.")
-            return
-
-        await broadcast_message(app, f"Этап 2: Найдено {len(pre_candidates)} кандидатов. Отправляю на финальный выбор в LLM...")
-        
-        prompt_text = PROMPT_SELECT_FOCUS.format(asset_data=json.dumps(pre_candidates, indent=2))
-        llm_response = await ask_llm(prompt_text)
-        
-        # ... (остальная часть функции с проверкой ответа LLM остается такой же) ...
-
     except Exception as e:
-        log.error(f"Critical error in searching phase: {e}", exc_info=True)
-        
+        log.error(f"Critical error in Stage 1 (Indicator Scan): {e}", exc_info=True)
+        await broadcast_message(app, f"⚠️ Ошибка на этапе 1: {e}")
+        return
+
+    if not pre_candidates:
+        log.info("No pre-candidates found.")
+        await broadcast_message(app, "ℹ️ Сканирование завершено. Не найдено монет в стадии отката по тренду.")
+        return
+
+    # Этап 2: Сбор глубоких данных
+    await broadcast_message(app, f"<b>Этап 2:</b> Отобрано {len(pre_candidates)} кандидатов. Собираю по ним глубокие данные...")
+    deep_data_candidates = []
+    try:
+        for candidate in pre_candidates:
+            pair = candidate['pair']
+            df_h1 = pd.DataFrame(await exchange.fetch_ohlcv(pair, '1h', limit=50), columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df_5m = pd.DataFrame(await exchange.fetch_ohlcv(pair, '5m', limit=50), columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            if len(df_h1) < 25 or len(df_5m) < 25: continue
+            
+            df_h1.ta.adx(length=14, append=True); df_h1.ta.ema(length=21, append=True)
+            last_h1 = df_h1.iloc[-1]
+            df_5m.ta.atr(length=14, append=True)
+            last_5m = df_5m.iloc[-1]
+
+            deep_data_candidates.append({
+                "pair": pair,
+                "h1_adx": round(last_h1.get('ADX_14'), 2),
+                "h1_price_to_ema_dist_pct": round(abs(last_h1['close'] - last_h1.get('EMA_21')) / last_h1.get('EMA_21') * 100, 2),
+                "m5_volatility_atr_pct": round(last_5m.get('ATRr_14') / last_5m['close'] * 100, 2),
+                "m5_price_change_pct": round((last_5m['close'] - df_5m.iloc[0]['close']) / df_5m.iloc[0]['close'] * 100, 2)
+            })
+            await asyncio.sleep(0.5)
+    except Exception as e:
+        log.error(f"Critical error in Stage 2 (Deep Data): {e}", exc_info=True)
+        await broadcast_message(app, f"⚠️ Ошибка на этапе 2: {e}")
+        return
+
+    # Этап 3: Финальный выбор LLM
+    if not deep_data_candidates:
+        await broadcast_message(app, "ℹ️ Не удалось собрать глубокие данные по кандидатам.")
+        return
+
+    await broadcast_message(app, f"<b>Этап 3:</b> Собрал данные. Отправляю на финальный выбор в LLM...")
+    try:
+        prompt_text = PROMPT_SELECT_FOCUS.format(asset_data=json.dumps(deep_data_candidates, indent=2))
+        llm_response = await asyncio.wait_for(ask_llm(prompt_text), timeout=120.0)
+
+        log.info(f"Raw LLM response for focus selection: {llm_response}")
+
+        if llm_response and isinstance(llm_response, dict) and 'focus_coin' in llm_response:
+            focus_coin = llm_response['focus_coin']
+            if "/" in focus_coin:
+                state['focus_coin'] = focus_coin
+                state['mode'] = 'FOCUSED'
+                state['last_focus_time'] = datetime.now().timestamp()
+                log.info(f"LLM selected new focus coin: {state['focus_coin']}")
+                await broadcast_message(app, f"🎯 <b>Новая цель от LLM:</b> <code>{state['focus_coin']}</code>. Начинаю слежение.")
+                save_state()
+            else:
+                log.error(f"LLM returned a sentence: {focus_coin}")
+                await broadcast_message(app, "⚠️ LLM вернул некорректный ответ.")
+        else:
+            log.error(f"Failed to get a valid focus coin from LLM. Response was: {llm_response}")
+            await broadcast_message(app, "⚠️ Не удалось получить валидную цель от LLM.")
+            
+    except asyncio.TimeoutError:
+        log.error("LLM call timed out in searching phase.")
+        await broadcast_message(app, "⚠️ LLM не ответил за 2 минуты. Пропускаю этот цикл.")
+    except Exception as e:
+        log.error(f"Critical error in Stage 3 (LLM Selection): {e}", exc_info=True)
+
 async def run_focused_phase(app):
     log.info(f"--- Mode: FOCUSED on {state.get('focus_coin')} ---")
     if not state.get('focus_coin'):
         state['mode'] = 'SEARCHING'
         return
         
-    if (datetime.now().timestamp() - state.get('last_focus_time', 0)) > 60 * 15:
-        await broadcast_message(app, f"⚠️ Не найдено подходящего сетапа по {state['focus_coin']} за 15 минут. Ищу новую цель.")
+    if (datetime.now().timestamp() - state.get('last_focus_time', 0)) > 60 * 20: # Увеличиваем таймаут до 20 минут
+        await broadcast_message(app, f"⚠️ Не найдено подходящего сетапа по {state['focus_coin']} за 20 минут. Ищу новую цель.")
         state['mode'] = 'SEARCHING'
         save_state()
         return
 
     try:
         ohlcv = await exchange.fetch_ohlcv(state['focus_coin'], timeframe='5m', limit=100)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
         prompt_text = PROMPT_FIND_ENTRY.format(asset=state['focus_coin'])
         llm_response = await ask_llm(prompt_text)
@@ -225,7 +270,7 @@ async def run_focused_phase(app):
             tp = llm_response.get('tp', 0)
             
             message = (
-                f"🔔 <b>ВНИМАНИЕ, СЕТАП!</b> 🔔\n\n"
+                f"🔔 <b>Этап 4: СЕТАП!</b> 🔔\n\n"
                 f"<b>Монета:</b> <code>{state['focus_coin']}</code>\n"
                 f"<b>Направление:</b> <b>{side}</b>\n"
                 f"<b>Take Profit:</b> <code>{tp}</code>\n"
@@ -246,7 +291,6 @@ async def run_monitoring_phase(app):
         return
     try:
         ohlcv = await exchange.fetch_ohlcv(pos['pair'], timeframe='1m', limit=100)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
         prompt_text = PROMPT_MANAGE_POSITION.format(asset=pos['pair'], side=pos['side'], entry_price=pos['entry_price'])
         llm_response = await ask_llm(prompt_text)
@@ -265,7 +309,6 @@ async def run_monitoring_phase(app):
 
 # === COMMANDS and RUN ===
 async def broadcast_message(app, text):
-    # Убедимся, что app.chat_ids существует
     chat_ids = getattr(app, 'chat_ids', CHAT_IDS)
     for chat_id in chat_ids:
         try:
@@ -336,6 +379,7 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pct_change = (pnl / initial_deposit) * 100 if initial_deposit != 0 else 0
         
         if LOGS_WS:
+            # Заполняем строку для Google Sheets
             row = [
                 datetime.fromisoformat(pos['entry_time']).strftime('%Y-%m-%d %H:%M:%S'),
                 pos.get('pair'), pos.get("side"), initial_deposit,
@@ -371,7 +415,6 @@ if __name__ == "__main__":
     log.info("Bot assistant starting...")
     
     if state.get('bot_on', False):
-        # Запускаем основной цикл в фоновом режиме
         scanner_task = asyncio.create_task(main_loop(app))
 
     app.run_polling()
