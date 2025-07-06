@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v14.0 - Global Trend Filter & Bounce Confirmation
-# • Добавлен фильтр по EMA 200 для торговли только в глобальном аптренде.
-# • Изменена логика входа: теперь бот ждет подтверждения отскока.
-# • Улучшен промпт LLM для учета глобального тренда.
+# v15.0 - MTF Analysis & Advanced Strategy
+# • Внедрен мульти-таймфрейм анализ (H1 для тренда, 5M для входа).
+# • Логика входа заменена на поиск паттерна "Бычье поглощение".
+# • LLM обучен анализировать уровни поддержки/сопротивления.
 # ============================================================================
 
 import os
@@ -36,7 +36,7 @@ LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "gpt-4.1")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
 for n in ("httpx",): logging.getLogger(n).setLevel(logging.WARNING)
-
+    
 # === GOOGLE SHEETS ===
 def setup_google_sheets():
     try:
@@ -75,36 +75,32 @@ def load_state():
 exchange = ccxt.mexc()
 
 # === STRATEGY PARAMS ===
-TIMEFRAME = '5m'
+TIMEFRAME_TREND = '1h'
+TIMEFRAME_ENTRY = '5m'
 SCAN_INTERVAL_SECONDS = 60 * 15
-ADX_LEN = 14
-ADX_THRESHOLD = 25.0
-BBANDS_LEN, BBANDS_STD = 20, 2.0
-MIN_BB_WIDTH_PCT = 0.8
-RSI_LEN, RSI_OVERSOLD = 14, 45 
-STOCH_OVERSOLD = 25.0
-EMA_LEN = 200 # Длина для фильтра глобального тренда
-MIN_RR_RATIO = 1.2 # Снизили требование до 1.2
+EMA_TREND_LEN = 50  # EMA для определения тренда на старшем ТФ
+RSI_LEN, RSI_OVERSOLD = 14, 50 # Смягчаем RSI, т.к. основной фильтр теперь - тренд
+STOCH_OVERSOLD = 30 # Смягчаем стохастик
+MIN_RR_RATIO = 1.5 # Возвращаем требование к R:R, т.к. ищем качественные сетапы
 
 # === INDICATORS ===
 def calculate_indicators(df: pd.DataFrame):
-    df.ta.adx(length=ADX_LEN, append=True)
-    df.ta.bbands(length=BBANDS_LEN, std=BBANDS_STD, append=True)
+    # Индикаторы для 5-минутного графика
     df.ta.rsi(length=RSI_LEN, append=True)
     df.ta.stoch(append=True)
-    df.ta.ema(length=EMA_LEN, append=True)
-    # ATR считаем последним, т.к. он не нужен для основного анализа
-    df.ta.atr(length=14, append=True)
+    # Индикаторы для 1-часового графика
+    df.ta.ema(length=EMA_TREND_LEN, append=True)
     return df.dropna()
 
 # === LLM ===
 LLM_PROMPT = (
-    "Ты — элитный трейдер-аналитик 'Сигма'. Твоя главная задача — отфильтровать ложные сигналы на покупку в нисходящем тренде.\n\n"
+    "Ты — элитный трейдер-аналитик 'Сигма'. Твоя задача — найти высоковероятную точку входа в LONG, подтвержденную на нескольких таймфреймах.\n\n"
     "АЛГОРИТМ АНАЛИЗА:\n"
-    "1.  **Проверка глобального тренда:** Цена входа (`entry_price`) находится выше `ema_200`? Если нет, это очень рискованный сигнал против тренда. Упомяни это как главный риск.\n"
-    "2.  **Подтверждение отскока:** Данные `last_candles` показывают, что цена действительно отскочила от нижней границы Боллинджера (например, последняя свеча закрылась выше предыдущей)? Есть ли бычьи свечные паттерны или дивергенции?\n"
-    "3.  **Расчет Risk/Reward:** На основе логичного SL (под минимумом) и консервативного TP (ближайшее сопротивление/`bb_middle`) рассчитай R:R.\n"
-    f"4.  **Решение:** Одобряй сделку (`APPROVE`) **только если глобальный тренд восходящий (цена > ema_200), есть подтверждение отскока И R:R >= {MIN_RR_RATIO}**. В противном случае — `REJECT`.\n\n"
+    "1.  **Глобальный тренд (H1):** Цена находится выше `ema_trend_h1`? Это обязательное условие. Если нет — `REJECT`.\n"
+    "2.  **Точка входа (5M):** Кандидат найден на основе паттерна 'Бычье поглощение' в зоне перепроданности. Это сильный сигнал? Оцени свечи `last_candles`.\n"
+    "3.  **Структура рынка:** Определи ближайшие ключевые уровни поддержки (для SL) и сопротивления (для TP). Не покупаем прямо под сопротивлением.\n"
+    "4.  **Risk/Reward:** Установи логичный SL под недавним минимумом/уровнем поддержки. Установи TP перед следующим уровнем сопротивления. Рассчитай R:R.\n"
+    f"5.  **Решение:** Одобряй (`APPROVE`) только если тренд на H1 восходящий, вход подтвержден, и R:R >= {MIN_RR_RATIO}. В остальных случаях — `REJECT`.\n\n"
     "Дай ответ ТОЛЬКО в виде JSON-объекта с полями: 'decision', 'confidence_score', 'reasoning', 'suggested_tp', 'suggested_sl'.\n\n"
     "АНАЛИЗИРУЙ СЕТАП:\n{trade_data}"
 )
@@ -131,7 +127,7 @@ async def ask_llm(trade_data):
 
 # === MAIN SCANNER LOOP ===
 async def scanner_loop(app):
-    await broadcast_message(app, "🤖 Сканер запущен. Начинаю формирование списка топ-монет по объему...")
+    await broadcast_message(app, "🤖 Сканер запущен. Новая стратегия: МТФ + Поглощение.")
     try:
         await exchange.load_markets()
         tickers = await exchange.fetch_tickers()
@@ -148,64 +144,59 @@ async def scanner_loop(app):
         candidates = []
         for pair in coin_list:
             try:
-                # Берем больше данных для корректного расчета EMA 200
-                ohlcv = await exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME, limit=250)
-                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                if len(df) < 210: continue
+                # 1. Получаем данные со старшего ТФ для определения тренда
+                ohlcv_h1 = await exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME_TREND, limit=100)
+                df_h1 = pd.DataFrame(ohlcv_h1, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df_h1 = calculate_indicators(df_h1)
+                if len(df_h1) < 2: continue
+                
+                last_h1 = df_h1.iloc[-1]
+                ema_trend = last_h1.get(f'EMA_{EMA_TREND_LEN}')
+                
+                # Фильтр глобального тренда
+                is_global_uptrend = last_h1['close'] > ema_trend
+                if not is_global_uptrend:
+                    if DEBUG_MODE: log.info(f"[DEBUG] {pair:<12} | Trend Filter: DOWN (Price {last_h1['close']:.4f} < EMA{EMA_TREND_LEN} on H1 {ema_trend:.4f})")
+                    continue
 
-                df_with_indicators = calculate_indicators(df.copy())
-                if len(df_with_indicators) < 2: continue
-                
-                prev = df_with_indicators.iloc[-2]
-                last = df_with_indicators.iloc[-1]
-                
-                adx_value = last.get(f'ADX_{ADX_LEN}')
-                last_ema = last.get(f'EMA_{EMA_LEN}')
-                bb_lower_last = last.get(f'BBL_{BBANDS_LEN}_{BBANDS_STD}')
-                bb_lower_prev = prev.get(f'BBL_{BBANDS_LEN}_{BBANDS_STD}')
-                rsi_value = last.get(f'RSI_{RSI_LEN}')
-                stoch_k_col = next((col for col in last.index if 'STOCHk' in col), None)
+                # 2. Получаем данные с младшего ТФ для точки входа
+                ohlcv_5m = await exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME_ENTRY, limit=100)
+                df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df_5m = calculate_indicators(df_5m)
+                if len(df_5m) < 2: continue
+
+                prev_5m = df_5m.iloc[-2]
+                last_5m = df_5m.iloc[-1]
+
+                rsi_value = last_5m.get(f'RSI_{RSI_LEN}')
+                stoch_k_col = next((col for col in last_5m.index if 'STOCHk' in col), None)
                 if not stoch_k_col: continue
-                stoch_k_value = last.get(stoch_k_col)
+                stoch_k_value = last_5m.get(stoch_k_col)
 
-                if any(v is None for v in [adx_value, last_ema, bb_lower_last, bb_lower_prev, rsi_value, stoch_k_value]): continue
-
-                # --- Новая, более строгая логика фильтрации ---
-                is_global_uptrend = last['close'] > last_ema
-                is_ranging = adx_value < ADX_THRESHOLD
+                # --- Новая логика фильтрации на 5M ---
                 is_oversold = rsi_value < RSI_OVERSOLD and stoch_k_value < STOCH_OVERSOLD
-                bounce_confirmed = prev['close'] <= bb_lower_prev and last['close'] > bb_lower_last
+                
+                # Паттерн "Бычье поглощение"
+                is_bullish_engulfing = (last_5m['close'] > prev_5m['open'] and 
+                                        last_5m['open'] < prev_5m['close'] and 
+                                        prev_5m['close'] < prev_5m['open']) # Убеждаемся, что предыдущая свеча красная
 
                 if DEBUG_MODE:
-                    log.info(
-                        f"[DEBUG] {pair:<12} | "
-                        f"Uptrend (C>EMA{EMA_LEN}): {is_global_uptrend} | "
-                        f"Ranging (ADX<{ADX_THRESHOLD}): {is_ranging} | "
-                        f"Oversold: {is_oversold} | "
-                        f"Bounce: {bounce_confirmed}"
-                    )
+                    log.info(f"[DEBUG] {pair:<12} | H1 Trend: UP | Oversold: {is_oversold} | Engulfing: {is_bullish_engulfing}")
                 
-                if is_global_uptrend and is_ranging and is_oversold and bounce_confirmed:
+                if is_oversold and is_bullish_engulfing:
                     now = datetime.now().timestamp()
                     if (now - state["last_alert_times"].get(pair, 0)) < 3600 * 4: continue
                     
-                    atr_col = next((col for col in last.index if 'ATRr' in col), 'ATRr_14')
-                    atr_value = last.get(atr_col, 0)
-
                     candidates.append({
-                        "pair": pair, "price": last['close'], 
-                        "rsi": round(rsi_value, 1),
-                        "stoch_k": round(stoch_k_value, 1),
-                        "bb_lower": bb_lower_last,
-                        "bb_middle": last[f'BBM_{BBANDS_LEN}_{BBANDS_STD}'],
-                        "bb_upper": last[f'BBU_{BBANDS_LEN}_{BBANDS_STD}'],
-                        "ema_200": last_ema,
-                        "atr": atr_value,
-                        "last_candles": df_with_indicators.tail(5)[['open', 'high', 'low', 'close', 'volume']].to_dict('records')
+                        "pair": pair, "price": last_5m['close'], 
+                        "ema_trend_h1": ema_trend,
+                        "last_candles": df_5m.tail(10)[['open', 'high', 'low', 'close', 'volume']].to_dict('records')
                     })
             except Exception as e:
                 log.error(f"Error processing pair {pair}: {e}")
         
+        # Блок обработки кандидатов через LLM (остается без изменений, но данные в него приходят другие)
         if candidates:
             log.info(f"Found {len(candidates)} candidates. Sending to LLM for analysis...")
             await broadcast_message(app, f"🔍 Найдено {len(candidates)} кандидатов. Отправляю на анализ в LLM...")
@@ -213,16 +204,15 @@ async def scanner_loop(app):
             approved_signals_count = 0
             for candidate in candidates:
                 try:
+                    # Данные для LLM теперь более полные
                     trade_data_for_llm = {
-                        "asset": candidate["pair"], "entry_price": candidate["price"],
-                        "rsi": candidate["rsi"], "stochastic_k": candidate["stoch_k"],
-                        "bb_lower": candidate["bb_lower"], "bb_middle": candidate["bb_middle"],
-                        "bb_upper": candidate["bb_upper"], "ema_200": candidate["ema_200"],
-                        "atr": candidate["atr"], "last_candles": candidate["last_candles"]
+                        "asset": candidate["pair"], 
+                        "entry_price": candidate["price"],
+                        "ema_trend_h1": candidate["ema_trend_h1"],
+                        "last_candles": candidate["last_candles"]
                     }
                     llm_response = await ask_llm(trade_data_for_llm)
                     log.info(f"LLM response for {candidate['pair']}: {llm_response.get('decision')}")
-
                     if llm_response and llm_response.get('decision') == 'APPROVE':
                         approved_signals_count += 1
                         asset_name = candidate['pair']
