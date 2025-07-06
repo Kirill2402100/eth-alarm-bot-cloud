@@ -79,12 +79,13 @@ exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
 # === LLM PROMPTS & FUNCTION ===
 
 PROMPT_SELECT_FOCUS = (
-    "Ты — трейдер-аналитик. Тебе предоставлен список монет и их ключевые показатели за последний час. "
-    "Проанализируй этот список и выбери ОДНУ самую перспективную монету для наблюдения в ближайшее время. "
-    "Ищи монеты с аномальной активностью: сильный рост или падение, повышенная волатильность, но при этом еще не улетевшие в космос. "
+    "Ты — главный трейдер-аналитик. Тебе предоставлен короткий список лучших кандидатов, уже отобранных по индикаторам (сильный тренд + откат). "
+    "Твоя задача — провести финальный анализ и выбрать из этого списка ОДНУ самую лучшую монету для пристального наблюдения в ближайшее время. "
+    "Оцени общую структуру, близость к ключевым уровням и потенциал для чистого импульса. "
     "Ответь ТОЛЬКО в виде JSON-объекта с одним полем: 'focus_coin'.\n\n"
-    "Данные для анализа:\n{asset_data}"
+    "Список кандидатов для финального выбора:\n{asset_data}"
 )
+
 PROMPT_FIND_ENTRY = (
     "Ты — снайпер, следящий за монетой {asset}. Твоя задача — дать сигнал на вход в тот самый момент, когда формируется идеальный сетап. "
     "Анализируй последние свечи, объемы, ищи паттерны, дивергенции, пробои или отскоки от уровней. "
@@ -140,40 +141,54 @@ async def main_loop(app):
             await asyncio.sleep(60)
 
 async def run_searching_phase(app):
-    log.info("--- Mode: SEARCHING (Deep Analysis) ---")
-    await broadcast_message(app, "🔍 Провожу глубокий анализ рынка для выбора цели...")
+    log.info("--- Mode: SEARCHING (Indicator-Filtered) ---")
+    await broadcast_message(app, "🔍 Этап 1: Сканирую рынок индикаторами для поиска кандидатов...")
     try:
         tickers = await exchange.fetch_tickers()
         usdt_pairs = {s: t for s, t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume')}
         sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
-        top_coins_list = [item[0] for item in sorted_pairs[:50]]
+        coin_list = [item[0] for item in sorted_pairs[:200]]
         
-        coins_data_for_llm = []
-        for pair in top_coins_list:
+        pre_candidates = []
+        for pair in coin_list:
+            if len(pre_candidates) >= 7: break # Ограничиваем список до 7 лучших
             try:
-                # Получаем часовые свечи для анализа
-                ohlcv = await exchange.fetch_ohlcv(pair, timeframe='1h', limit=24)
+                ohlcv = await exchange.fetch_ohlcv(pair, timeframe='1h', limit=50)
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                if len(df) < 2: continue
+                if len(df) < 25: continue
                 
-                # Считаем простые метрики
-                last_candle = df.iloc[-1]
-                price_change_pct = ((last_candle['close'] - df.iloc[0]['close']) / df.iloc[0]['close']) * 100
-                
-                coins_data_for_llm.append({
-                    "pair": pair,
-                    "price_change_24h_pct": round(price_change_pct, 2),
-                    "current_price": last_candle['close']
-                })
-                await asyncio.sleep(0.5) # небольшая задержка, чтобы не перегружать API
-            except Exception as e:
-                log.warning(f"Could not fetch data for {pair} during search: {e}")
+                # Рассчитываем индикаторы для фильтра
+                df.ta.adx(length=14, append=True)
+                df.ta.ema(length=21, append=True)
+                last = df.iloc[-1]
 
-        if not coins_data_for_llm:
-            await broadcast_message(app, "⚠️ Не удалось собрать данные для анализа. Попробую позже.")
+                adx = last.get('ADX_14')
+                ema = last.get('EMA_21')
+                
+                if adx is None or ema is None: continue
+
+                # Условия фильтра: сильный тренд и цена близко к EMA (откат)
+                is_strong_trend = adx > 25
+                is_near_ema = abs(last['close'] - ema) / ema < 0.02 # Цена в пределах 2% от EMA
+
+                if is_strong_trend and is_near_ema:
+                    pre_candidates.append({
+                        "pair": pair,
+                        "adx": round(adx, 2),
+                        "price_to_ema_dist_pct": round(abs(last['close'] - ema) / ema * 100, 2)
+                    })
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                log.warning(f"Could not fetch data for {pair} during initial scan: {e}")
+
+        if not pre_candidates:
+            log.info("No pre-candidates found after indicator scan.")
+            await broadcast_message(app, "ℹ️ Сканирование завершено. Не найдено монет в стадии отката по тренду.")
             return
 
-        prompt_text = PROMPT_SELECT_FOCUS.format(asset_data=json.dumps(coins_data_for_llm, indent=2))
+        await broadcast_message(app, f"Этап 2: Найдено {len(pre_candidates)} кандидатов. Отправляю на финальный выбор в LLM...")
+        
+        prompt_text = PROMPT_SELECT_FOCUS.format(asset_data=json.dumps(pre_candidates, indent=2))
         llm_response = await ask_llm(prompt_text)
         
         # ... (остальная часть функции с проверкой ответа LLM остается такой же) ...
