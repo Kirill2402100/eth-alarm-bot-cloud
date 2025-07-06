@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v1.0 - Interactive Trading Assistant
-# • Полностью новая архитектура на основе состояний (поиск, фокус, позиция).
-# • Бот выбирает один инструмент и следит за ним в реальном времени.
-# • Взаимодействие через команды /entry и /exit для управления позицией.
+# v1.1 - Interactive Assistant (Robust LLM Calls)
+# • Исправлена ошибка KeyError при вызове LLM.
+# • Рефакторинг функции ask_llm для повышения надежности кода.
 # ============================================================================
 
 import os
@@ -25,7 +24,6 @@ from telegram.error import BadRequest
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID = os.getenv("SHEET_ID")
-COIN_LIST_SIZE = int(os.getenv("COIN_LIST_SIZE", "200"))
 WORKSHEET_NAME = "Trading_Logs_v10"
 
 LLM_API_KEY = os.getenv("LLM_API_KEY")
@@ -34,12 +32,11 @@ LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "gpt-4.1")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
-for n in ("httpx",): logging.getLogger(n).setLevel(logging.WARNING)
+for n in ("httpx", "httpcore"): logging.getLogger(n).setLevel(logging.WARNING)
 
 # === GOOGLE SHEETS ===
 def setup_google_sheets():
     try:
-        # ... (код без изменений)
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
@@ -68,15 +65,11 @@ def load_state():
     global state
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r') as f: state = json.load(f)
-    # Устанавливаем начальное состояние по умолчанию
     if 'mode' not in state:
         state.update({
-            "bot_on": False,
-            "mode": "SEARCHING", # SEARCHING, FOCUSED, POSITION_OPEN
-            "focus_coin": None,
-            "current_position": None,
-            "last_signal": None,
-            "last_focus_time": 0
+            "bot_on": False, "mode": "SEARCHING",
+            "focus_coin": None, "current_position": None,
+            "last_signal": None, "last_focus_time": 0
         })
     log.info(f"State loaded: {state}")
 
@@ -103,15 +96,13 @@ PROMPT_MANAGE_POSITION = (
     "{'decision': 'CLOSE', 'reason': 'краткое обоснование почему нужно закрыться'}. Не жди стоп-лосса, если видишь опасность."
 )
 
-async def ask_llm(prompt, data):
-    # ... (код функции ask_llm без изменений, только промпт передается как аргумент)
-    final_prompt = prompt.format(**data)
+async def ask_llm(final_prompt: str):
+    if not LLM_API_KEY: return None
     payload = {"model": LLM_MODEL_ID, "messages": [{"role": "user", "content": final_prompt}], "temperature": 0.4, "response_format": {"type": "json_object"}}
     headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(LLM_API_URL, json=payload, headers=headers, timeout=90) as r:
-                # ... (остальной код функции без изменений)
                 txt = await r.text()
                 if r.status != 200:
                     log.error(f"LLM HTTP Error {r.status}: {txt}")
@@ -120,7 +111,7 @@ async def ask_llm(prompt, data):
                 content_str = response_json["choices"][0]["message"]["content"]
                 return json.loads(content_str.strip().strip("`"))
     except Exception as e:
-        log.error(f"LLM request/parse err: %s", e)
+        log.error(f"LLM request/parse err: {e}")
         return None
 
 # === MAIN BOT LOGIC ===
@@ -129,19 +120,19 @@ async def main_loop(app):
         try:
             if state['mode'] == 'SEARCHING':
                 await run_searching_phase(app)
-                await asyncio.sleep(60 * 15) # Ищем новую цель раз в 15 минут
+                await asyncio.sleep(60 * 15)
             elif state['mode'] == 'FOCUSED':
                 await run_focused_phase(app)
-                await asyncio.sleep(30) # Следим за целью каждые 30 секунд
+                await asyncio.sleep(30)
             elif state['mode'] == 'POSITION_OPEN':
                 await run_monitoring_phase(app)
-                await asyncio.sleep(30) # Мониторим позицию каждые 30 секунд
+                await asyncio.sleep(30)
             else:
-                log.error(f"Unknown bot mode: {state['mode']}")
-                state['mode'] = 'SEARCHING' # Сброс в безопасное состояние
+                log.error(f"Unknown bot mode: {state['mode']}. Resetting to SEARCHING.")
+                state['mode'] = 'SEARCHING'
                 await asyncio.sleep(60)
         except Exception as e:
-            log.error(f"Error in main_loop: {e}")
+            log.error(f"Critical error in main_loop: {e}", exc_info=True)
             await broadcast_message(app, f"⚠️ Критическая ошибка в главном цикле: {e}")
             await asyncio.sleep(60)
 
@@ -152,58 +143,55 @@ async def run_searching_phase(app):
         tickers = await exchange.fetch_tickers()
         usdt_pairs = {s: t for s, t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume')}
         sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
-        top_coins = [item[0] for item in sorted_pairs[:50]]
+        top_coins_list = [item[0] for item in sorted_pairs[:50]]
         
-        # Запрашиваем фокусную монету у LLM
-        llm_response = await ask_llm(PROMPT_SELECT_FOCUS, {"asset_list": top_coins})
-        
-        # ---> НАЧАЛО НОВОГО БЛОКА ПРОВЕРОК И ЛОГИРОВАНИЯ <---
-        
-        # Логируем сырой ответ от LLM, чтобы видеть, что он присылает
+        llm_response = await ask_llm(PROMPT_SELECT_FOCUS)
         log.info(f"Raw LLM response for focus selection: {llm_response}")
 
-        # Делаем проверки более надежными
         if llm_response and isinstance(llm_response, dict) and 'focus_coin' in llm_response:
-            state['focus_coin'] = llm_response['focus_coin']
-            state['mode'] = 'FOCUSED'
-            state['last_focus_time'] = datetime.now().timestamp()
-            log.info(f"LLM selected new focus coin: {state['focus_coin']}")
-            await broadcast_message(app, f"🎯 Новая цель для наблюдения: <b>{state['focus_coin']}</b>. Начинаю слежение в реальном времени.")
-            save_state()
+            focus_coin = llm_response['focus_coin']
+            if focus_coin in top_coins_list: # Проверяем, что LLM выбрал монету из предложенных
+                state['focus_coin'] = focus_coin
+                state['mode'] = 'FOCUSED'
+                state['last_focus_time'] = datetime.now().timestamp()
+                log.info(f"LLM selected new focus coin: {state['focus_coin']}")
+                await broadcast_message(app, f"🎯 Новая цель для наблюдения: <b>{state['focus_coin']}</b>. Начинаю слежение.")
+                save_state()
+            else:
+                log.error(f"LLM selected a coin not in the top list: {focus_coin}")
         else:
             log.error(f"Failed to get a valid focus coin from LLM. Response was: {llm_response}")
-            await broadcast_message(app, "⚠️ Не удалось получить валидную цель от LLM. Попробую снова через некоторое время.")
-
-        # ---> КОНЕЦ НОВОГО БЛОКА <---
-
+            await broadcast_message(app, "⚠️ Не удалось получить валидную цель от LLM. Попробую снова.")
     except Exception as e:
-        log.error(f"Critical error in searching phase: {e}", exc_info=True) # Добавляем полный traceback для лучшей диагностики
-        
+        log.error(f"Critical error in searching phase: {e}", exc_info=True)
+
 async def run_focused_phase(app):
     log.info(f"--- Mode: FOCUSED on {state['focus_coin']} ---")
     if not state['focus_coin']:
         state['mode'] = 'SEARCHING'
         return
         
-    # Таймаут: если за 15 минут не было сигнала, ищем новую цель
     if (datetime.now().timestamp() - state.get('last_focus_time', 0)) > 60 * 15:
         await broadcast_message(app, f"⚠️ Не найдено подходящего сетапа по {state['focus_coin']} за 15 минут. Ищу новую цель.")
         state['mode'] = 'SEARCHING'
+        save_state()
         return
 
     try:
         ohlcv = await exchange.fetch_ohlcv(state['focus_coin'], timeframe='5m', limit=100)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        llm_data = {"asset": state['focus_coin'], "candles_data": df.to_dict('records')}
-        llm_response = await ask_llm(PROMPT_FIND_ENTRY, llm_data)
+        prompt_text = PROMPT_FIND_ENTRY.format(asset=state['focus_coin'])
+        llm_response = await ask_llm(prompt_text)
 
         if llm_response and llm_response.get('decision') == 'ENTER':
             state['last_signal'] = llm_response
-            side = llm_response.get('side')
-            reason = llm_response.get('reason')
-            sl = llm_response.get('sl')
-            tp = llm_response.get('tp')
+            save_state()
+            
+            side = llm_response.get('side', 'N/A')
+            reason = llm_response.get('reason', 'N/A')
+            sl = llm_response.get('sl', 0)
+            tp = llm_response.get('tp', 0)
             
             message = (
                 f"🔔 <b>ВНИМАНИЕ, СЕТАП!</b> 🔔\n\n"
@@ -215,24 +203,24 @@ async def run_focused_phase(app):
                 f"👉 Откройте сделку и подтвердите вход командой <code>/entry</code>."
             )
             await broadcast_message(app, message)
-            # Мы не меняем режим, ждем команду /entry от пользователя
-            save_state()
-
     except Exception as e:
-        log.error(f"Error in focused phase for {state['focus_coin']}: {e}")
+        log.error(f"Error in focused phase for {state['focus_coin']}: {e}", exc_info=True)
 
 async def run_monitoring_phase(app):
-    log.info(f"--- Mode: POSITION_OPEN on {state['current_position']['pair']} ---")
-    pos = state['current_position']
+    log.info(f"--- Mode: POSITION_OPEN on {state.get('current_position', {}).get('pair')} ---")
+    pos = state.get('current_position')
+    if not pos:
+        state['mode'] = 'SEARCHING'
+        return
     try:
-        ohlcv = await exchange.fetch_ohlcv(pos['pair'], timeframe='1m', limit=100) # Мониторим на минутках
+        ohlcv = await exchange.fetch_ohlcv(pos['pair'], timeframe='1m', limit=100)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
-        llm_data = {"asset": pos['pair'], "side": pos['side'], "entry_price": pos['entry_price'], "candles_data": df.to_dict('records')}
-        llm_response = await ask_llm(PROMPT_MANAGE_POSITION, llm_data)
+        prompt_text = PROMPT_MANAGE_POSITION.format(asset=pos['pair'], side=pos['side'], entry_price=pos['entry_price'])
+        llm_response = await ask_llm(prompt_text)
 
         if llm_response and llm_response.get('decision') == 'CLOSE':
-            reason = llm_response.get('reason')
+            reason = llm_response.get('reason', 'N/A')
             message = (
                 f"⚠️ <b>РЕКОМЕНДАЦИЯ: ЗАКРЫТЬ ПОЗИЦИЮ!</b> ⚠️\n\n"
                 f"<b>Монета:</b> <code>{pos['pair']}</code>\n"
@@ -240,12 +228,12 @@ async def run_monitoring_phase(app):
                 f"👉 Закройте сделку и подтвердите выход командой <code>/exit</code>."
             )
             await broadcast_message(app, message)
-            # Режим не меняем, ждем /exit
     except Exception as e:
-        log.error(f"Error in monitoring phase for {pos['pair']}: {e}")
+        log.error(f"Error in monitoring phase for {pos['pair']}: {e}", exc_info=True)
 
 # === COMMANDS and RUN ===
 async def broadcast_message(app, text):
+    # ... (код без изменений)
     for chat_id in app.chat_ids:
         try:
             await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
@@ -259,9 +247,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.application.chat_ids = CHAT_IDS
     ctx.application.chat_ids.add(chat_id)
     
-    if not state['bot_on']:
+    if not state.get('bot_on'):
         state['bot_on'] = True
-        state['mode'] = 'SEARCHING' # Начинаем всегда с поиска
+        state['mode'] = 'SEARCHING'
         save_state()
         await update.message.reply_text("✅ Ассистент запущен. Начинаю поиск цели...")
         if scanner_task is None or scanner_task.done():
@@ -270,7 +258,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ Ассистент уже запущен.")
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if state['bot_on']:
+    if state.get('bot_on'):
         state['bot_on'] = False
         save_state()
         await update.message.reply_text("❌ Ассистент остановлен. Все циклы завершатся.")
@@ -278,40 +266,35 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ Ассистент уже был остановлен.")
 
 async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if state['mode'] != 'FOCUSED' or not state['last_signal']:
-        await update.message.reply_text("⚠️ Нет активного сигнала для подтверждения входа. Дождитесь сигнала.")
+    if state['mode'] != 'FOCUSED' or not state.get('last_signal'):
+        await update.message.reply_text("⚠️ Нет активного сигнала для подтверждения входа.")
         return
     try:
-        # Формат: /entry цена_входа депозит
         entry_price = float(ctx.args[0])
         deposit = float(ctx.args[1])
-        
         signal = state['last_signal']
+        
         state['current_position'] = {
-            "entry_time": datetime.now(timezone.utc).isoformat(),
-            "pair": state['focus_coin'],
-            "side": signal['side'],
-            "deposit": deposit,
-            "entry_price": entry_price,
-            "sl": signal['sl'],
-            "tp": signal['tp']
+            "entry_time": datetime.now(timezone.utc).isoformat(), "pair": state['focus_coin'],
+            "side": signal.get('side'), "deposit": deposit,
+            "entry_price": entry_price, "sl": signal.get('sl'), "tp": signal.get('tp')
         }
         state['mode'] = 'POSITION_OPEN'
         state['last_signal'] = None
         save_state()
+        
+        pos = state['current_position']
         await update.message.reply_text(
-            f"✅ Позиция <b>{state['current_position']['side']}</b> по <b>{state['current_position']['pair']}</b> зафиксирована.\n"
-            f"Начинаю сопровождение."
+            f"✅ Позиция <b>{pos.get('side')}</b> по <b>{pos.get('pair')}</b> зафиксирована.\nНачинаю сопровождение."
         )
     except (IndexError, ValueError):
         await update.message.reply_text("⚠️ Неверный формат. Используйте: <code>/entry &lt;цена_входа&gt; &lt;депозит&gt;</code>", parse_mode="HTML")
 
 async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if state['mode'] != 'POSITION_OPEN' or not state['current_position']:
+    if state['mode'] != 'POSITION_OPEN' or not state.get('current_position'):
         await update.message.reply_text("⚠️ Нет открытой позиции для закрытия.")
         return
     try:
-        # Формат: /exit итоговый_депозит
         exit_deposit = float(ctx.args[0])
         pos = state['current_position']
 
@@ -320,7 +303,6 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pct_change = (pnl / initial_deposit) * 100 if initial_deposit != 0 else 0
         
         if LOGS_WS:
-            # ... (код логирования в Google Sheets без изменений)
             row = [
                 datetime.fromisoformat(pos['entry_time']).strftime('%Y-%m-%d %H:%M:%S'),
                 pos.get('pair'), pos.get("side"), initial_deposit,
@@ -336,7 +318,7 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         
         state['current_position'] = None
         state['focus_coin'] = None
-        state['mode'] = 'SEARCHING' # Возвращаемся к поиску
+        state['mode'] = 'SEARCHING'
         save_state()
         
     except (IndexError, ValueError):
@@ -353,7 +335,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("exit", cmd_exit))
 
     log.info("Bot assistant started...")
-    # Запускаем основной цикл, если бот должен быть включен при старте
+    
     if state.get('bot_on', False):
         asyncio.ensure_future(main_loop(app))
 
