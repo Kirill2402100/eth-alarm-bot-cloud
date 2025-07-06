@@ -77,8 +77,9 @@ def load_state():
 exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
 
 # === LLM PROMPTS & FUNCTION ===
+
 PROMPT_SELECT_FOCUS = (
-    "Ты — трейдер-аналитик. Тебе предоставлен список криптовалютных пар с высокой волатильностью. "
+    "Ты — трейдер-аналитик. Вот список криптовалютных пар с высокой волатильностью: {asset_list}. "
     "Твоя задача — выбрать из этого списка ОДНУ наиболее перспективную монету для наблюдения в ближайший час с целью поиска входа в LONG или SHORT. "
     "Ищи монеты, которые приближаются к сильным уровням или показывают явные признаки подготовки к импульсу. "
     "Ответь ТОЛЬКО в виде JSON-объекта с одним полем: 'focus_coin', например: {'focus_coin': 'BTC/USDT:USDT'}."
@@ -145,12 +146,19 @@ async def run_searching_phase(app):
         sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
         top_coins_list = [item[0] for item in sorted_pairs[:50]]
         
-        llm_response = await ask_llm(PROMPT_SELECT_FOCUS)
+        # ---> НАЧАЛО ИСПРАВЛЕНИЯ <---
+        
+        # Форматируем промпт, вставляя в него список монет
+        prompt_text = PROMPT_SELECT_FOCUS.format(asset_list=json.dumps(top_coins_list))
+        llm_response = await ask_llm(prompt_text)
+        
+        # ---> КОНЕЦ ИСПРАВЛЕНИЯ <---
+        
         log.info(f"Raw LLM response for focus selection: {llm_response}")
 
         if llm_response and isinstance(llm_response, dict) and 'focus_coin' in llm_response:
             focus_coin = llm_response['focus_coin']
-            if focus_coin in top_coins_list: # Проверяем, что LLM выбрал монету из предложенных
+            if focus_coin in top_coins_list:
                 state['focus_coin'] = focus_coin
                 state['mode'] = 'FOCUSED'
                 state['last_focus_time'] = datetime.now().timestamp()
@@ -158,13 +166,15 @@ async def run_searching_phase(app):
                 await broadcast_message(app, f"🎯 Новая цель для наблюдения: <b>{state['focus_coin']}</b>. Начинаю слежение.")
                 save_state()
             else:
-                log.error(f"LLM selected a coin not in the top list: {focus_coin}")
+                log.error(f"LLM selected a coin not in the top list or returned a sentence: {focus_coin}")
+                await broadcast_message(app, f"⚠️ LLM вернул некорректное имя монеты. Попробую снова.")
         else:
             log.error(f"Failed to get a valid focus coin from LLM. Response was: {llm_response}")
             await broadcast_message(app, "⚠️ Не удалось получить валидную цель от LLM. Попробую снова.")
+
     except Exception as e:
         log.error(f"Critical error in searching phase: {e}", exc_info=True)
-
+        
 async def run_focused_phase(app):
     log.info(f"--- Mode: FOCUSED on {state['focus_coin']} ---")
     if not state['focus_coin']:
