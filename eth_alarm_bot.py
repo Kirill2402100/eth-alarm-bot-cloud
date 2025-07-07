@@ -148,9 +148,8 @@ async def main_loop(app):
             log.error(f"Critical error in main_loop: {e}", exc_info=True)
 
 async def run_searching_phase(app):
-    log.info("--- Mode: SEARCHING for Imminent EMA Crossovers ---")
-    await broadcast_message(app, f"<b>Этап 1:</b> Ищу монеты с максимальным сближением 9/21 EMA...")
-    
+    log.info("--- Mode: SEARCHING for Fresh EMA Crossovers ---")
+    await broadcast_message(app, f"<b>Этап 1:</b> Ищу пересечения EMA среди топ-<b>{COIN_LIST_SIZE}</b> монет (не старше 2 свечей)...")
     pre_candidates = []
     try:
         tickers = await exchange.fetch_tickers()
@@ -162,46 +161,52 @@ async def run_searching_phase(app):
             if len(pre_candidates) >= 10: break
             if not state.get('bot_on'): return
             try:
-                ohlcv_5m = await exchange.fetch_ohlcv(pair, timeframe='5m', limit=50)
+                ohlcv_5m = await exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME_ENTRY, limit=50)
                 df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 if len(df_5m) < 22: continue
 
                 df_5m.ta.ema(length=9, append=True)
                 df_5m.ta.ema(length=21, append=True)
-                
-                last_5m = df_5m.iloc[-1]
-                prev_5m = df_5m.iloc[-2]
 
-                ema_short = last_5m.get('EMA_9')
-                ema_long = last_5m.get('EMA_21')
-                prev_ema_short = prev_5m.get('EMA_9')
-                
-                if any(v is None for v in [ema_short, ema_long, prev_ema_short]): continue
+                # Ищем пересечение в последних 5 свечах
+                for i in range(len(df_5m) - 1, len(df_5m) - 6, -1):
+                    if i < 1: break
+                    
+                    last = df_5m.iloc[i]
+                    prev = df_5m.iloc[i-1]
+                    
+                    ema_short = last.get('EMA_9')
+                    ema_long = last.get('EMA_21')
+                    prev_ema_short = prev.get('EMA_9')
+                    prev_ema_long = prev.get('EMA_21')
 
-                # --- Новая логика "Упреждающего сигнала" ---
-                distance_pct = abs(ema_short - ema_long) / last_5m['close']
-                side = None
+                    if any(v is None for v in [ema_short, ema_long, prev_ema_short, prev_ema_long]): continue
+                    
+                    candles_since_cross = (len(df_5m) - 1) - i
+                    if candles_since_cross > 2:
+                        break 
 
-                # Условие для LONG: 9 EMA НИЖЕ 21 EMA, но уже РАСТЕТ и очень близко
-                if ema_short < ema_long and ema_short > prev_ema_short and distance_pct < PROXIMITY_THRESHOLD:
-                    side = 'LONG'
-                
-                # Условие для SHORT: 9 EMA ВЫШЕ 21 EMA, но уже ПАДАЕТ и очень близко
-                elif ema_short > ema_long and ema_short < prev_ema_short and distance_pct < PROXIMITY_THRESHOLD:
-                    side = 'SHORT'
-                
-                if side:
-                    pre_candidates.append({"pair": pair, "side": side})
-                    log.info(f"Found pre-candidate (Imminent Crossover): {pair}, Side: {side}")
+                    side = None
+                    # Проверяем на свершившееся пересечение
+                    if prev_ema_short <= prev_ema_long and ema_short > ema_long:
+                        side = 'LONG'
+                    elif prev_ema_short >= prev_ema_long and ema_short < ema_long:
+                        side = 'SHORT'
+                    
+                    if side:
+                        pre_candidates.append({"pair": pair, "side": side})
+                        log.info(f"Found pre-candidate: {pair}, Side: {side}")
+                        break
                 
                 await asyncio.sleep(1.5)
             except Exception as e:
                 log.warning(f"Could not process {pair} in initial scan: {e}")
-                
     except Exception as e:
         log.error(f"Critical error in Stage 1 (Indicator Scan): {e}", exc_info=True)
         return
 
+    # ... остальная часть функции остается без изменений ...
+    
     if not pre_candidates:
         log.info("No pre-candidates found.")
         await broadcast_message(app, "ℹ️ Сканирование завершено. Не найдено монет, готовящихся к пересечению EMA.")
