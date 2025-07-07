@@ -191,7 +191,7 @@ async def run_searching_phase(app):
                         log.info(f"Found pre-candidate: {pair}, Side: {side}, Freshness: {candles_since_cross} candles ago.")
                         break
                 
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1.5)
             except Exception as e:
                 log.warning(f"Could not process {pair} in initial scan: {e}")
     # ... (остальная часть функции остается без изменений) ...
