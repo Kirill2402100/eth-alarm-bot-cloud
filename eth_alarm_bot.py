@@ -133,7 +133,7 @@ async def main_loop(app):
         try:
             if state['mode'] == 'SEARCHING':
                 await run_searching_phase(app)
-                await asyncio.sleep(60 * 10)
+                await asyncio.sleep(60 * 3)
             elif state['mode'] == 'AWAITING_ENTRY':
                 await run_awaiting_entry_phase(app)
                 await asyncio.sleep(60)
