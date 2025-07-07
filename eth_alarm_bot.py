@@ -91,19 +91,17 @@ exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
 
 # === LLM PROMPTS & FUNCTION ===
 PROMPT_ANALYZE_AND_SELECT = (
-    "Ты — главный трейдер-аналитик. Твоя задача — проанализировать предоставленный список кандидатов и выбрать из них ОДИН лучший для торговли, а для него предложить СТРАТЕГИЮ установки ордеров.\n\n"
-    "**КРИТИЧЕСКИ ВАЖНО:** Твой анализ должен быть основан **ИСКЛЮЧИТЕЛЬНО** на предоставленных ниже данных по каждому кандидату.\n\n"
+    "Ты — главный трейдер-аналитик. Тебе предоставлен список кандидатов, отобранных по сигналу 'свежее пересечение EMA'.\n\n"
+    "**КРИТИЧЕСКИ ВАЖНО:** Твой анализ должен быть основан **ИСКЛЮЧИТЕЛЬНО** на предоставленных ниже данных по каждому кандидату. Не используй свою внутреннюю базу знаний о ценах.\n\n"
     "**ТВОЙ АЛГОРИТМ ВЫБОРА:**\n"
     "1.  Проанализируй **каждого** кандидата в списке `candidates`.\n"
-    "2.  **Главный критерий — свежесть сигнала (`candles_since_cross`).** Отдавай абсолютный приоритет кандидатам со значением 0 или 1.\n"
-    "3.  **Вторичные критерии для сравнения:** Среди самых свежих сигналов выбери тот, у которого лучшая комбинация остальных факторов: соответствие тренду на H1, сила импульса (ADX), адекватный RSI.\n"
-    "4.  **Обязательный выбор:** Основываясь на этих правилах, **ты ОБЯЗАН выбрать ОДНОГО, самого лучшего кандидата**.\n"
-    "5.  **Разработка стратегии:** Для этого лучшего кандидата порекомендуй:\n"
-    "    - `sl_pct` (число): Оптимальный размер стоп-лосса в ПРОЦЕНТАХ от точки входа (например, 1.5 для 1.5%).\n"
-    "    - `rr_ratio` (число): Целевое соотношение риска к прибыли (например, 2.0 для R:R 1:2).\n\n"
+    "2.  Сравни их между собой по совокупности факторов: соответствие глобальному тренду на H1, сила импульса (ADX), адекватный RSI (не в экстремальной зоне).\n"
+    "3.  **Обязательный выбор:** Выбери **ОДНОГО, самого лучшего кандидата**.\n"
+    "4.  **Проверка направления:** Убедись, что направление (`side`) твоего финального сетапа **строго совпадает** с направлением, указанным для выбранного кандидата.\n"
+    "5.  **Генерация сетапа:** Для этого лучшего кандидата сгенерируй SL и TP с R:R >= 1.5.\n\n"
     "**ТРЕБОВАНИЯ К ОТВЕТУ:**\n"
-    "Твой ответ **обязательно** должен быть в формате **JSON** и содержать ТОЛЬКО стратегию для лучшего кандидата. Пример: "
-    "`{ 'pair': 'BTC/USDT:USDT', 'side': 'LONG', 'reason': 'Свежее пересечение с подтверждением...', 'sl_pct': 1.5, 'rr_ratio': 2.0 }`."
+    "Твой ответ **обязательно** должен быть в формате **JSON** и содержать ТОЛЬКО сетап лучшего кандидата. Пример: "
+    "`{ 'pair': 'BTC/USDT:USDT', 'side': 'LONG', 'reason': 'Свежее пересечение...', 'sl_pct': 1.5, 'rr_ratio': 2.0 }`."
 )
 PROMPT_MANAGE_POSITION = (
     "Ты — риск-менеджер. Ты ведешь открытую позицию {side} по {asset} от цены {entry_price}. "
@@ -152,7 +150,7 @@ async def main_loop(app):
 
 async def run_searching_phase(app):
     log.info("--- Mode: SEARCHING for Fresh EMA Crossovers ---")
-    await broadcast_message(app, f"<b>Этап 1:</b> Ищу монеты со свежим пересечением 9/21 EMA...")
+    await broadcast_message(app, f"<b>Этап 1:</b> Ищу монеты со свежим пересечением 9/21 EMA (не старше 2 свечей)...")
     pre_candidates = []
     try:
         tickers = await exchange.fetch_tickers()
@@ -167,25 +165,37 @@ async def run_searching_phase(app):
                 ohlcv_5m = await exchange.fetch_ohlcv(pair, timeframe='5m', limit=50)
                 df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 if len(df_5m) < 22: continue
+
                 df_5m.ta.ema(length=9, append=True); df_5m.ta.ema(length=21, append=True)
 
                 for i in range(len(df_5m) - 1, len(df_5m) - 6, -1):
                     if i < 1: break
+                    
                     last = df_5m.iloc[i]; prev = df_5m.iloc[i-1]
                     ema_short = last.get('EMA_9'); ema_long = last.get('EMA_21')
                     prev_ema_short = prev.get('EMA_9'); prev_ema_long = prev.get('EMA_21')
                     if any(v is None for v in [ema_short, ema_long, prev_ema_short, prev_ema_long]): continue
                     
+                    candles_since_cross = (len(df_5m) - 1) - i
+                    
+                    # ---> ЖЕСТКИЙ ФИЛЬТР ПО СВЕЖЕСТИ СИГНАЛА <---
+                    if candles_since_cross > 2:
+                        break # Если пересечение было давно, дальше не ищем
+
                     side = None
                     if prev_ema_short <= prev_ema_long and ema_short > ema_long: side = 'LONG'
                     elif prev_ema_short >= prev_ema_long and ema_short < ema_long: side = 'SHORT'
                     
                     if side:
-                        pre_candidates.append({"pair": pair, "side": side, "candles_since_cross": (len(df_5m) - 1) - i})
+                        pre_candidates.append({"pair": pair, "side": side, "candles_since_cross": candles_since_cross})
+                        log.info(f"Found pre-candidate: {pair}, Side: {side}, Freshness: {candles_since_cross} candles ago.")
                         break
+                
                 await asyncio.sleep(0.5)
             except Exception as e:
                 log.warning(f"Could not process {pair} in initial scan: {e}")
+    # ... (остальная часть функции остается без изменений) ...
+        
     except Exception as e:
         log.error(f"Critical error in Stage 1 (Indicator Scan): {e}", exc_info=True)
         return
