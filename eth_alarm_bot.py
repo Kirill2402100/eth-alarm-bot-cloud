@@ -386,12 +386,41 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except (IndexError, ValueError):
         await update.message.reply_text("⚠️ Неверный формат: <code>/exit &lt;итоговый_депозит&gt;</code>", parse_mode="HTML")
 
+async def cmd_next(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Принудительно запускает новый поиск, отменяя текущий сетап."""
+    global scanner_task
+    if state.get('mode') == 'AWAITING_ENTRY' and state.get('last_signal'):
+        pair = state['last_signal'].get('pair', 'N/A')
+        await update.message.reply_text(f"✅ Понял, пропускаю сетап по <code>{pair}</code>. Немедленно начинаю новый поиск...", parse_mode="HTML")
+        
+        # Сбрасываем состояние и немедленно перезапускаем главный цикл
+        state['last_signal'] = None
+        state['mode'] = 'SEARCHING'
+        save_state()
+        
+        if scanner_task and not scanner_task.done():
+            scanner_task.cancel()
+        
+        # Даем небольшую паузу для отмены и запускаем новый таск
+        await asyncio.sleep(1)
+        scanner_task = asyncio.create_task(main_loop(ctx.application))
+
+    elif state.get('mode') == 'SEARCHING':
+        await update.message.reply_text("ℹ️ Бот уже находится в режиме поиска.")
+    else:
+        await update.message.reply_text("⚠️ Эту команду можно использовать, только когда бот предложил сетап и ожидает входа.")
+        
 if __name__ == "__main__":
     load_state()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.chat_ids = CHAT_IDS
-    app.add_handler(CommandHandler("start", cmd_start)); app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("entry", cmd_entry)); app.add_handler(CommandHandler("exit", cmd_exit))
+    
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("entry", cmd_entry))
+    app.add_handler(CommandHandler("exit", cmd_exit))
+    app.add_handler(CommandHandler("next", cmd_next)) # <-- ДОБАВЬТЕ ЭТУ СТРОКУ
+
     log.info("Sniper Assistant starting...")
     if state.get('bot_on', False):
         scanner_task = asyncio.create_task(main_loop(app))
