@@ -183,7 +183,7 @@ async def run_searching_phase(app):
     if not pre_candidates:
         log.info("No candidates with EMA crossover found."); return
 
-    await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Рассчитываю сетапы и отправляю в LLM...")
+    await broadcast_message(app, f"<b>Этап 1:</b> Ищу пересечения EMA среди топ-{COIN_LIST_SIZE} монет...")
     setups_for_llm = []
     try:
         for candidate in pre_candidates:
