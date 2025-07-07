@@ -84,10 +84,14 @@ def load_state():
 exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
 
 # === STRATEGY PARAMS ===
+# Таймфреймы теперь задаются через переменные окружения на Railway
+TIMEFRAME_ENTRY = os.getenv("TF_ENTRY", "15m")
+TIMEFRAME_TREND = os.getenv("TF_TREND", "1h")
+
+# Параметры для расчета SL/TP по ATR
 ATR_LEN = 14
-SL_ATR_MULTIPLIER = 1.0
-RR_RATIO = 2.0
-PROXIMITY_THRESHOLD = 0.002 # 0.2% - порог максимального сближения EMA
+SL_ATR_MULTIPLIER = 1.0  # SL = 1 * ATR
+RR_RATIO = 2.0           # R:R = 1:2
 
 # === LLM PROMPTS & FUNCTION ===
 PROMPT_FINAL_APPROVAL = (
