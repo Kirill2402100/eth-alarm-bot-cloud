@@ -144,7 +144,10 @@ async def main_loop(app):
 
 async def run_searching_phase(app):
     log.info("--- Mode: SEARCHING for Fresh EMA Crossovers ---")
-    await broadcast_message(app, f"<b>Этап 1:</b> Ищу монеты со свежим пересечением 9/21 EMA (не старше 2 свечей)...")
+    
+    # Исправлено: Одно-единственное, правильное сообщение для Этапа 1
+    await broadcast_message(app, f"<b>Этап 1:</b> Ищу пересечения EMA среди топ-<b>{COIN_LIST_SIZE}</b> монет (не старше 2 свечей)...")
+    
     pre_candidates = []
     try:
         tickers = await exchange.fetch_tickers()
@@ -159,31 +162,43 @@ async def run_searching_phase(app):
                 ohlcv_5m = await exchange.fetch_ohlcv(pair, timeframe='5m', limit=50)
                 df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 if len(df_5m) < 22: continue
+
                 df_5m.ta.ema(length=9, append=True); df_5m.ta.ema(length=21, append=True)
+
                 for i in range(len(df_5m) - 1, len(df_5m) - 6, -1):
                     if i < 1: break
                     last = df_5m.iloc[i]; prev = df_5m.iloc[i-1]
                     ema_short = last.get('EMA_9'); ema_long = last.get('EMA_21')
                     prev_ema_short = prev.get('EMA_9'); prev_ema_long = prev.get('EMA_21')
                     if any(v is None for v in [ema_short, ema_long, prev_ema_short, prev_ema_long]): continue
+                    
                     candles_since_cross = (len(df_5m) - 1) - i
                     if candles_since_cross > 2: break
+
                     side = None
                     if prev_ema_short <= prev_ema_long and ema_short > ema_long: side = 'LONG'
                     elif prev_ema_short >= prev_ema_long and ema_short < ema_long: side = 'SHORT'
+                    
                     if side:
-                        pre_candidates.append({"pair": pair, "side": side, "candles_since_cross": candles_since_cross})
-                        break
+                        pre_candidates.append({"pair": pair, "side": side})
+                        log.info(f"Found pre-candidate: {pair}, Side: {side}, Freshness: {candles_since_cross} candles ago.")
+                        break # Нашли самое свежее пересечение, дальше по этой монете не ищем
+                
                 await asyncio.sleep(1.5)
             except Exception as e:
                 log.warning(f"Could not process {pair} in initial scan: {e}")
     except Exception as e:
-        log.error(f"Critical error in Stage 1 (Indicator Scan): {e}", exc_info=True); return
+        log.error(f"Critical error in Stage 1 (Indicator Scan): {e}", exc_info=True)
+        return
 
     if not pre_candidates:
-        log.info("No candidates with EMA crossover found."); return
+        log.info("No candidates with EMA crossover found.")
+        await broadcast_message(app, "ℹ️ Сканирование завершено. Не найдено свежих пересечений EMA.")
+        return
 
-    await broadcast_message(app, f"<b>Этап 1:</b> Ищу пересечения EMA среди топ-{COIN_LIST_SIZE} монет...")
+    # Исправлено: Сообщение для Этапа 2 отправляется здесь
+    await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Рассчитываю сетапы и отправляю в LLM...")
+    
     setups_for_llm = []
     try:
         for candidate in pre_candidates:
@@ -204,31 +219,36 @@ async def run_searching_phase(app):
             risk_amount = atr_value * SL_ATR_MULTIPLIER
             if side == 'LONG':
                 sl = entry_price - risk_amount; tp = entry_price + risk_amount * RR_RATIO
-            else:
+            else: # SHORT
                 sl = entry_price + risk_amount; tp = entry_price - risk_amount * RR_RATIO
             
             setups_for_llm.append({
                 "pair": pair, "side": side, "entry_price": entry_price, "sl": sl, "tp": tp,
-                "candles_since_cross": candidate['candles_since_cross'],
                 "h1_trend": "UP" if last_h1['close'] > ema_h1 else "DOWN",
                 "m5_adx": round(last_5m.get('ADX_14'), 2), "m5_rsi": round(last_5m.get('RSI_14'), 2)
             })
             await asyncio.sleep(0.5)
     except Exception as e:
-        log.error(f"Critical error in Stage 2 (Deep Data): {e}", exc_info=True); return
+        log.error(f"Critical error in Stage 2 (Deep Data): {e}", exc_info=True)
+        return
 
     if not setups_for_llm:
         await broadcast_message(app, "ℹ️ Не удалось подготовить данные для анализа."); return
         
-    prompt_text = PROMPT_ANALYZE_AND_SELECT_BEST + "\n\nКандидаты для выбора (JSON):\n" + json.dumps({"candidates": setups_for_llm})
+    prompt_text = PROMPT_FINAL_APPROVAL + "\n\nКандидаты для выбора (JSON):\n" + json.dumps({"candidates": setups_for_llm})
     llm_response = await ask_llm(prompt_text)
+    
     log.info(f"LLM decision on batch: {llm_response}")
 
     if llm_response and llm_response.get('decision') != 'REJECT':
         final_setup = llm_response
-        state['last_signal'] = final_setup; state['last_signal']['timestamp'] = datetime.now().timestamp()
-        state['mode'] = 'AWAITING_ENTRY'; save_state()
+        state['last_signal'] = final_setup
+        state['last_signal']['timestamp'] = datetime.now().timestamp()
+        state['mode'] = 'AWAITING_ENTRY'
+        save_state()
+        
         await log_signal_to_gs(final_setup)
+        
         message = (f"🔔 <b>ЛУЧШИЙ СЕТАП!</b> 🔔\n\n<b>Монета:</b> <code>{final_setup.get('pair')}</code>\n<b>Направление:</b> <b>{final_setup.get('side')}</b>\n"
                    f"<b>Цена входа (расчетная):</b> <code>{final_setup.get('entry_price'):.6f}</code>\n"
                    f"<b>Take Profit:</b> <code>{final_setup.get('tp'):.6f}</code>\n<b>Stop Loss:</b> <code>{final_setup.get('sl'):.6f}</code>\n\n"
@@ -238,7 +258,7 @@ async def run_searching_phase(app):
     else:
         reason = llm_response.get('reason', 'N/A') if llm_response else "LLM не ответил."
         await broadcast_message(app, f"ℹ️ Анализ завершен. LLM не выбрал ни одного достойного кандидата. Причина: <i>{reason}</i>")
-
+        
 async def run_awaiting_entry_phase(app):
     log.info(f"--- Mode: AWAITING_ENTRY for {state.get('last_signal', {}).get('pair')} ---")
     signal_time = state.get('last_signal', {}).get('timestamp', 0)
