@@ -95,15 +95,17 @@ exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
 PROMPT_ANALYZE_AND_SELECT = (
     "Ты — главный трейдер-аналитик. Твоя задача — проанализировать предоставленный список кандидатов и выбрать из них ОДИН лучший для торговли.\n\n"
     "**КРИТИЧЕСКИ ВАЖНО:** Забудь все, что ты знаешь об этих активах из своей базы знаний. Твой анализ должен быть основан **ИСКЛЮЧИТЕЛЬНО** на предоставленных ниже данных по каждому кандидату.\n\n"
-    "**ТВОЙ АЛГОРИТМ:**\n"
+    "**ТВОЙ АЛГОРИТМ ВЫБОРА:**\n"
     "1.  Проанализируй **каждого** кандидата в списке `candidates`.\n"
-    "2.  Сравни их между собой по совокупности факторов (соответствие тренду H1, сила ADX, значение RSI, чистота сигнала).\n"
-    "3.  **Ты ОБЯЗАН выбрать ОДНОГО, относительно лучшего кандидата**, даже если ни один из них не идеален.\n"
-    "4.  Для этого лучшего кандидата сгенерируй полный торговый сетап: логичный SL (за локальным экстремумом), TP (перед следующим уровнем) и убедись, что R:R >= 1.5.\n\n"
+    "2.  **Главный критерий — свежесть сигнала (`candles_since_cross`).** Отдавай абсолютный приоритет кандидатам со значением 0 или 1. Чем больше это число, тем хуже кандидат.\n"
+    "3.  **Вторичные критерии для сравнения:** Среди самых свежих сигналов выбери тот, у которого лучшая комбинация остальных факторов: соответствие тренду на H1, сила импульса (ADX), адекватный RSI (не в экстремальной зоне).\n"
+    "4.  **Обязательный выбор:** Основываясь на этих правилах, **ты ОБЯЗАН выбрать ОДНОГО, самого лучшего кандидата**.\n"
+    "5.  **Генерация сетапа:** Для этого лучшего кандидата сгенерируй полный торговый сетап: логичный SL (за локальным экстремумом), TP (перед следующим уровнем) и убедись, что R:R >= 1.5.\n\n"
     "**ТРЕБОВАНИЯ К ОТВЕТУ:**\n"
     "Твой ответ **обязательно** должен быть в формате **JSON** и содержать ТОЛЬКО сетап лучшего кандидата. Пример: "
-    "`{ 'pair': 'BTC/USDT:USDT', 'side': 'LONG', 'reason': 'Обоснование выбора', 'sl': 65100, 'tp': 67500 }`."
+    "`{ 'pair': 'BTC/USDT:USDT', 'side': 'LONG', 'reason': 'Свежее пересечение (0 свечей) с подтверждением...', 'sl': 65100, 'tp': 67500 }`."
 )
+
 PROMPT_MANAGE_POSITION = (
     "Ты — риск-менеджер. Ты ведешь открытую позицию {side} по {asset} от цены {entry_price}. "
     "Анализируй каждую новую свечу. Если позиция развивается по плану, ответь {'decision': 'HOLD'}. "
@@ -150,11 +152,10 @@ async def main_loop(app):
             await asyncio.sleep(60)
 
 async def run_searching_phase(app):
-    log.info("--- Mode: SEARCHING for Setups ---")
-    await broadcast_message(app, f"<b>Этап 1:</b> Ищу монеты с пересечением 9/21 EMA...")
+    log.info("--- Mode: SEARCHING for Fresh EMA Crossovers ---")
+    await broadcast_message(app, f"<b>Этап 1:</b> Ищу монеты со свежим пересечением 9/21 EMA...")
     pre_candidates = []
     try:
-        # ... (код поиска pre_candidates по пересечению остается таким же) ...
         tickers = await exchange.fetch_tickers()
         usdt_pairs = {s: t for s, t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume')}
         sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
@@ -167,23 +168,42 @@ async def run_searching_phase(app):
                 ohlcv_5m = await exchange.fetch_ohlcv(pair, timeframe='5m', limit=50)
                 df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 if len(df_5m) < 22: continue
-                df_5m.ta.ema(length=9, append=True); df_5m.ta.ema(length=21, append=True)
-                prev_5m = df_5m.iloc[-2]; last_5m = df_5m.iloc[-1]
-                ema_short = last_5m.get('EMA_9'); ema_long = last_5m.get('EMA_21')
-                prev_ema_short = prev_5m.get('EMA_9'); prev_ema_long = prev_5m.get('EMA_21')
-                if any(v is None for v in [ema_short, ema_long, prev_ema_short, prev_ema_long]): continue
-                
-                side = None
-                if prev_ema_short <= prev_ema_long and ema_short > ema_long: side = 'LONG'
-                elif prev_ema_short >= prev_ema_long and ema_short < ema_long: side = 'SHORT'
-                
-                if side:
-                    pre_candidates.append({"pair": pair, "side": side})
 
+                df_5m.ta.ema(length=9, append=True); df_5m.ta.ema(length=21, append=True)
+
+                # Ищем пересечение в последних 5 свечах (от самой свежей к старой)
+                for i in range(len(df_5m) - 1, len(df_5m) - 6, -1):
+                    if i < 1: break
+                    
+                    last = df_5m.iloc[i]
+                    prev = df_5m.iloc[i-1]
+                    
+                    ema_short = last.get('EMA_9'); ema_long = last.get('EMA_21')
+                    prev_ema_short = prev.get('EMA_9'); prev_ema_long = prev.get('EMA_21')
+                    if any(v is None for v in [ema_short, ema_long, prev_ema_short, prev_ema_long]): continue
+
+                    candles_since_cross = (len(df_5m) - 1) - i
+                    side = None
+                    
+                    # Проверяем, что на предыдущей свече пересечения еще не было
+                    if prev_ema_short <= prev_ema_long and ema_short > ema_long:
+                        side = 'LONG'
+                    elif prev_ema_short >= prev_ema_long and ema_short < ema_long:
+                        side = 'SHORT'
+                    
+                    if side:
+                        pre_candidates.append({
+                            "pair": pair, 
+                            "side": side,
+                            "candles_since_cross": candles_since_cross
+                        })
+                        log.info(f"Found pre-candidate: {pair}, Side: {side}, Freshness: {candles_since_cross} candles ago.")
+                        break # Нашли самое свежее пересечение, дальше не ищем
+                
                 await asyncio.sleep(0.5)
             except Exception as e:
                 log.warning(f"Could not process {pair} in initial scan: {e}")
-
+                
     except Exception as e:
         log.error(f"Critical error in Stage 1 (Indicator Scan): {e}", exc_info=True)
         return
