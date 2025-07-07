@@ -87,11 +87,11 @@ exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
 ATR_LEN = 14
 SL_ATR_MULTIPLIER = 1.0
 RR_RATIO = 2.0
+PROXIMITY_THRESHOLD = 0.002 # 0.2% - порог максимального сближения EMA
 
 # === LLM PROMPTS & FUNCTION ===
 PROMPT_FINAL_APPROVAL = (
-    "Ты — главный трейдер-аналитик. Тебе предоставлен список готовых торговых сетапов, уже рассчитанных по индикаторам.\n\n"
-    "ТВОЯ ЗАДАЧА:\n"
+    "Ты — главный трейдер-аналитик. Тебе предоставлен список кандидатов, у которых 9 и 21 EMA максимально сблизились и ГОТОВЯТСЯ к пересечению.\n\n"    "ТВОЯ ЗАДАЧА:\n"
     "1.  Проанализируй и сравни **каждого** кандидата в списке `candidates`.\n"
     "2.  **Ты ОБЯЗАН выбрать ОДНОГО, САМОГО ЛУЧШЕГО кандидата**, даже если ни один из них не идеален. Твой выбор должен быть основан на лучшей комбинации всех факторов: свежесть сигнала (`candles_since_cross`), соответствие глобальному тренду H1, сила импульса (ADX), адекватный RSI и отсутствие очевидных препятствий на графике.\n"
     "3.  Убедись, что у выбранного сетапа нет критических проблем.\n\n"
@@ -144,8 +144,8 @@ async def main_loop(app):
             log.error(f"Critical error in main_loop: {e}", exc_info=True)
 
 async def run_searching_phase(app):
-    log.info("--- Mode: SEARCHING for Best Setup in Batch ---")
-    await broadcast_message(app, f"<b>Этап 1:</b> Ищу монеты со свежим пересечением 9/21 EMA (не старше 2 свечей) среди топ-<b>{COIN_LIST_SIZE}</b>...")
+    log.info("--- Mode: SEARCHING for Imminent EMA Crossovers ---")
+    await broadcast_message(app, f"<b>Этап 1:</b> Ищу монеты с максимальным сближением 9/21 EMA...")
     
     pre_candidates = []
     try:
@@ -164,63 +164,60 @@ async def run_searching_phase(app):
 
                 df_5m.ta.ema(length=9, append=True)
                 df_5m.ta.ema(length=21, append=True)
-
-                for i in range(len(df_5m) - 1, len(df_5m) - 6, -1):
-                    if i < 1: break
-                    
-                    last_candle_data = df_5m.iloc[i]
-                    prev_candle_data = df_5m.iloc[i-1]
-                    
-                    ema_short = last_candle_data.get('EMA_9')
-                    ema_long = last_candle_data.get('EMA_21')
-                    prev_ema_short = prev_candle_data.get('EMA_9')
-                    prev_ema_long = prev_candle_data.get('EMA_21')
-
-                    if any(v is None for v in [ema_short, ema_long, prev_ema_short, prev_ema_long]): continue
-                    
-                    candles_since_cross = (len(df_5m) - 1) - i
-                    if candles_since_cross > 2:
-                        break 
-
-                    side = None
-                    if prev_ema_short <= prev_ema_long and ema_short > ema_long:
-                        side = 'LONG'
-                    elif prev_ema_short >= prev_ema_long and ema_short < ema_long:
-                        side = 'SHORT'
-                    
-                    if side:
-                        pre_candidates.append({"pair": pair, "side": side, "candles_since_cross": candles_since_cross})
-                        log.info(f"Found pre-candidate: {pair}, Side: {side}, Freshness: {candles_since_cross} candles ago.")
-                        break
                 
-                await asyncio.sleep(1.5) # Пауза для избежания бана от биржи
+                last_5m = df_5m.iloc[-1]
+                prev_5m = df_5m.iloc[-2]
+
+                ema_short = last_5m.get('EMA_9')
+                ema_long = last_5m.get('EMA_21')
+                prev_ema_short = prev_5m.get('EMA_9')
+                
+                if any(v is None for v in [ema_short, ema_long, prev_ema_short]): continue
+
+                # --- Новая логика "Упреждающего сигнала" ---
+                distance_pct = abs(ema_short - ema_long) / last_5m['close']
+                side = None
+
+                # Условие для LONG: 9 EMA НИЖЕ 21 EMA, но уже РАСТЕТ и очень близко
+                if ema_short < ema_long and ema_short > prev_ema_short and distance_pct < PROXIMITY_THRESHOLD:
+                    side = 'LONG'
+                
+                # Условие для SHORT: 9 EMA ВЫШЕ 21 EMA, но уже ПАДАЕТ и очень близко
+                elif ema_short > ema_long and ema_short < prev_ema_short and distance_pct < PROXIMITY_THRESHOLD:
+                    side = 'SHORT'
+                
+                if side:
+                    pre_candidates.append({"pair": pair, "side": side})
+                    log.info(f"Found pre-candidate (Imminent Crossover): {pair}, Side: {side}")
+                
+                await asyncio.sleep(1.5)
             except Exception as e:
                 log.warning(f"Could not process {pair} in initial scan: {e}")
+                
     except Exception as e:
         log.error(f"Critical error in Stage 1 (Indicator Scan): {e}", exc_info=True)
         return
 
     if not pre_candidates:
-        log.info("No candidates with EMA crossover found.")
-        await broadcast_message(app, "ℹ️ Сканирование завершено. Не найдено свежих пересечений EMA.")
+        log.info("No pre-candidates found.")
+        await broadcast_message(app, "ℹ️ Сканирование завершено. Не найдено монет, готовящихся к пересечению EMA.")
         return
 
-    await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Рассчитываю сетапы и собираю данные для LLM...")
+    # Этап 2 и 3: Сбор данных и выбор LLM (этот код уже из финальной версии и не требует изменений)
+    await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Рассчитываю сетапы и отправляю в LLM...")
     
     setups_for_llm = []
     try:
         for candidate in pre_candidates:
-            pair = candidate['pair']
-            side = candidate['side']
+            pair = candidate['pair']; side = candidate['side']
             log.info(f"--> Collecting deep data for {pair}...")
             try:
-                # Получаем данные с таймаутами для надежности
                 h1_task = exchange.fetch_ohlcv(pair, '1h', limit=100)
                 ohlcv_h1 = await asyncio.wait_for(h1_task, timeout=30.0)
                 
                 m5_task = exchange.fetch_ohlcv(pair, '5m', limit=100)
                 ohlcv_5m = await asyncio.wait_for(m5_task, timeout=30.0)
-                
+
                 df_h1 = pd.DataFrame(ohlcv_h1, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df_h1.ta.ema(length=50, append=True)
                 last_h1 = df_h1.iloc[-1]
@@ -240,7 +237,6 @@ async def run_searching_phase(app):
                 
                 setups_for_llm.append({
                     "pair": pair, "side": side, "entry_price": entry_price, "sl": sl, "tp": tp,
-                    "candles_since_cross": candidate['candles_since_cross'],
                     "h1_trend": "UP" if last_h1['close'] > ema_h1 else "DOWN",
                     "m5_adx": round(last_5m.get('ADX_14'), 2), "m5_rsi": round(last_5m.get('RSI_14'), 2)
                 })
@@ -263,7 +259,7 @@ async def run_searching_phase(app):
     log.info(f"LLM decision on batch: {llm_response}")
 
     if llm_response and llm_response.get('decision') != 'REJECT':
-        final_setup = llm_response # LLM возвращает сетап лучшего кандидата
+        final_setup = llm_response
         state['last_signal'] = final_setup
         state['last_signal']['timestamp'] = datetime.now().timestamp()
         state['mode'] = 'AWAITING_ENTRY'
@@ -271,17 +267,14 @@ async def run_searching_phase(app):
         
         await log_signal_to_gs(final_setup)
         
-        message = (f"🔔 <b>ЛУЧШИЙ СЕТАП!</b> 🔔\n\n"
-                   f"<b>Монета:</b> <code>{final_setup.get('pair')}</code>\n"
-                   f"<b>Направление:</b> <b>{final_setup.get('side')}</b>\n"
+        message = (f"🔔 <b>ЛУЧШИЙ СЕТАП!</b> 🔔\n\n<b>Монета:</b> <code>{final_setup.get('pair')}</code>\n<b>Направление:</b> <b>{final_setup.get('side')}</b>\n"
                    f"<b>Цена входа (расчетная):</b> <code>{final_setup.get('entry_price'):.6f}</code>\n"
-                   f"<b>Take Profit:</b> <code>{final_setup.get('tp'):.6f}</code>\n"
-                   f"<b>Stop Loss:</b> <code>{final_setup.get('sl'):.6f}</code>\n\n"
+                   f"<b>Take Profit:</b> <code>{final_setup.get('tp'):.6f}</code>\n<b>Stop Loss:</b> <code>{final_setup.get('sl'):.6f}</code>\n\n"
                    f"<b>Обоснование LLM:</b> <i>{final_setup.get('reason')}</i>\n\n"
                    f"👉 Откройте сделку и подтвердите вход командой <code>/entry</code>. Сетап актуален 20 минут.")
         await broadcast_message(app, message)
     else:
-        reason = llm_response.get('reason', 'Причина не указана.') if llm_response else "LLM не ответил."
+        reason = llm_response.get('reason', 'N/A') if llm_response else "LLM не ответил."
         await broadcast_message(app, f"ℹ️ Анализ завершен. LLM не выбрал ни одного достойного кандидата. Причина: <i>{reason}</i>")
         
 async def run_awaiting_entry_phase(app):
