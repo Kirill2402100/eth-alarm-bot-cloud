@@ -144,12 +144,10 @@ async def main_loop(app):
 
 async def run_searching_phase(app):
     log.info("--- Mode: SEARCHING for Fresh EMA Crossovers ---")
-    
-    # Исправлено: Одно-единственное, правильное сообщение для Этапа 1
-    await broadcast_message(app, f"<b>Этап 1:</b> Ищу пересечения EMA среди топ-<b>{COIN_LIST_SIZE}</b> монет (не старше 2 свечей)...")
-    
+    await broadcast_message(app, f"<b>Этап 1:</b> Ищу пересечения EMA среди топ-<b>{COIN_LIST_SIZE}</b> монет...")
     pre_candidates = []
     try:
+        # ... (Код поиска pre_candidates остается без изменений) ...
         tickers = await exchange.fetch_tickers()
         usdt_pairs = {s: t for s, t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume')}
         sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
@@ -181,53 +179,63 @@ async def run_searching_phase(app):
                     
                     if side:
                         pre_candidates.append({"pair": pair, "side": side})
-                        log.info(f"Found pre-candidate: {pair}, Side: {side}, Freshness: {candles_since_cross} candles ago.")
-                        break # Нашли самое свежее пересечение, дальше по этой монете не ищем
+                        log.info(f"Found pre-candidate: {pair}, Side: {side}")
+                        break 
                 
                 await asyncio.sleep(1.5)
             except Exception as e:
                 log.warning(f"Could not process {pair} in initial scan: {e}")
+
     except Exception as e:
         log.error(f"Critical error in Stage 1 (Indicator Scan): {e}", exc_info=True)
         return
 
     if not pre_candidates:
-        log.info("No candidates with EMA crossover found.")
-        await broadcast_message(app, "ℹ️ Сканирование завершено. Не найдено свежих пересечений EMA.")
-        return
+        log.info("No candidates with EMA crossover found."); return
 
-    # Исправлено: Сообщение для Этапа 2 отправляется здесь
-    await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Рассчитываю сетапы и отправляю в LLM...")
+    await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Собираю глубокие данные...")
     
     setups_for_llm = []
     try:
+        # ---> НАЧАЛО ИЗМЕНЕНИЙ В ЭТАПЕ 2 <---
         for candidate in pre_candidates:
             pair = candidate['pair']; side = candidate['side']
-            ohlcv_5m = await exchange.fetch_ohlcv(pair, '5m', limit=100)
-            df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_5m.ta.atr(length=ATR_LEN, append=True); df_5m.ta.rsi(length=14, append=True); df_5m.ta.adx(length=14, append=True)
-            last_5m = df_5m.iloc[-1]
-            
-            ohlcv_h1 = await exchange.fetch_ohlcv(pair, '1h', limit=100)
-            df_h1 = pd.DataFrame(ohlcv_h1, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_h1.ta.ema(length=50, append=True)
-            last_h1 = df_h1.iloc[-1]
+            log.info(f"--> Collecting deep data for {pair}...") # Логируем, какую монету обрабатываем
+            try:
+                # Устанавливаем таймаут на каждый запрос данных
+                h1_task = exchange.fetch_ohlcv(pair, '1h', limit=100)
+                ohlcv_h1 = await asyncio.wait_for(h1_task, timeout=30.0)
 
-            atr_value = last_5m.get(f'ATRr_{ATR_LEN}'); entry_price = last_5m['close']; ema_h1 = last_h1.get('EMA_50')
-            if any(v is None for v in [atr_value, entry_price, ema_h1]) or atr_value == 0: continue
+                m5_task = exchange.fetch_ohlcv(pair, '5m', limit=100)
+                ohlcv_5m = await asyncio.wait_for(m5_task, timeout=30.0)
 
-            risk_amount = atr_value * SL_ATR_MULTIPLIER
-            if side == 'LONG':
-                sl = entry_price - risk_amount; tp = entry_price + risk_amount * RR_RATIO
-            else: # SHORT
-                sl = entry_price + risk_amount; tp = entry_price - risk_amount * RR_RATIO
-            
-            setups_for_llm.append({
-                "pair": pair, "side": side, "entry_price": entry_price, "sl": sl, "tp": tp,
-                "h1_trend": "UP" if last_h1['close'] > ema_h1 else "DOWN",
-                "m5_adx": round(last_5m.get('ADX_14'), 2), "m5_rsi": round(last_5m.get('RSI_14'), 2)
-            })
-            await asyncio.sleep(0.5)
+                df_h1 = pd.DataFrame(ohlcv_h1, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df_h1.ta.ema(length=50, append=True)
+                last_h1 = df_h1.iloc[-1]
+
+                df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df_5m.ta.atr(length=ATR_LEN, append=True); df_5m.ta.rsi(length=14, append=True); df_5m.ta.adx(length=14, append=True)
+                last_5m = df_5m.iloc[-1]
+
+                atr_value = last_5m.get(f'ATRr_{ATR_LEN}'); entry_price = last_5m['close']; ema_h1 = last_h1.get('EMA_50')
+                if any(v is None for v in [atr_value, entry_price, ema_h1]) or atr_value == 0: continue
+
+                risk_amount = atr_value * SL_ATR_MULTIPLIER
+                if side == 'LONG':
+                    sl = entry_price - risk_amount; tp = entry_price + risk_amount * RR_RATIO
+                else: # SHORT
+                    sl = entry_price + risk_amount; tp = entry_price - risk_amount * RR_RATIO
+                
+                setups_for_llm.append({
+                    "pair": pair, "side": side, "entry_price": entry_price, "sl": sl, "tp": tp,
+                    "h1_trend": "UP" if last_h1['close'] > ema_h1 else "DOWN",
+                    "m5_adx": round(last_5m.get('ADX_14'), 2), "m5_rsi": round(last_5m.get('RSI_14'), 2)
+                })
+            except asyncio.TimeoutError:
+                log.warning(f"Timeout while fetching data for {pair}. Skipping.")
+            except Exception as e:
+                log.error(f"Error building setup for {pair}: {e}")
+        # ---> КОНЕЦ ИЗМЕНЕНИЙ <---
     except Exception as e:
         log.error(f"Critical error in Stage 2 (Deep Data): {e}", exc_info=True)
         return
@@ -235,6 +243,10 @@ async def run_searching_phase(app):
     if not setups_for_llm:
         await broadcast_message(app, "ℹ️ Не удалось подготовить данные для анализа."); return
         
+    await broadcast_message(app, f"<b>Этап 3:</b> Отправляю {len(setups_for_llm)} готовых сетапов в LLM для выбора лучшего...")
+    
+    # ... (остальная часть функции с вызовом LLM остается без изменений) ...
+    
     prompt_text = PROMPT_FINAL_APPROVAL + "\n\nКандидаты для выбора (JSON):\n" + json.dumps({"candidates": setups_for_llm})
     llm_response = await ask_llm(prompt_text)
     
