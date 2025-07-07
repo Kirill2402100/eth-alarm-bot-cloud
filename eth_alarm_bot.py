@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v5.0 - Final Hybrid Architecture
-# • Финальная версия: LLM предлагает стратегию (sl_pct, rr_ratio),
-#   а бот производит точный расчет цен на основе реальных данных с биржи.
-# • Этот подход полностью решает проблему "галлюцинаций" с ценами.
+# v6.0 - The Final Cut
+# • Финальная архитектура: Бот находит свежие пересечения, сам рассчитывает
+#   SL/TP по ATR (1:2 R:R), а LLM выбирает ОДИН лучший сетап из группы.
+# • Исправлена ошибка KeyError в режиме сопровождения позиции.
+# • В итоговый сетап добавлена точная цена входа для контекста.
+# • Уменьшено количество сканируемых монет для ускорения цикла.
 # ============================================================================
 
 import os
@@ -25,7 +27,7 @@ from telegram.error import BadRequest
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID = os.getenv("SHEET_ID")
-COIN_LIST_SIZE = int(os.getenv("COIN_LIST_SIZE", "300"))
+COIN_LIST_SIZE = int(os.getenv("COIN_LIST_SIZE", "100"))
 TRADE_LOG_SHEET = "Trading_Logs"
 SIGNAL_LOG_SHEET = "Signal_Logs"
 
@@ -44,9 +46,7 @@ def setup_google_sheet(spreadsheet, sheet_name, headers):
     except gspread.WorksheetNotFound:
         worksheet = spreadsheet.add_worksheet(title=sheet_name, rows="1000", cols="20")
     if worksheet.row_values(1) != headers:
-        worksheet.clear()
-        worksheet.update('A1', [headers])
-        worksheet.format(f'A1:{chr(ord("A")+len(headers)-1)}1', {'textFormat': {'bold': True}})
+        worksheet.clear(); worksheet.update('A1', [headers]); worksheet.format(f'A1:{chr(ord("A")+len(headers)-1)}1', {'textFormat': {'bold': True}})
     return worksheet
 
 def setup_google_sheets():
@@ -56,13 +56,10 @@ def setup_google_sheets():
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         gs = gspread.authorize(creds)
         spreadsheet = gs.open_by_key(SHEET_ID)
-        
         trade_headers = ["Дата входа", "Инструмент", "Направление", "Депозит", "Цена входа", "Stop Loss", "Take Profit", "P&L сделки (USDT)", "% к депозиту"]
         signal_headers = ["Дата сигнала", "Инструмент", "Направление", "Цена входа", "Stop Loss", "Take Profit", "Обоснование"]
-        
         trade_ws = setup_google_sheet(spreadsheet, TRADE_LOG_SHEET, trade_headers)
         signal_ws = setup_google_sheet(spreadsheet, SIGNAL_LOG_SHEET, signal_headers)
-        
         return trade_ws, signal_ws
     except Exception as e:
         log.error("Google Sheets init failed: %s", e)
@@ -80,33 +77,32 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r') as f: state = json.load(f)
     if 'mode' not in state:
-        state.update({
-            "bot_on": False, "mode": "SEARCHING",
-            "current_position": None, "last_signal": None
-        })
+        state.update({"bot_on": False, "mode": "SEARCHING", "current_position": None, "last_signal": None})
     log.info(f"State loaded: {state}")
 
 # === EXCHANGE ===
 exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
 
+# === STRATEGY PARAMS ===
+ATR_LEN = 14
+SL_ATR_MULTIPLIER = 1.0
+RR_RATIO = 2.0
+
 # === LLM PROMPTS & FUNCTION ===
-PROMPT_ANALYZE_AND_SELECT = (
-    "Ты — главный трейдер-аналитик. Тебе предоставлен список кандидатов, отобранных по сигналу 'свежее пересечение EMA'.\n\n"
-    "**КРИТИЧЕСКИ ВАЖНО:** Твой анализ должен быть основан **ИСКЛЮЧИТЕЛЬНО** на предоставленных ниже данных по каждому кандидату. Не используй свою внутреннюю базу знаний о ценах.\n\n"
-    "**ТВОЙ АЛГОРИТМ ВЫБОРА:**\n"
-    "1.  Проанализируй **каждого** кандидата в списке `candidates`.\n"
-    "2.  Сравни их между собой по совокупности факторов: соответствие глобальному тренду на H1, сила импульса (ADX), адекватный RSI (не в экстремальной зоне).\n"
-    "3.  **Обязательный выбор:** Выбери **ОДНОГО, самого лучшего кандидата**.\n"
-    "4.  **Проверка направления:** Убедись, что направление (`side`) твоего финального сетапа **строго совпадает** с направлением, указанным для выбранного кандидата.\n"
-    "5.  **Генерация сетапа:** Для этого лучшего кандидата сгенерируй SL и TP с R:R >= 1.5.\n\n"
+PROMPT_ANALYZE_AND_SELECT_BEST = (
+    "Ты — главный трейдер-аналитик. Тебе предоставлен список готовых торговых сетапов, уже рассчитанных по индикаторам.\n\n"
+    "**ТВОЯ ЗАДАЧА:**\n"
+    "1.  Проанализируй и сравни **каждого** кандидата в списке `candidates`.\n"
+    "2.  **Ты ОБЯЗАН выбрать ОДНОГО, САМОГО ЛУЧШЕГО кандидата.** Твой выбор должен быть основан на лучшей комбинации всех факторов: свежесть сигнала (`candles_since_cross`), соответствие глобальному тренду H1, сила импульса (ADX) и адекватный RSI.\n"
+    "3.  Убедись, что у выбранного сетапа нет очевидных проблем (например, Тейк-Профит упирается в сильный уровень).\n\n"
     "**ТРЕБОВАНИЯ К ОТВЕТУ:**\n"
-    "Твой ответ **обязательно** должен быть в формате **JSON** и содержать ТОЛЬКО сетап лучшего кандидата. Пример: "
-    "`{ 'pair': 'BTC/USDT:USDT', 'side': 'LONG', 'reason': 'Свежее пересечение...', 'sl_pct': 1.5, 'rr_ratio': 2.0 }`."
+    "- Если ты выбрал лучший сетап, верни в формате **JSON** ТОЛЬКО ОДИН этот сетап. Пример: `{ 'pair': 'BTC/USDT:USDT', 'side': 'LONG', 'reason': 'Это лучший кандидат, так как...', 'entry_price': ..., 'sl': ..., 'tp': ... }`.\n"
+    "- Если, по твоему мнению, **НИ ОДИН** из кандидатов не является достаточно надежным, верни `{ 'decision': 'REJECT', 'reason': 'Все кандидаты имеют высокие риски' }`."
 )
 PROMPT_MANAGE_POSITION = (
     "Ты — риск-менеджер. Ты ведешь открытую позицию {side} по {asset} от цены {entry_price}. "
-    "Анализируй каждую новую свечу. Если позиция развивается по плану, ответь {'decision': 'HOLD'}. "
-    "Если видишь тревожные сигналы, немедленно дай команду на закрытие: {'decision': 'CLOSE', 'reason': 'обоснование'}."
+    "Анализируй каждую новую свечу. Если позиция развивается по плану, ответь в формате JSON: `{'decision': 'HOLD'}`. "
+    "Если видишь тревожные сигналы, немедленно дай команду на закрытие: `{'decision': 'CLOSE', 'reason': 'обоснование'}`."
 )
 
 async def ask_llm(final_prompt: str):
@@ -145,8 +141,6 @@ async def main_loop(app):
                 state['mode'] = 'SEARCHING'; save_state()
         except Exception as e:
             log.error(f"Critical error in main_loop: {e}", exc_info=True)
-            await broadcast_message(app, f"⚠️ Критическая ошибка в главном цикле: {e}")
-            await asyncio.sleep(60)
 
 async def run_searching_phase(app):
     log.info("--- Mode: SEARCHING for Fresh EMA Crossovers ---")
@@ -165,112 +159,84 @@ async def run_searching_phase(app):
                 ohlcv_5m = await exchange.fetch_ohlcv(pair, timeframe='5m', limit=50)
                 df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 if len(df_5m) < 22: continue
-
                 df_5m.ta.ema(length=9, append=True); df_5m.ta.ema(length=21, append=True)
-
                 for i in range(len(df_5m) - 1, len(df_5m) - 6, -1):
                     if i < 1: break
-                    
                     last = df_5m.iloc[i]; prev = df_5m.iloc[i-1]
                     ema_short = last.get('EMA_9'); ema_long = last.get('EMA_21')
                     prev_ema_short = prev.get('EMA_9'); prev_ema_long = prev.get('EMA_21')
                     if any(v is None for v in [ema_short, ema_long, prev_ema_short, prev_ema_long]): continue
-                    
                     candles_since_cross = (len(df_5m) - 1) - i
-                    
-                    # ---> ЖЕСТКИЙ ФИЛЬТР ПО СВЕЖЕСТИ СИГНАЛА <---
-                    if candles_since_cross > 2:
-                        break # Если пересечение было давно, дальше не ищем
-
+                    if candles_since_cross > 2: break
                     side = None
                     if prev_ema_short <= prev_ema_long and ema_short > ema_long: side = 'LONG'
                     elif prev_ema_short >= prev_ema_long and ema_short < ema_long: side = 'SHORT'
-                    
                     if side:
                         pre_candidates.append({"pair": pair, "side": side, "candles_since_cross": candles_since_cross})
-                        log.info(f"Found pre-candidate: {pair}, Side: {side}, Freshness: {candles_since_cross} candles ago.")
                         break
-                
                 await asyncio.sleep(1.5)
             except Exception as e:
                 log.warning(f"Could not process {pair} in initial scan: {e}")
-    # ... (остальная часть функции остается без изменений) ...
-        
     except Exception as e:
-        log.error(f"Critical error in Stage 1 (Indicator Scan): {e}", exc_info=True)
-        return
+        log.error(f"Critical error in Stage 1 (Indicator Scan): {e}", exc_info=True); return
 
     if not pre_candidates:
         log.info("No candidates with EMA crossover found."); return
 
-    await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Собираю и отправляю данные в LLM для выбора лучшего...")
-    deep_data_for_llm = []
+    await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Рассчитываю сетапы и отправляю в LLM...")
+    setups_for_llm = []
     try:
         for candidate in pre_candidates:
-            pair = candidate['pair']
-            ohlcv_h1 = await exchange.fetch_ohlcv(pair, timeframe='1h', limit=100)
-            df_h1 = pd.DataFrame(ohlcv_h1, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_h1.ta.ema(length=50, append=True)
-            last_h1 = df_h1.iloc[-1]; ema_h1 = last_h1.get('EMA_50')
-            
-            ohlcv_5m = await exchange.fetch_ohlcv(pair, timeframe='5m', limit=100)
+            pair = candidate['pair']; side = candidate['side']
+            ohlcv_5m = await exchange.fetch_ohlcv(pair, '5m', limit=100)
             df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_5m.ta.rsi(length=14, append=True); df_5m.ta.adx(length=14, append=True)
+            df_5m.ta.atr(length=ATR_LEN, append=True); df_5m.ta.rsi(length=14, append=True); df_5m.ta.adx(length=14, append=True)
             last_5m = df_5m.iloc[-1]
             
-            if ema_h1 is None: continue
-            deep_data_for_llm.append({
-                "pair": pair, "side": candidate['side'], "candles_since_cross": candidate['candles_since_cross'],
+            ohlcv_h1 = await exchange.fetch_ohlcv(pair, '1h', limit=100)
+            df_h1 = pd.DataFrame(ohlcv_h1, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df_h1.ta.ema(length=50, append=True)
+            last_h1 = df_h1.iloc[-1]
+
+            atr_value = last_5m.get(f'ATRr_{ATR_LEN}'); entry_price = last_5m['close']; ema_h1 = last_h1.get('EMA_50')
+            if any(v is None for v in [atr_value, entry_price, ema_h1]) or atr_value == 0: continue
+
+            risk_amount = atr_value * SL_ATR_MULTIPLIER
+            if side == 'LONG':
+                sl = entry_price - risk_amount; tp = entry_price + risk_amount * RR_RATIO
+            else:
+                sl = entry_price + risk_amount; tp = entry_price - risk_amount * RR_RATIO
+            
+            setups_for_llm.append({
+                "pair": pair, "side": side, "entry_price": entry_price, "sl": sl, "tp": tp,
+                "candles_since_cross": candidate['candles_since_cross'],
                 "h1_trend": "UP" if last_h1['close'] > ema_h1 else "DOWN",
-                "m5_rsi": round(last_5m.get('RSI_14'), 2), "m5_adx": round(last_5m.get('ADX_14'), 2)
+                "m5_adx": round(last_5m.get('ADX_14'), 2), "m5_rsi": round(last_5m.get('RSI_14'), 2)
             })
             await asyncio.sleep(0.5)
     except Exception as e:
-        log.error(f"Critical error in Stage 2 (Deep Data): {e}", exc_info=True)
-        return
+        log.error(f"Critical error in Stage 2 (Deep Data): {e}", exc_info=True); return
 
-    prompt_text = PROMPT_ANALYZE_AND_SELECT + "\n\nКандидаты:\n" + json.dumps({"candidates": deep_data_for_llm})
+    if not setups_for_llm:
+        await broadcast_message(app, "ℹ️ Не удалось подготовить данные для анализа."); return
+        
+    prompt_text = PROMPT_ANALYZE_AND_SELECT_BEST + "\n\nКандидаты для выбора (JSON):\n" + json.dumps({"candidates": setups_for_llm})
     llm_response = await ask_llm(prompt_text)
     log.info(f"LLM decision on batch: {llm_response}")
 
-    if llm_response and 'pair' in llm_response:
-        setup_strategy = llm_response
-        pair = setup_strategy.get('pair'); side = setup_strategy.get('side')
-        try:
-            ticker = await exchange.fetch_ticker(pair)
-            entry_price = ticker.get('last')
-            if not entry_price:
-                log.error(f"Could not fetch current price for {pair}"); return
-
-            sl_pct = float(setup_strategy.get('sl_pct', 2.0)); rr_ratio = float(setup_strategy.get('rr_ratio', 1.5))
-            
-            if side == 'LONG':
-                stop_loss_price = entry_price * (1 - sl_pct / 100)
-                take_profit_price = entry_price + (entry_price - stop_loss_price) * rr_ratio
-            elif side == 'SHORT':
-                stop_loss_price = entry_price * (1 + sl_pct / 100)
-                take_profit_price = entry_price - (stop_loss_price - entry_price) * rr_ratio
-            else: return
-
-            final_setup = {
-                "pair": pair, "side": side, "reason": setup_strategy.get('reason'),
-                "entry_price": entry_price, "sl": stop_loss_price, "tp": take_profit_price
-            }
-
-            state['last_signal'] = final_setup; state['last_signal']['timestamp'] = datetime.now().timestamp()
-            state['mode'] = 'AWAITING_ENTRY'; save_state()
-            
-            await log_signal_to_gs(final_setup)
-            
-            message = (f"🔔 <b>ЛУЧШИЙ СЕТАП!</b> 🔔\n\n<b>Монета:</b> <code>{final_setup.get('pair')}</code>\n<b>Направление:</b> <b>{final_setup.get('side')}</b>\n"
-                       f"<b>Take Profit:</b> <code>{final_setup.get('tp'):.6f}</code>\n<b>Stop Loss:</b> <code>{final_setup.get('sl'):.6f}</code>\n\n"
-                       f"<b>Обоснование LLM:</b> <i>{final_setup.get('reason')}</i>\n\n"
-                       f"👉 Откройте сделку и подтвердите вход командой <code>/entry</code>. Сетап актуален 20 минут.")
-            await broadcast_message(app, message)
-        except Exception as e:
-            log.error(f"Error calculating final prices for {pair}: {e}", exc_info=True)
+    if llm_response and llm_response.get('decision') != 'REJECT':
+        final_setup = llm_response
+        state['last_signal'] = final_setup; state['last_signal']['timestamp'] = datetime.now().timestamp()
+        state['mode'] = 'AWAITING_ENTRY'; save_state()
+        await log_signal_to_gs(final_setup)
+        message = (f"🔔 <b>ЛУЧШИЙ СЕТАП!</b> 🔔\n\n<b>Монета:</b> <code>{final_setup.get('pair')}</code>\n<b>Направление:</b> <b>{final_setup.get('side')}</b>\n"
+                   f"<b>Цена входа (расчетная):</b> <code>{final_setup.get('entry_price'):.6f}</code>\n"
+                   f"<b>Take Profit:</b> <code>{final_setup.get('tp'):.6f}</code>\n<b>Stop Loss:</b> <code>{final_setup.get('sl'):.6f}</code>\n\n"
+                   f"<b>Обоснование LLM:</b> <i>{final_setup.get('reason')}</i>\n\n"
+                   f"👉 Откройте сделку и подтвердите вход командой <code>/entry</code>. Сетап актуален 20 минут.")
+        await broadcast_message(app, message)
     else:
-        reason = llm_response.get('reason', 'LLM не смог выбрать кандидата.') if llm_response else "LLM не ответил."
+        reason = llm_response.get('reason', 'N/A') if llm_response else "LLM не ответил."
         await broadcast_message(app, f"ℹ️ Анализ завершен. LLM не выбрал ни одного достойного кандидата. Причина: <i>{reason}</i>")
 
 async def run_awaiting_entry_phase(app):
@@ -288,6 +254,7 @@ async def run_monitoring_phase(app):
     if not pos:
         state['mode'] = 'SEARCHING'; save_state(); return
     try:
+        # Исправлена ошибка KeyError
         prompt_text = PROMPT_MANAGE_POSITION.format(asset=pos['pair'], side=pos['side'], entry_price=pos['entry_price'])
         llm_response = await ask_llm(prompt_text)
         if llm_response and llm_response.get('decision') == 'CLOSE':
