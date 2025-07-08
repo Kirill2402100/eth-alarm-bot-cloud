@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v7.3 - Concurrent Architecture with Original Candidate Logic
-# • Restored the original, stricter logic for candidate selection.
-# • The bot now only considers crossovers that are no more than 2 candles old.
-# • This ensures only the freshest setups are sent to the LLM, matching the
-#   original bot's behavior and potentially increasing signal quality.
-# • The core autonomous architecture and 3-stage notifications remain.
+# v7.4 - Final Version with Comprehensive Data Logging
+# • CRITICAL FIX: The bot now logs all key indicator values (RSI, ADX, H1 Trend)
+#   at the moment of entry into the Google Sheet for every trade.
+# • The Google Sheet now contains all necessary data for deep analysis.
+# • The core autonomous architecture, concurrent monitoring, and verbose
+#   notifications are all preserved. This version is ready for data collection.
 # ============================================================================
 
 import os
@@ -48,12 +48,14 @@ def setup_google_sheets():
         gs = gspread.authorize(creds)
         spreadsheet = gs.open_by_key(SHEET_ID)
         
+        # --- ОБНОВЛЕННЫЕ ЗАГОЛОВКИ ДЛЯ ПОЛНОГО АНАЛИЗА ---
         headers = [
             "Signal_ID", "Pair", "Side", "Status", "Entry_Time_UTC", "Exit_Time_UTC",
-            "Entry_Price", "Exit_Price", "SL_Price", "TP_Price", "Reason"
+            "Entry_Price", "Exit_Price", "SL_Price", "TP_Price",
+            "Entry_RSI", "Entry_ADX", "H1_Trend_at_Entry", "LLM_Reason"
         ]
         
-        sheet_name = "Autonomous_Trade_Log"
+        sheet_name = "Autonomous_Trade_Log_v2" # Новое имя, чтобы не конфликтовать со старым
         try:
             worksheet = spreadsheet.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
@@ -72,7 +74,7 @@ def setup_google_sheets():
 TRADE_LOG_WS = setup_google_sheets()
 
 # === STATE MANAGEMENT ===
-STATE_FILE = "concurrent_bot_state_v3.json"
+STATE_FILE = "concurrent_bot_state_v4.json"
 state = {}
 def save_state():
     with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
@@ -146,27 +148,18 @@ async def signal_scanner_loop(app):
                     df.ta.ema(length=9, append=True)
                     df.ta.ema(length=21, append=True)
                     
-                    # --- ВОССТАНОВЛЕННАЯ ЛОГИКА ОТБОРА ---
-                    # Ищем пересечение только в последних свечах
                     for i in range(len(df) - 1, len(df) - 6, -1):
                         if i < 1: break
-                        
-                        # Проверяем, что пересечение не слишком старое
                         candles_since_cross = (len(df) - 1) - i
-                        if candles_since_cross > 2:
-                            break # Если пересечение старше 2 свечей, прекращаем поиск для этой монеты
-
+                        if candles_since_cross > 2: break
                         last, prev = df.iloc[i], df.iloc[i-1]
                         side = None
-                        if prev.get('EMA_9') <= prev.get('EMA_21') and last.get('EMA_9') > last.get('EMA_21'):
-                            side = 'LONG'
-                        elif prev.get('EMA_9') >= prev.get('EMA_21') and last.get('EMA_9') < last.get('EMA_21'):
-                            side = 'SHORT'
-                        
+                        if prev.get('EMA_9') <= prev.get('EMA_21') and last.get('EMA_9') > last.get('EMA_21'): side = 'LONG'
+                        elif prev.get('EMA_9') >= prev.get('EMA_21') and last.get('EMA_9') < last.get('EMA_21'): side = 'SHORT'
                         if side:
                             pre_candidates.append({"pair": pair, "side": side})
                             log.info(f"Found pre-candidate: {pair}, Side: {side}, {candles_since_cross} candles ago.")
-                            break # Нашли пересечение, переходим к следующей монете
+                            break
                 except Exception: continue
             
             if not pre_candidates:
@@ -264,12 +257,14 @@ async def position_monitor_loop(app):
                 if outcome:
                     log.info(f"MONITOR: Signal {signal['signal_id']} for {signal['pair']} closed by {outcome} at price {current_price}.")
                     
+                    # --- ИСПРАВЛЕННОЕ ЛОГИРОВАНИЕ ---
                     if TRADE_LOG_WS:
                         try:
                             row = [
                                 signal.get('signal_id'), signal.get('pair'), signal.get('side'), outcome,
                                 signal.get('entry_time_utc'), datetime.now(timezone.utc).isoformat(),
                                 signal.get('entry_price'), current_price, signal.get('sl'), signal.get('tp'),
+                                signal.get('rsi'), signal.get('adx'), signal.get('h1_trend'), # Добавляем данные индикаторов
                                 signal.get('reason', 'N/A')
                             ]
                             await asyncio.to_thread(TRADE_LOG_WS.append_row, row, value_input_option='USER_ENTERED')
