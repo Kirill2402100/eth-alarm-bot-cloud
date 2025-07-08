@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v7.5 - MFE & MAE Tracking for SL/TP Optimization
-# • The bot now tracks Maximum Favorable Excursion (MFE) and Maximum
-#   Adverse Excursion (MAE) for every open position.
-# • When a trade is closed, the final MFE and MAE prices are logged to
-#   the Google Sheet, creating a powerful dataset for analysis.
-# • This allows for data-driven optimization of Stop Loss and Take Profit
-#   levels based on real market behavior.
+# v7.6 - Dynamic Price Formatting
+# • Added a `format_price` helper function to dynamically format prices
+#   based on their magnitude, preventing low-priced assets from showing as 0.
+# • All user-facing messages in Telegram (/status, new signal, close alert)
+#   now use this function for clear and accurate price display.
+# • This fixes the issue of unreadable signals for "shitcoins".
 # ============================================================================
 
 import os
@@ -39,6 +38,20 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("bot")
 for n in ("httpx", "httpcore"): logging.getLogger(n).setLevel(logging.WARNING)
 
+# === HELPER FUNCTION ===
+def format_price(price):
+    """Dynamically formats the price for readability in Telegram messages."""
+    if price is None: return "N/A"
+    
+    if price > 10:
+        return f"{price:,.2f}"
+    elif price > 0.1:
+        return f"{price:.4f}"
+    elif price > 0.001:
+        return f"{price:.6f}"
+    else:
+        return f"{price:.8f}"
+
 # === GOOGLE SHEETS ===
 TRADE_LOG_WS = None
 def setup_google_sheets():
@@ -49,15 +62,14 @@ def setup_google_sheets():
         gs = gspread.authorize(creds)
         spreadsheet = gs.open_by_key(SHEET_ID)
         
-        # --- ДОБАВЛЕНЫ СТОЛБЦЫ MFE И MAE ---
         headers = [
             "Signal_ID", "Pair", "Side", "Status", "Entry_Time_UTC", "Exit_Time_UTC",
             "Entry_Price", "Exit_Price", "SL_Price", "TP_Price",
-            "MFE_Price", "MAE_Price", # Макс. прибыль и макс. просадка
+            "MFE_Price", "MAE_Price",
             "Entry_RSI", "Entry_ADX", "H1_Trend_at_Entry", "LLM_Reason"
         ]
         
-        sheet_name = "Autonomous_Trade_Log_v3" # Новое имя, чтобы не конфликтовать
+        sheet_name = "Autonomous_Trade_Log_v3"
         try:
             worksheet = spreadsheet.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
@@ -134,7 +146,6 @@ async def signal_scanner_loop(app):
                 continue
 
             await broadcast_message(app, f"<b>Этап 1:</b> Ищу пересечения EMA (не старше 2 свечей) среди топ-<b>{COIN_LIST_SIZE}</b> монет...")
-            # ... (логика поиска кандидатов без изменений)
             pre_candidates = []
             tickers = await exchange.fetch_tickers()
             usdt_pairs = {s: t for s, t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume')}
@@ -171,7 +182,6 @@ async def signal_scanner_loop(app):
                 continue
 
             await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Рассчитываю сетапы...")
-            # ... (логика сбора данных для LLM без изменений)
             setups_for_llm = []
             for candidate in pre_candidates:
                 try:
@@ -206,12 +216,11 @@ async def signal_scanner_loop(app):
             final_setup = await ask_llm(prompt_text)
 
             if final_setup and final_setup.get('pair'):
-                # --- ИНИЦИАЛИЗАЦИЯ MFE/MAE ---
                 entry_p = final_setup.get('entry_price')
                 final_setup['signal_id'] = str(uuid.uuid4())[:8]
                 final_setup['entry_time_utc'] = datetime.now(timezone.utc).isoformat()
-                final_setup['mfe_price'] = entry_p # Начальное MFE = цена входа
-                final_setup['mae_price'] = entry_p # Начальное MAE = цена входа
+                final_setup['mfe_price'] = entry_p
+                final_setup['mae_price'] = entry_p
                 
                 state['monitored_signals'].append(final_setup)
                 save_state()
@@ -219,8 +228,8 @@ async def signal_scanner_loop(app):
                 log.info(f"SCANNER: LLM chose {final_setup['pair']}. Added to monitoring list.")
                 message = (f"🔔 <b>ЛУЧШИЙ СЕТАП! (ID: {final_setup['signal_id']})</b> 🔔\n\n"
                            f"<b>Монета:</b> <code>{final_setup.get('pair')}</code>\n<b>Направление:</b> <b>{final_setup.get('side')}</b>\n"
-                           f"<b>Цена входа (расчетная):</b> <code>{final_setup.get('entry_price'):.6f}</code>\n"
-                           f"<b>Take Profit:</b> <code>{final_setup.get('tp'):.6f}</code>\n<b>Stop Loss:</b> <code>{final_setup.get('sl'):.6f}</code>\n\n"
+                           f"<b>Цена входа (расчетная):</b> <code>{format_price(final_setup.get('entry_price'))}</code>\n"
+                           f"<b>Take Profit:</b> <code>{format_price(final_setup.get('tp'))}</code>\n<b>Stop Loss:</b> <code>{format_price(final_setup.get('sl'))}</code>\n\n"
                            f"<b>Обоснование LLM:</b> <i>{final_setup.get('reason')}</i>\n\n"
                            f"<i>Бот автоматически отслеживает эту позицию.</i>")
                 await broadcast_message(app, message)
@@ -255,13 +264,12 @@ async def position_monitor_loop(app):
 
                 side, sl, tp = signal['side'], signal['sl'], signal['tp']
                 
-                # --- ЛОГИКА ОБНОВЛЕНИЯ MFE/MAE ---
                 if side == 'LONG':
                     if current_price > signal['mfe_price']: signal['mfe_price'] = current_price
                     if current_price < signal['mae_price']: signal['mae_price'] = current_price
                 elif side == 'SHORT':
-                    if current_price < signal['mfe_price']: signal['mfe_price'] = current_price # Для шорта MFE - это мин. цена
-                    if current_price > signal['mae_price']: signal['mae_price'] = current_price # Для шорта MAE - это макс. цена
+                    if current_price < signal['mfe_price']: signal['mfe_price'] = current_price
+                    if current_price > signal['mae_price']: signal['mae_price'] = current_price
 
                 outcome = None
                 if side == 'LONG' and current_price >= tp: outcome = "TP_HIT"
@@ -274,12 +282,11 @@ async def position_monitor_loop(app):
                     
                     if TRADE_LOG_WS:
                         try:
-                            # --- ЛОГИРОВАНИЕ С MFE/MAE ---
                             row = [
                                 signal.get('signal_id'), signal.get('pair'), signal.get('side'), outcome,
                                 signal.get('entry_time_utc'), datetime.now(timezone.utc).isoformat(),
                                 signal.get('entry_price'), current_price, signal.get('sl'), signal.get('tp'),
-                                signal.get('mfe_price'), signal.get('mae_price'), # Записываем итоговые значения
+                                signal.get('mfe_price'), signal.get('mae_price'),
                                 signal.get('rsi'), signal.get('adx'), signal.get('h1_trend'),
                                 signal.get('reason', 'N/A')
                             ]
@@ -292,7 +299,7 @@ async def position_monitor_loop(app):
                                f"<b>ID:</b> {signal['signal_id']}\n"
                                f"<b>Монета:</b> <code>{signal['pair']}</code>\n"
                                f"<b>Направление:</b> {signal['side']}\n"
-                               f"<b>Цена выхода:</b> <code>{current_price:.6f}</code>")
+                               f"<b>Цена выхода:</b> <code>{format_price(current_price)}</code>")
                     await broadcast_message(app, message)
                     
                     closed_signals_ids.append(signal['signal_id'])
@@ -345,7 +352,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg += "<b><u>Активные сигналы:</u></b>\n"
         for signal in state['monitored_signals']:
             msg += (f"  - <code>{signal['pair']}</code> <b>{signal['side']}</b> (ID: {signal['signal_id']})\n"
-                    f"    TP: <code>{signal['tp']:.4f}</code>, SL: <code>{signal['sl']:.4f}</code>\n")
+                    f"    TP: <code>{format_price(signal['tp'])}</code>, SL: <code>{format_price(signal['sl'])}</code>\n")
     else:
         msg += "<i>Нет активных сигналов для отслеживания.</i>"
         
