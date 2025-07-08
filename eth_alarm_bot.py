@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v7.2 - Concurrent Architecture with Full Verbose Notifications
-# • Restored the 3-stage user notifications for the scanning process.
-# • The bot now informs about:
-#   1. Scan start.
-#   2. Number of candidates found and sent to LLM.
-#   3. Final choice from LLM.
-# • The core logic of concurrent monitoring and smart pause remains unchanged.
+# v7.3 - Concurrent Architecture with Original Candidate Logic
+# • Restored the original, stricter logic for candidate selection.
+# • The bot now only considers crossovers that are no more than 2 candles old.
+# • This ensures only the freshest setups are sent to the LLM, matching the
+#   original bot's behavior and potentially increasing signal quality.
+# • The core autonomous architecture and 3-stage notifications remain.
 # ============================================================================
 
 import os
@@ -73,7 +72,7 @@ def setup_google_sheets():
 TRADE_LOG_WS = setup_google_sheets()
 
 # === STATE MANAGEMENT ===
-STATE_FILE = "concurrent_bot_state_v2.json"
+STATE_FILE = "concurrent_bot_state_v3.json"
 state = {}
 def save_state():
     with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
@@ -130,9 +129,7 @@ async def signal_scanner_loop(app):
                 await asyncio.sleep(60 * 5)
                 continue
 
-            # --- ВОЗВРАЩАЕМ 3-Х ЭТАПНЫЕ УВЕДОМЛЕНИЯ ---
-            # Этап 1: Уведомление о начале сканирования
-            await broadcast_message(app, f"<b>Этап 1:</b> Ищу пересечения EMA среди топ-<b>{COIN_LIST_SIZE}</b> монет...")
+            await broadcast_message(app, f"<b>Этап 1:</b> Ищу пересечения EMA (не старше 2 свечей) среди топ-<b>{COIN_LIST_SIZE}</b> монет...")
             pre_candidates = []
             tickers = await exchange.fetch_tickers()
             usdt_pairs = {s: t for s, t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume')}
@@ -149,13 +146,27 @@ async def signal_scanner_loop(app):
                     df.ta.ema(length=9, append=True)
                     df.ta.ema(length=21, append=True)
                     
+                    # --- ВОССТАНОВЛЕННАЯ ЛОГИКА ОТБОРА ---
+                    # Ищем пересечение только в последних свечах
                     for i in range(len(df) - 1, len(df) - 6, -1):
                         if i < 1: break
+                        
+                        # Проверяем, что пересечение не слишком старое
+                        candles_since_cross = (len(df) - 1) - i
+                        if candles_since_cross > 2:
+                            break # Если пересечение старше 2 свечей, прекращаем поиск для этой монеты
+
                         last, prev = df.iloc[i], df.iloc[i-1]
+                        side = None
                         if prev.get('EMA_9') <= prev.get('EMA_21') and last.get('EMA_9') > last.get('EMA_21'):
-                            pre_candidates.append({"pair": pair, "side": "LONG"}); break
+                            side = 'LONG'
                         elif prev.get('EMA_9') >= prev.get('EMA_21') and last.get('EMA_9') < last.get('EMA_21'):
-                            pre_candidates.append({"pair": pair, "side": "SHORT"}); break
+                            side = 'SHORT'
+                        
+                        if side:
+                            pre_candidates.append({"pair": pair, "side": side})
+                            log.info(f"Found pre-candidate: {pair}, Side: {side}, {candles_since_cross} candles ago.")
+                            break # Нашли пересечение, переходим к следующей монете
                 except Exception: continue
             
             if not pre_candidates:
@@ -164,7 +175,6 @@ async def signal_scanner_loop(app):
                 await asyncio.sleep(60 * 20)
                 continue
 
-            # Этап 2: Уведомление о количестве кандидатов
             await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Рассчитываю сетапы и отправляю в LLM...")
             setups_for_llm = []
             for candidate in pre_candidates:
@@ -196,7 +206,6 @@ async def signal_scanner_loop(app):
                 await asyncio.sleep(60 * 20)
                 continue
 
-            # Этап 3: Уведомление о финальном выборе
             await broadcast_message(app, f"<b>Этап 3:</b> Отправляю {len(setups_for_llm)} готовых сетапов в LLM для выбора лучшего...")
             prompt_text = PROMPT_FINAL_APPROVAL + "\n\nКандидаты для выбора (JSON):\n" + json.dumps({"candidates": setups_for_llm})
             final_setup = await ask_llm(prompt_text)
