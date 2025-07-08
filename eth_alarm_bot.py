@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v7.4 - Final Version with Comprehensive Data Logging
-# • CRITICAL FIX: The bot now logs all key indicator values (RSI, ADX, H1 Trend)
-#   at the moment of entry into the Google Sheet for every trade.
-# • The Google Sheet now contains all necessary data for deep analysis.
-# • The core autonomous architecture, concurrent monitoring, and verbose
-#   notifications are all preserved. This version is ready for data collection.
+# v7.5 - MFE & MAE Tracking for SL/TP Optimization
+# • The bot now tracks Maximum Favorable Excursion (MFE) and Maximum
+#   Adverse Excursion (MAE) for every open position.
+# • When a trade is closed, the final MFE and MAE prices are logged to
+#   the Google Sheet, creating a powerful dataset for analysis.
+# • This allows for data-driven optimization of Stop Loss and Take Profit
+#   levels based on real market behavior.
 # ============================================================================
 
 import os
@@ -48,14 +49,15 @@ def setup_google_sheets():
         gs = gspread.authorize(creds)
         spreadsheet = gs.open_by_key(SHEET_ID)
         
-        # --- ОБНОВЛЕННЫЕ ЗАГОЛОВКИ ДЛЯ ПОЛНОГО АНАЛИЗА ---
+        # --- ДОБАВЛЕНЫ СТОЛБЦЫ MFE И MAE ---
         headers = [
             "Signal_ID", "Pair", "Side", "Status", "Entry_Time_UTC", "Exit_Time_UTC",
             "Entry_Price", "Exit_Price", "SL_Price", "TP_Price",
+            "MFE_Price", "MAE_Price", # Макс. прибыль и макс. просадка
             "Entry_RSI", "Entry_ADX", "H1_Trend_at_Entry", "LLM_Reason"
         ]
         
-        sheet_name = "Autonomous_Trade_Log_v2" # Новое имя, чтобы не конфликтовать со старым
+        sheet_name = "Autonomous_Trade_Log_v3" # Новое имя, чтобы не конфликтовать
         try:
             worksheet = spreadsheet.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
@@ -74,7 +76,7 @@ def setup_google_sheets():
 TRADE_LOG_WS = setup_google_sheets()
 
 # === STATE MANAGEMENT ===
-STATE_FILE = "concurrent_bot_state_v4.json"
+STATE_FILE = "concurrent_bot_state_v5.json"
 state = {}
 def save_state():
     with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
@@ -132,6 +134,7 @@ async def signal_scanner_loop(app):
                 continue
 
             await broadcast_message(app, f"<b>Этап 1:</b> Ищу пересечения EMA (не старше 2 свечей) среди топ-<b>{COIN_LIST_SIZE}</b> монет...")
+            # ... (логика поиска кандидатов без изменений)
             pre_candidates = []
             tickers = await exchange.fetch_tickers()
             usdt_pairs = {s: t for s, t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume')}
@@ -163,12 +166,12 @@ async def signal_scanner_loop(app):
                 except Exception: continue
             
             if not pre_candidates:
-                log.info("SCANNER: No fresh crossovers found.")
                 await broadcast_message(app, "ℹ️ Сканирование завершено. Не найдено свежих пересечений EMA.")
                 await asyncio.sleep(60 * 20)
                 continue
 
-            await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Рассчитываю сетапы и отправляю в LLM...")
+            await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Рассчитываю сетапы...")
+            # ... (логика сбора данных для LLM без изменений)
             setups_for_llm = []
             for candidate in pre_candidates:
                 try:
@@ -194,18 +197,22 @@ async def signal_scanner_loop(app):
                 except Exception as e: log.warning(f"SCANNER: Could not process candidate {candidate['pair']}: {e}")
 
             if not setups_for_llm:
-                log.info("SCANNER: Failed to build any setups for LLM.")
-                await broadcast_message(app, "ℹ️ Не удалось подготовить данные для анализа. Начинаю новый цикл.")
+                await broadcast_message(app, "ℹ️ Не удалось подготовить данные для анализа.")
                 await asyncio.sleep(60 * 20)
                 continue
 
-            await broadcast_message(app, f"<b>Этап 3:</b> Отправляю {len(setups_for_llm)} готовых сетапов в LLM для выбора лучшего...")
+            await broadcast_message(app, f"<b>Этап 3:</b> Отправляю {len(setups_for_llm)} готовых сетапов в LLM...")
             prompt_text = PROMPT_FINAL_APPROVAL + "\n\nКандидаты для выбора (JSON):\n" + json.dumps({"candidates": setups_for_llm})
             final_setup = await ask_llm(prompt_text)
 
             if final_setup and final_setup.get('pair'):
+                # --- ИНИЦИАЛИЗАЦИЯ MFE/MAE ---
+                entry_p = final_setup.get('entry_price')
                 final_setup['signal_id'] = str(uuid.uuid4())[:8]
                 final_setup['entry_time_utc'] = datetime.now(timezone.utc).isoformat()
+                final_setup['mfe_price'] = entry_p # Начальное MFE = цена входа
+                final_setup['mae_price'] = entry_p # Начальное MAE = цена входа
+                
                 state['monitored_signals'].append(final_setup)
                 save_state()
                 
@@ -247,8 +254,16 @@ async def position_monitor_loop(app):
                 if not current_price: continue
 
                 side, sl, tp = signal['side'], signal['sl'], signal['tp']
-                outcome = None
                 
+                # --- ЛОГИКА ОБНОВЛЕНИЯ MFE/MAE ---
+                if side == 'LONG':
+                    if current_price > signal['mfe_price']: signal['mfe_price'] = current_price
+                    if current_price < signal['mae_price']: signal['mae_price'] = current_price
+                elif side == 'SHORT':
+                    if current_price < signal['mfe_price']: signal['mfe_price'] = current_price # Для шорта MFE - это мин. цена
+                    if current_price > signal['mae_price']: signal['mae_price'] = current_price # Для шорта MAE - это макс. цена
+
+                outcome = None
                 if side == 'LONG' and current_price >= tp: outcome = "TP_HIT"
                 elif side == 'LONG' and current_price <= sl: outcome = "SL_HIT"
                 elif side == 'SHORT' and current_price <= tp: outcome = "TP_HIT"
@@ -257,14 +272,15 @@ async def position_monitor_loop(app):
                 if outcome:
                     log.info(f"MONITOR: Signal {signal['signal_id']} for {signal['pair']} closed by {outcome} at price {current_price}.")
                     
-                    # --- ИСПРАВЛЕННОЕ ЛОГИРОВАНИЕ ---
                     if TRADE_LOG_WS:
                         try:
+                            # --- ЛОГИРОВАНИЕ С MFE/MAE ---
                             row = [
                                 signal.get('signal_id'), signal.get('pair'), signal.get('side'), outcome,
                                 signal.get('entry_time_utc'), datetime.now(timezone.utc).isoformat(),
                                 signal.get('entry_price'), current_price, signal.get('sl'), signal.get('tp'),
-                                signal.get('rsi'), signal.get('adx'), signal.get('h1_trend'), # Добавляем данные индикаторов
+                                signal.get('mfe_price'), signal.get('mae_price'), # Записываем итоговые значения
+                                signal.get('rsi'), signal.get('adx'), signal.get('h1_trend'),
                                 signal.get('reason', 'N/A')
                             ]
                             await asyncio.to_thread(TRADE_LOG_WS.append_row, row, value_input_option='USER_ENTERED')
