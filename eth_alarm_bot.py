@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v7.1 - Concurrent Architecture with Smart Pause
-# • Bot is now fully autonomous. No more /entry or /exit commands.
-# • Two independent loops:
-#   1. Signal Scanner: Finds the best setup via LLM. Pauses if the monitoring buffer is full.
-#   2. Position Monitor: Tracks all active signals for SL/TP hits every 60s.
-# • All outcomes are automatically logged to Google Sheets.
-# • Added a limit for max concurrent monitored signals.
+# v7.2 - Concurrent Architecture with Full Verbose Notifications
+# • Restored the 3-stage user notifications for the scanning process.
+# • The bot now informs about:
+#   1. Scan start.
+#   2. Number of candidates found and sent to LLM.
+#   3. Final choice from LLM.
+# • The core logic of concurrent monitoring and smart pause remains unchanged.
 # ============================================================================
 
 import os
@@ -29,7 +29,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID = os.getenv("SHEET_ID")
 COIN_LIST_SIZE = int(os.getenv("COIN_LIST_SIZE", "100"))
-MAX_CONCURRENT_SIGNALS = int(os.getenv("MAX_CONCURRENT_SIGNALS", "10")) # Лимит одновременных сделок
+MAX_CONCURRENT_SIGNALS = int(os.getenv("MAX_CONCURRENT_SIGNALS", "10"))
 
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_API_URL = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
@@ -73,7 +73,7 @@ def setup_google_sheets():
 TRADE_LOG_WS = setup_google_sheets()
 
 # === STATE MANAGEMENT ===
-STATE_FILE = "concurrent_bot_state.json"
+STATE_FILE = "concurrent_bot_state_v2.json"
 state = {}
 def save_state():
     with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
@@ -83,7 +83,7 @@ def load_state():
         with open(STATE_FILE, 'r') as f: state = json.load(f)
     
     if 'bot_on' not in state:
-        state.update({"bot_on": False, "monitored_signals": []}) # Основное хранилище - список
+        state.update({"bot_on": False, "monitored_signals": []})
     log.info(f"State loaded: {len(state.get('monitored_signals', []))} signals are being monitored.")
 
 # === EXCHANGE & STRATEGY PARAMS ===
@@ -102,7 +102,6 @@ PROMPT_FINAL_APPROVAL = (
     "Добавь в него поле `reason` с кратким обоснованием твоего выбора."
 )
 async def ask_llm(final_prompt: str):
-    # ... (код без изменений)
     if not LLM_API_KEY: return None
     payload = {"model": LLM_MODEL_ID, "messages": [{"role": "user", "content": final_prompt}], "temperature": 0.4, "response_format": {"type": "json_object"}}
     headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
@@ -124,21 +123,16 @@ async def ask_llm(final_prompt: str):
 
 # --- LOOP 1: Signal Scanner ---
 async def signal_scanner_loop(app):
-    """Ищет новые сигналы, ставя себя на паузу, если достигнут лимит."""
     while state.get('bot_on', False):
         try:
-            # --- ИЗМЕНЕННАЯ ЛОГИКА ПАУЗЫ ---
-            # Проверяем лимит ПЕРЕД началом сканирования
             if len(state.get("monitored_signals", [])) >= MAX_CONCURRENT_SIGNALS:
                 log.warning(f"Max concurrent signals ({MAX_CONCURRENT_SIGNALS}) reached. Scanner is pausing for 5 minutes.")
-                await asyncio.sleep(60 * 5) # Ждем 5 минут и проверяем снова
-                continue # Перезапускаем цикл, чтобы снова проверить лимит, а не ждать 20 минут
+                await asyncio.sleep(60 * 5)
+                continue
 
-            # Если лимит не достигнут, выполняем полный цикл сканирования
-            log.info("--- SCANNER: Starting new scan cycle. ---")
-            
-            # Этап 1: Поиск кандидатов
-            log.info("SCANNER: Searching for fresh EMA crossovers...")
+            # --- ВОЗВРАЩАЕМ 3-Х ЭТАПНЫЕ УВЕДОМЛЕНИЯ ---
+            # Этап 1: Уведомление о начале сканирования
+            await broadcast_message(app, f"<b>Этап 1:</b> Ищу пересечения EMA среди топ-<b>{COIN_LIST_SIZE}</b> монет...")
             pre_candidates = []
             tickers = await exchange.fetch_tickers()
             usdt_pairs = {s: t for s, t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume')}
@@ -165,12 +159,13 @@ async def signal_scanner_loop(app):
                 except Exception: continue
             
             if not pre_candidates:
-                log.info("SCANNER: No fresh crossovers found. Waiting 20 minutes.")
+                log.info("SCANNER: No fresh crossovers found.")
+                await broadcast_message(app, "ℹ️ Сканирование завершено. Не найдено свежих пересечений EMA.")
                 await asyncio.sleep(60 * 20)
                 continue
 
-            # Этап 2: Сбор данных и расчет SL/TP
-            log.info(f"SCANNER: Found {len(pre_candidates)} candidates. Collecting deep data...")
+            # Этап 2: Уведомление о количестве кандидатов
+            await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Рассчитываю сетапы и отправляю в LLM...")
             setups_for_llm = []
             for candidate in pre_candidates:
                 try:
@@ -196,12 +191,13 @@ async def signal_scanner_loop(app):
                 except Exception as e: log.warning(f"SCANNER: Could not process candidate {candidate['pair']}: {e}")
 
             if not setups_for_llm:
-                log.info("SCANNER: Failed to build any setups for LLM. Waiting 20 minutes.")
+                log.info("SCANNER: Failed to build any setups for LLM.")
+                await broadcast_message(app, "ℹ️ Не удалось подготовить данные для анализа. Начинаю новый цикл.")
                 await asyncio.sleep(60 * 20)
                 continue
 
-            # Этап 3: Выбор LLM
-            log.info(f"SCANNER: Sending {len(setups_for_llm)} setups to LLM for final choice...")
+            # Этап 3: Уведомление о финальном выборе
+            await broadcast_message(app, f"<b>Этап 3:</b> Отправляю {len(setups_for_llm)} готовых сетапов в LLM для выбора лучшего...")
             prompt_text = PROMPT_FINAL_APPROVAL + "\n\nКандидаты для выбора (JSON):\n" + json.dumps({"candidates": setups_for_llm})
             final_setup = await ask_llm(prompt_text)
 
@@ -212,7 +208,7 @@ async def signal_scanner_loop(app):
                 save_state()
                 
                 log.info(f"SCANNER: LLM chose {final_setup['pair']}. Added to monitoring list.")
-                message = (f"🔔 <b>НОВЫЙ СИГНАЛ! (ID: {final_setup['signal_id']})</b> 🔔\n\n"
+                message = (f"🔔 <b>ЛУЧШИЙ СЕТАП! (ID: {final_setup['signal_id']})</b> 🔔\n\n"
                            f"<b>Монета:</b> <code>{final_setup.get('pair')}</code>\n<b>Направление:</b> <b>{final_setup.get('side')}</b>\n"
                            f"<b>Цена входа (расчетная):</b> <code>{final_setup.get('entry_price'):.6f}</code>\n"
                            f"<b>Take Profit:</b> <code>{final_setup.get('tp'):.6f}</code>\n<b>Stop Loss:</b> <code>{final_setup.get('sl'):.6f}</code>\n\n"
@@ -220,22 +216,21 @@ async def signal_scanner_loop(app):
                            f"<i>Бот автоматически отслеживает эту позицию.</i>")
                 await broadcast_message(app, message)
             else:
-                log.info("SCANNER: LLM rejected all candidates.")
+                reason = final_setup.get('reason', 'N/A') if final_setup else "LLM не ответил."
+                await broadcast_message(app, f"ℹ️ Анализ завершен. LLM не выбрал ни одного достойного кандидата. Причина: <i>{reason}</i>")
 
-            # После полного цикла сканирования ждем 20 минут
             log.info("--- SCANNER: Full scan cycle finished. Waiting 20 minutes. ---")
             await asyncio.sleep(60 * 20)
 
         except Exception as e:
             log.error(f"CRITICAL ERROR in Signal Scanner Loop: {e}", exc_info=True)
-            await asyncio.sleep(60 * 5) # Пауза в случае критической ошибки
+            await asyncio.sleep(60 * 5)
 
 # --- LOOP 2: Position Monitor ---
 async def position_monitor_loop(app):
-    """Проверяет все активные сигналы на предмет закрытия по SL/TP."""
     while state.get('bot_on', False):
         if not state.get('monitored_signals'):
-            await asyncio.sleep(30) # Нет активных сигналов, проверяем реже
+            await asyncio.sleep(30)
             continue
         
         log.info(f"--- MONITOR: Checking {len(state['monitored_signals'])} active signals... ---")
@@ -290,7 +285,7 @@ async def position_monitor_loop(app):
             save_state()
             log.info(f"MONITOR: Removed {len(closed_signals_ids)} closed signals from state.")
 
-        await asyncio.sleep(60) # Проверяем позиции раз в минуту
+        await asyncio.sleep(60)
 
 # === COMMANDS & LIFECYCLE ===
 async def broadcast_message(app, text):
