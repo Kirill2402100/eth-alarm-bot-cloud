@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v7.6 - Dynamic Price Formatting
-# • Added a `format_price` helper function to dynamically format prices
-#   based on their magnitude, preventing low-priced assets from showing as 0.
-# • All user-facing messages in Telegram (/status, new signal, close alert)
-#   now use this function for clear and accurate price display.
-# • This fixes the issue of unreadable signals for "shitcoins".
+# v8.0 - Strategy v2.0 Implementation
+# • Implemented all improvements based on the v1.0 data analysis.
+# • ADX Filter: Candidates with ADX < 25 are now automatically rejected.
+# • H1 Trend Filter: LLM prompt updated to give absolute priority to trades
+#   that align with the H1 trend.
+# • New Risk/Reward: The RR_RATIO is now set to 1.8 for the new experiment.
+# • New Data Collection: The bot now calculates and logs Bollinger Bands
+#   data for future analysis, writing to a new 'v4' log sheet.
 # ============================================================================
 
 import os
@@ -40,17 +42,11 @@ for n in ("httpx", "httpcore"): logging.getLogger(n).setLevel(logging.WARNING)
 
 # === HELPER FUNCTION ===
 def format_price(price):
-    """Dynamically formats the price for readability in Telegram messages."""
     if price is None: return "N/A"
-    
-    if price > 10:
-        return f"{price:,.2f}"
-    elif price > 0.1:
-        return f"{price:.4f}"
-    elif price > 0.001:
-        return f"{price:.6f}"
-    else:
-        return f"{price:.8f}"
+    if price > 10: return f"{price:,.2f}"
+    elif price > 0.1: return f"{price:.4f}"
+    elif price > 0.001: return f"{price:.6f}"
+    else: return f"{price:.8f}"
 
 # === GOOGLE SHEETS ===
 TRADE_LOG_WS = None
@@ -62,14 +58,17 @@ def setup_google_sheets():
         gs = gspread.authorize(creds)
         spreadsheet = gs.open_by_key(SHEET_ID)
         
+        # --- НОВЫЕ ЗАГОЛОВКИ ДЛЯ АНАЛИЗА v2.0 ---
         headers = [
             "Signal_ID", "Pair", "Side", "Status", "Entry_Time_UTC", "Exit_Time_UTC",
             "Entry_Price", "Exit_Price", "SL_Price", "TP_Price",
             "MFE_Price", "MAE_Price",
-            "Entry_RSI", "Entry_ADX", "H1_Trend_at_Entry", "LLM_Reason"
+            "Entry_RSI", "Entry_ADX", "H1_Trend_at_Entry",
+            "Entry_BB_Position", # Новый столбец для Полос Боллинджера
+            "LLM_Reason"
         ]
         
-        sheet_name = "Autonomous_Trade_Log_v3"
+        sheet_name = "Autonomous_Trade_Log_v4" # Новый лист для чистоты данных
         try:
             worksheet = spreadsheet.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
@@ -88,7 +87,7 @@ def setup_google_sheets():
 TRADE_LOG_WS = setup_google_sheets()
 
 # === STATE MANAGEMENT ===
-STATE_FILE = "concurrent_bot_state_v5.json"
+STATE_FILE = "concurrent_bot_state_v6.json"
 state = {}
 def save_state():
     with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
@@ -96,7 +95,6 @@ def load_state():
     global state
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r') as f: state = json.load(f)
-    
     if 'bot_on' not in state:
         state.update({"bot_on": False, "monitored_signals": []})
     log.info(f"State loaded: {len(state.get('monitored_signals', []))} signals are being monitored.")
@@ -106,13 +104,15 @@ exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
 TIMEFRAME_ENTRY = os.getenv("TF_ENTRY", "15m")
 ATR_LEN = 14
 SL_ATR_MULTIPLIER = 1.0
-RR_RATIO = 2.0
+RR_RATIO = 1.8 # ИЗМЕНЕНИЕ №3: Новое соотношение Риск/Прибыль
 
 # === LLM PROMPT ===
 PROMPT_FINAL_APPROVAL = (
     "Ты — главный трейдер-аналитик. Тебе предоставлен список кандидатов, у которых 9 и 21 EMA на 15-минутном графике недавно пересеклись. "
     "Твоя задача — выбрать ОДИН, САМЫЙ ЛУЧШИЙ сетап для входа в сделку. "
-    "Оценивай силу тренда на H1, ADX, RSI. Выбери самый перспективный вариант. "
+    "Оценивай силу тренда (ADX), RSI и глобальный тренд H1. "
+    # ИЗМЕНЕНИЕ №2: Усиление фильтра H1 тренда
+    "ОТДАВАЙ АБСОЛЮТНЫЙ ПРИОРИТЕТ кандидатам, направление которых (`side`) совпадает с глобальным трендом (`h1_trend`). "
     "Твой ответ ОБЯЗАТЕЛЬНО должен быть в формате JSON и содержать полный объект выбранного тобой лучшего кандидата. "
     "Добавь в него поле `reason` с кратким обоснованием твоего выбора."
 )
@@ -190,24 +190,42 @@ async def signal_scanner_loop(app):
                     ohlcv_entry = await exchange.fetch_ohlcv(pair, TIMEFRAME_ENTRY, limit=100)
                     
                     df_h1 = pd.DataFrame(ohlcv_h1, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']); df_h1.ta.ema(length=50, append=True)
-                    df_entry = pd.DataFrame(ohlcv_entry, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']); df_entry.ta.atr(length=ATR_LEN, append=True); df_entry.ta.rsi(length=14, append=True); df_entry.ta.adx(length=14, append=True)
+                    df_entry = pd.DataFrame(ohlcv_entry, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    # ИЗМЕНЕНИЕ №4: Добавляем расчет Полос Боллинджера
+                    df_entry.ta.bbands(length=20, std=2, append=True)
+                    df_entry.ta.atr(length=ATR_LEN, append=True); df_entry.ta.rsi(length=14, append=True); df_entry.ta.adx(length=14, append=True)
                     
                     last_entry, last_h1 = df_entry.iloc[-1], df_h1.iloc[-1]
+                    
+                    # ИЗМЕНЕНИЕ №1: Фильтр по ADX
+                    adx_value = last_entry.get('ADX_14')
+                    if adx_value is None or adx_value < 25:
+                        log.info(f"Candidate {pair} rejected due to low ADX: {adx_value}")
+                        continue
+
                     atr_value, entry_price = last_entry.get(f'ATRr_{ATR_LEN}'), last_entry['close']
                     if any(v is None for v in [atr_value, entry_price]) or atr_value == 0: continue
                     
+                    # Определяем положение цены относительно Полос Боллинджера
+                    bb_upper = last_entry.get('BBU_20_2.0')
+                    bb_lower = last_entry.get('BBL_20_2.0')
+                    bb_pos = "Inside"
+                    if entry_price > bb_upper: bb_pos = "Above_Upper"
+                    elif entry_price < bb_lower: bb_pos = "Below_Lower"
+
                     risk = atr_value * SL_ATR_MULTIPLIER
                     sl, tp = (entry_price - risk, entry_price + risk * RR_RATIO) if side == 'LONG' else (entry_price + risk, entry_price - risk * RR_RATIO)
                     
                     setups_for_llm.append({
                         "pair": pair, "side": side, "entry_price": entry_price, "sl": sl, "tp": tp,
                         "h1_trend": "UP" if last_h1['close'] > last_h1.get('EMA_50') else "DOWN",
-                        "adx": round(last_entry.get('ADX_14'), 2), "rsi": round(last_entry.get('RSI_14'), 2)
+                        "adx": round(adx_value, 2), "rsi": round(last_entry.get('RSI_14'), 2),
+                        "bb_pos": bb_pos # Добавляем новые данные для LLM
                     })
                 except Exception as e: log.warning(f"SCANNER: Could not process candidate {candidate['pair']}: {e}")
 
             if not setups_for_llm:
-                await broadcast_message(app, "ℹ️ Не удалось подготовить данные для анализа.")
+                await broadcast_message(app, "ℹ️ Не удалось подготовить данные для анализа (все кандидаты отфильтрованы).")
                 await asyncio.sleep(60 * 20)
                 continue
 
@@ -288,6 +306,7 @@ async def position_monitor_loop(app):
                                 signal.get('entry_price'), current_price, signal.get('sl'), signal.get('tp'),
                                 signal.get('mfe_price'), signal.get('mae_price'),
                                 signal.get('rsi'), signal.get('adx'), signal.get('h1_trend'),
+                                signal.get('bb_pos'), # Записываем новые данные
                                 signal.get('reason', 'N/A')
                             ]
                             await asyncio.to_thread(TRADE_LOG_WS.append_row, row, value_input_option='USER_ENTERED')
@@ -329,7 +348,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not state.get('bot_on'):
         state['bot_on'] = True
         save_state()
-        await update.message.reply_text("✅ Бот запущен в автономном режиме. Начинаю поиск и мониторинг.")
+        await update.message.reply_text("✅ Бот v2.0 запущен. Начинаю сбор данных с новыми фильтрами.")
         asyncio.create_task(signal_scanner_loop(ctx.application))
         asyncio.create_task(position_monitor_loop(ctx.application))
     else:
@@ -367,7 +386,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    log.info("Autonomous Bot starting...")
+    log.info("Autonomous Bot v2.0 starting...")
     if state.get('bot_on', False):
         asyncio.create_task(signal_scanner_loop(app))
         asyncio.create_task(position_monitor_loop(app))
