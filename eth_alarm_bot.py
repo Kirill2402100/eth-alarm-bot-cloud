@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v8.4 - Strategy v2.3 (Stable Trend Filter)
-# • Added H1 Trend Stability Filter: The H1 trend condition (e.g., for UP:
-#   EMA_9 > EMA_21 > EMA_50) must now be true for the last 3 consecutive
-#   H1 candles to be considered valid, preventing entries on weak bounces.
+# v8.5 - Strategy v2.4 (Architectural Optimization)
+# • Refactored the scanner loop to filter "on the fly". The H1 stable trend
+#   check is now performed immediately after an M15 crossover is found.
+#   Only candidates that pass both filters are added to the pre-candidate list.
+#   This ensures a high-quality pool for the LLM and prevents "empty" cycles.
 # ============================================================================
 
 import os
@@ -25,7 +26,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID = os.getenv("SHEET_ID")
-COIN_LIST_SIZE = int(os.getenv("COIN_LIST_SIZE", "100"))
+COIN_LIST_SIZE = int(os.getenv("COIN_LIST_SIZE", "200"))
 MAX_CONCURRENT_SIGNALS = int(os.getenv("MAX_CONCURRENT_SIGNALS", "10"))
 ANOMALOUS_CANDLE_MULTIPLIER = 3.0
 COOLDOWN_HOURS = 4 # Время "охлаждения" монеты в часах
@@ -142,101 +143,96 @@ async def signal_scanner_loop(app):
                 await asyncio.sleep(60 * 5)
                 continue
             
-            # Очистка старых записей из списка охлаждения
             now_ts = datetime.now(timezone.utc).timestamp()
             cooldown_list = state.get('cooldown_list', {})
             state['cooldown_list'] = {p: ts for p, ts in cooldown_list.items() if now_ts - ts < (COOLDOWN_HOURS * 3600)}
 
-            await broadcast_message(app, f"<b>Этап 1:</b> Ищу пересечения EMA (не старше 2 свечей) среди топ-<b>{COIN_LIST_SIZE}</b> монет...")
+            # ИЗМЕНЕНИЕ №9: Теперь pre_candidates - это список полностью проверенных монет
+            await broadcast_message(app, f"<b>Этап 1:</b> Ищу до 10 качественных сетапов (M15 кросс + стабильный тренд H1) среди топ-<b>{COIN_LIST_SIZE}</b> монет...")
             pre_candidates = []
+            
             tickers = await exchange.fetch_tickers()
             usdt_pairs = {s: t for s, t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume')}
             sorted_pairs = sorted(usdt_pairs.items(), key=lambda item: item[1]['quoteVolume'], reverse=True)
             coin_list = [item[0] for item in sorted_pairs[:COIN_LIST_SIZE]]
             
             for pair in coin_list:
-                if len(pre_candidates) >= 10: break
+                if len(pre_candidates) >= 10:
+                    log.info("Found 10 pre-qualified candidates. Stopping initial scan.")
+                    break
                 if not state.get('bot_on'): return
                 if pair in state.get('cooldown_list', {}):
-                    log.info(f"Pair {pair} is on cooldown. Skipping.")
                     continue
+
                 try:
-                    ohlcv = await exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME_ENTRY, limit=50)
-                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    if len(df) < 22: continue
-                    df.ta.ema(length=9, append=True)
-                    df.ta.ema(length=21, append=True)
-                    df.ta.atr(length=ATR_LEN, append=True)
+                    # 1. Быстрая проверка пересечения на M15
+                    ohlcv_m15 = await exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME_ENTRY, limit=50)
+                    df_m15 = pd.DataFrame(ohlcv_m15, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    if len(df_m15) < 22: continue
+                    df_m15.ta.ema(length=9, append=True)
+                    df_m15.ta.ema(length=21, append=True)
+                    df_m15.ta.atr(length=ATR_LEN, append=True)
                     
-                    for i in range(len(df) - 1, len(df) - 6, -1):
+                    side = None
+                    for i in range(len(df_m15) - 1, len(df_m15) - 4, -1):
                         if i < 1: break
-                        candles_since_cross = (len(df) - 1) - i
-                        if candles_since_cross > 2: break
-                        last, prev = df.iloc[i], df.iloc[i-1]
+                        last, prev = df_m15.iloc[i], df_m15.iloc[i-1]
                         
                         candle_range = last['high'] - last['low']
                         atr_on_signal = last.get(f'ATRr_{ATR_LEN}')
                         if atr_on_signal and candle_range > (atr_on_signal * ANOMALOUS_CANDLE_MULTIPLIER):
-                            log.info(f"Pre-candidate {pair} rejected due to Anomalous Candle.")
                             break
 
-                        side = None
                         if prev.get('EMA_9') <= prev.get('EMA_21') and last.get('EMA_9') > last.get('EMA_21'): side = 'LONG'
                         elif prev.get('EMA_9') >= prev.get('EMA_21') and last.get('EMA_9') < last.get('EMA_21'): side = 'SHORT'
-                        if side:
-                            pre_candidates.append({"pair": pair, "side": side})
-                            log.info(f"Found pre-candidate: {pair}, Side: {side}, {candles_since_cross} candles ago.")
-                            break
-                except Exception: continue
+                        
+                        if side: break # Нашли пересечение, выходим для проверки тренда H1
+                    
+                    if not side: continue # Если пересечения не найдено, идем к следующей монете
+
+                    # 2. Если пересечение найдено, проверяем тренд на H1 "на лету"
+                    ohlcv_h1 = await exchange.fetch_ohlcv(pair, '1h', limit=100)
+                    df_h1 = pd.DataFrame(ohlcv_h1, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    if len(df_h1) < 53: continue
+                    df_h1.ta.ema(length=9, append=True); df_h1.ta.ema(length=21, append=True); df_h1.ta.ema(length=50, append=True)
+                    
+                    recent_h1_candles = df_h1.iloc[-3:]
+                    if len(recent_h1_candles) < 3: continue
+
+                    is_stable_up = all(row.get('EMA_9') > row.get('EMA_21') and row.get('EMA_21') > row.get('EMA_50') for _, row in recent_h1_candles.iterrows())
+                    is_stable_down = all(row.get('EMA_9') < row.get('EMA_21') and row.get('EMA_21') < row.get('EMA_50') for _, row in recent_h1_candles.iterrows())
+
+                    h1_trend_ok = (side == 'LONG' and is_stable_up) or (side == 'SHORT' and is_stable_down)
+
+                    # 3. Если ОБА условия выполнены, добавляем в кандидаты
+                    if h1_trend_ok:
+                        pre_candidates.append({"pair": pair, "side": side, "h1_trend": "UP" if is_stable_up else "DOWN"})
+                        log.info(f"Found QUALIFIED candidate: {pair}, Side: {side}. Total candidates: {len(pre_candidates)}")
+                    
+                except Exception as e:
+                    log.warning(f"Error processing {pair} in Stage 1: {e}")
+                    continue
             
             if not pre_candidates:
-                await broadcast_message(app, "ℹ️ Сканирование завершено. Не найдено свежих пересечений EMA.")
-                await asyncio.sleep(60 * 20)
+                await broadcast_message(app, "ℹ️ Сканирование завершено. Не найдено ни одного сетапа, соответствующего всем критериям.")
+                await asyncio.sleep(60 * 15)
                 continue
 
-            await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Рассчитываю сетапы и фильтрую...")
-            all_setups = []
+            # Этап 2 теперь - это просто сбор доп. данных для уже качественных кандидатов
+            await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} качественных кандидатов. Собираю доп. данные для LLM...")
+            setups_for_llm = []
             for candidate in pre_candidates:
                 try:
                     pair, side = candidate['pair'], candidate['side']
-                    ohlcv_h1 = await exchange.fetch_ohlcv(pair, '1h', limit=100)
                     ohlcv_entry = await exchange.fetch_ohlcv(pair, TIMEFRAME_ENTRY, limit=100)
-                    
-                    df_h1 = pd.DataFrame(ohlcv_h1, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']); df_h1.ta.ema(length=9, append=True); df_h1.ta.ema(length=21, append=True); df_h1.ta.ema(length=50, append=True)
-                    df_entry = pd.DataFrame(ohlcv_entry, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']); df_entry.ta.bbands(length=20, std=2, append=True); df_entry.ta.atr(length=ATR_LEN, append=True); df_entry.ta.rsi(length=14, append=True); df_entry.ta.adx(length=14, append=True)
-                    
-                    if len(df_h1) < 53 or len(df_entry) < 21: continue # Проверка на достаточность данных
+                    df_entry = pd.DataFrame(ohlcv_entry, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df_entry.ta.bbands(length=20, std=2, append=True); df_entry.ta.atr(length=ATR_LEN, append=True); df_entry.ta.rsi(length=14, append=True); df_entry.ta.adx(length=14, append=True)
                     
                     last_entry = df_entry.iloc[-1]
-                    
                     adx_value = last_entry.get('ADX_14')
                     if adx_value is None or adx_value < 25:
-                        log.info(f"Candidate {pair} rejected due to low ADX: {adx_value:.2f}")
+                        log.info(f"Candidate {pair} rejected at final check due to low ADX: {adx_value:.2f}")
                         continue
-
-                    # --- ИЗМЕНЕНИЕ №8: ФИЛЬТР СТАБИЛЬНОСТИ ТРЕНДА H1 ---
-                    is_stable_trend = False
-                    # Проверяем последние 3 часовые свечи
-                    recent_h1_candles = df_h1.iloc[-3:]
-                    if len(recent_h1_candles) == 3:
-                        is_up_trend = True
-                        is_down_trend = True
-                        for _, row in recent_h1_candles.iterrows():
-                            h1_ema_fast = row.get('EMA_9')
-                            h1_ema_slow = row.get('EMA_21')
-                            h1_ema_trend = row.get('EMA_50')
-                            if not (h1_ema_fast > h1_ema_slow and h1_ema_slow > h1_ema_trend):
-                                is_up_trend = False
-                            if not (h1_ema_fast < h1_ema_slow and h1_ema_slow < h1_ema_trend):
-                                is_down_trend = False
-                        
-                        if is_up_trend: h1_trend = "UP"
-                        elif is_down_trend: h1_trend = "DOWN"
-                        else: h1_trend = "NEUTRAL"
-                    else:
-                        h1_trend = "NEUTRAL" # Недостаточно данных для проверки стабильности
-                    
-                    # ----------------------------------------------------
 
                     atr_value, entry_price = last_entry.get(f'ATRr_{ATR_LEN}'), last_entry['close']
                     if any(v is None for v in [atr_value, entry_price]) or atr_value == 0: continue
@@ -249,27 +245,19 @@ async def signal_scanner_loop(app):
                     risk = atr_value * SL_ATR_MULTIPLIER
                     sl, tp = (entry_price - risk, entry_price + risk * RR_RATIO) if side == 'LONG' else (entry_price + risk, entry_price - risk * RR_RATIO)
                     
-                    all_setups.append({
+                    setups_for_llm.append({
                         "pair": pair, "side": side, "entry_price": entry_price, "sl": sl, "tp": tp,
-                        "h1_trend": h1_trend,
+                        "h1_trend": candidate['h1_trend'],
                         "adx": round(adx_value, 2), "rsi": round(last_entry.get('RSI_14'), 2),
                         "bb_pos": bb_pos
                     })
-                except Exception as e: log.warning(f"SCANNER: Could not process candidate {candidate['pair']}: {e}")
-
-            if not all_setups:
-                await broadcast_message(app, "ℹ️ Не удалось подготовить данные для анализа (все кандидаты отфильтрованы).")
-                await asyncio.sleep(60 * 20)
-                continue
-            
-            setups_for_llm = [s for s in all_setups if (s['side'] == 'LONG' and s['h1_trend'] == 'UP') or (s['side'] == 'SHORT' and s['h1_trend'] == 'DOWN')]
+                except Exception as e: log.warning(f"SCANNER: Could not build final setup for {candidate['pair']}: {e}")
 
             if not setups_for_llm:
-                log.info(f"All {len(all_setups)} setups were counter-trend, neutral or unstable. Skipping LLM call.")
-                await broadcast_message(app, "ℹ️ Анализ завершен. Все найденные сетапы идут против стабильного глобального тренда.")
-                await asyncio.sleep(60 * 20)
+                await broadcast_message(app, "ℹ️ Не удалось подготовить данные для LLM (все кандидаты отфильтрованы на финальной проверке ADX).")
+                await asyncio.sleep(60 * 15)
                 continue
-
+            
             await broadcast_message(app, f"<b>Этап 3:</b> Отправляю {len(setups_for_llm)} отфильтрованных сетапов в LLM...")
             prompt_text = PROMPT_FINAL_APPROVAL + "\n\nКандидаты для выбора (JSON):\n" + json.dumps({"candidates": setups_for_llm})
             final_setup = await ask_llm(prompt_text)
@@ -297,8 +285,8 @@ async def signal_scanner_loop(app):
                 reason = final_setup.get('reason', 'N/A') if final_setup else "LLM не ответил."
                 await broadcast_message(app, f"ℹ️ Анализ завершен. LLM не выбрал ни одного достойного кандидата. Причина: <i>{reason}</i>")
 
-            log.info("--- SCANNER: Full scan cycle finished. Waiting 20 minutes. ---")
-            await asyncio.sleep(60 * 20)
+            log.info("--- SCANNER: Full scan cycle finished. Waiting 15 minutes. ---")
+            await asyncio.sleep(60 * 15)
 
         except Exception as e:
             log.error(f"CRITICAL ERROR in Signal Scanner Loop: {e}", exc_info=True)
@@ -390,7 +378,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not state.get('bot_on'):
         state['bot_on'] = True
         save_state()
-        await update.message.reply_text("✅ Бот v2.3 запущен. Начинаю сбор данных с фильтром стабильности тренда.")
+        await update.message.reply_text("✅ Бот v2.4 запущен. Новая архитектура сканера: фильтрация 'на лету'.")
         asyncio.create_task(signal_scanner_loop(ctx.application))
         asyncio.create_task(position_monitor_loop(ctx.application))
     else:
@@ -428,7 +416,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    log.info("Autonomous Bot v2.3 starting...")
+    log.info("Autonomous Bot v2.4 starting...")
     if state.get('bot_on', False):
         asyncio.create_task(signal_scanner_loop(app))
         asyncio.create_task(position_monitor_loop(app))
