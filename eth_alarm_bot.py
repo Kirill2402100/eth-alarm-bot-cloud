@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v8.5 - Strategy v2.4 (Architectural Optimization)
-# • Refactored the scanner loop to filter "on the fly". The H1 stable trend
-#   check is now performed immediately after an M15 crossover is found.
-#   Only candidates that pass both filters are added to the pre-candidate list.
-#   This ensures a high-quality pool for the LLM and prevents "empty" cycles.
+# v8.6 - Strategy v2.5 (Ultimate "On-the-Fly" Filtering)
+# • Integrated the ADX > 25 filter directly into the Stage 1 scanner loop.
+# • A candidate must now pass three checks to qualify: M15 Crossover,
+#   H1 Stable Trend, AND M15 ADX > 25. This creates a highly robust
+#   initial selection process and ensures only top-tier candidates reach the LLM.
 # ============================================================================
 
 import os
@@ -26,7 +26,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID = os.getenv("SHEET_ID")
-COIN_LIST_SIZE = int(os.getenv("COIN_LIST_SIZE", "200"))
+COIN_LIST_SIZE = int(os.getenv("COIN_LIST_SIZE", "300"))
 MAX_CONCURRENT_SIGNALS = int(os.getenv("MAX_CONCURRENT_SIGNALS", "10"))
 ANOMALOUS_CANDLE_MULTIPLIER = 3.0
 COOLDOWN_HOURS = 4 # Время "охлаждения" монеты в часах
@@ -147,8 +147,7 @@ async def signal_scanner_loop(app):
             cooldown_list = state.get('cooldown_list', {})
             state['cooldown_list'] = {p: ts for p, ts in cooldown_list.items() if now_ts - ts < (COOLDOWN_HOURS * 3600)}
 
-            # ИЗМЕНЕНИЕ №9: Теперь pre_candidates - это список полностью проверенных монет
-            await broadcast_message(app, f"<b>Этап 1:</b> Ищу до 10 качественных сетапов (M15 кросс + стабильный тренд H1) среди топ-<b>{COIN_LIST_SIZE}</b> монет...")
+            await broadcast_message(app, f"<b>Этап 1:</b> Ищу до 10 качественных сетапов (M15 кросс + H1 тренд + ADX > 25) среди топ-<b>{COIN_LIST_SIZE}</b> монет...")
             pre_candidates = []
             
             tickers = await exchange.fetch_tickers()
@@ -165,15 +164,21 @@ async def signal_scanner_loop(app):
                     continue
 
                 try:
-                    # 1. Быстрая проверка пересечения на M15
+                    # 1. Запрос и расчет всех индикаторов для M15
                     ohlcv_m15 = await exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME_ENTRY, limit=50)
                     df_m15 = pd.DataFrame(ohlcv_m15, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    if len(df_m15) < 22: continue
+                    if len(df_m15) < 30: continue # Нужно больше данных для ADX
                     df_m15.ta.ema(length=9, append=True)
                     df_m15.ta.ema(length=21, append=True)
                     df_m15.ta.atr(length=ATR_LEN, append=True)
+                    df_m15.ta.adx(length=14, append=True)
                     
+                    # 2. Проверка ТРОЙНОГО ФИЛЬТРА: Кроссовер + ADX
                     side = None
+                    adx_value = df_m15.iloc[-1].get('ADX_14')
+                    if adx_value is None or adx_value < 25:
+                        continue # ADX слишком низкий, пропускаем
+
                     for i in range(len(df_m15) - 1, len(df_m15) - 4, -1):
                         if i < 1: break
                         last, prev = df_m15.iloc[i], df_m15.iloc[i-1]
@@ -186,11 +191,11 @@ async def signal_scanner_loop(app):
                         if prev.get('EMA_9') <= prev.get('EMA_21') and last.get('EMA_9') > last.get('EMA_21'): side = 'LONG'
                         elif prev.get('EMA_9') >= prev.get('EMA_21') and last.get('EMA_9') < last.get('EMA_21'): side = 'SHORT'
                         
-                        if side: break # Нашли пересечение, выходим для проверки тренда H1
+                        if side: break
                     
-                    if not side: continue # Если пересечения не найдено, идем к следующей монете
+                    if not side: continue
 
-                    # 2. Если пересечение найдено, проверяем тренд на H1 "на лету"
+                    # 3. Если первые два фильтра пройдены, проверяем тренд H1
                     ohlcv_h1 = await exchange.fetch_ohlcv(pair, '1h', limit=100)
                     df_h1 = pd.DataFrame(ohlcv_h1, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     if len(df_h1) < 53: continue
@@ -204,7 +209,7 @@ async def signal_scanner_loop(app):
 
                     h1_trend_ok = (side == 'LONG' and is_stable_up) or (side == 'SHORT' and is_stable_down)
 
-                    # 3. Если ОБА условия выполнены, добавляем в кандидаты
+                    # 4. Если ВСЕ ТРИ фильтра пройдены, добавляем в кандидаты
                     if h1_trend_ok:
                         pre_candidates.append({"pair": pair, "side": side, "h1_trend": "UP" if is_stable_up else "DOWN"})
                         log.info(f"Found QUALIFIED candidate: {pair}, Side: {side}. Total candidates: {len(pre_candidates)}")
@@ -218,8 +223,8 @@ async def signal_scanner_loop(app):
                 await asyncio.sleep(60 * 15)
                 continue
 
-            # Этап 2 теперь - это просто сбор доп. данных для уже качественных кандидатов
-            await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} качественных кандидатов. Собираю доп. данные для LLM...")
+            # Этап 2 теперь - это просто обогащение данных для LLM
+            await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} качественных кандидатов. Обогащаю данные для LLM...")
             setups_for_llm = []
             for candidate in pre_candidates:
                 try:
@@ -229,11 +234,6 @@ async def signal_scanner_loop(app):
                     df_entry.ta.bbands(length=20, std=2, append=True); df_entry.ta.atr(length=ATR_LEN, append=True); df_entry.ta.rsi(length=14, append=True); df_entry.ta.adx(length=14, append=True)
                     
                     last_entry = df_entry.iloc[-1]
-                    adx_value = last_entry.get('ADX_14')
-                    if adx_value is None or adx_value < 25:
-                        log.info(f"Candidate {pair} rejected at final check due to low ADX: {adx_value:.2f}")
-                        continue
-
                     atr_value, entry_price = last_entry.get(f'ATRr_{ATR_LEN}'), last_entry['close']
                     if any(v is None for v in [atr_value, entry_price]) or atr_value == 0: continue
                     
@@ -248,13 +248,14 @@ async def signal_scanner_loop(app):
                     setups_for_llm.append({
                         "pair": pair, "side": side, "entry_price": entry_price, "sl": sl, "tp": tp,
                         "h1_trend": candidate['h1_trend'],
-                        "adx": round(adx_value, 2), "rsi": round(last_entry.get('RSI_14'), 2),
+                        "adx": round(last_entry.get('ADX_14'), 2), "rsi": round(last_entry.get('RSI_14'), 2),
                         "bb_pos": bb_pos
                     })
                 except Exception as e: log.warning(f"SCANNER: Could not build final setup for {candidate['pair']}: {e}")
 
             if not setups_for_llm:
-                await broadcast_message(app, "ℹ️ Не удалось подготовить данные для LLM (все кандидаты отфильтрованы на финальной проверке ADX).")
+                # Этот блок теперь почти никогда не будет вызываться, но оставим на всякий случай
+                await broadcast_message(app, "ℹ️ Не удалось подготовить данные для LLM.")
                 await asyncio.sleep(60 * 15)
                 continue
             
@@ -378,7 +379,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not state.get('bot_on'):
         state['bot_on'] = True
         save_state()
-        await update.message.reply_text("✅ Бот v2.4 запущен. Новая архитектура сканера: фильтрация 'на лету'.")
+        await update.message.reply_text("✅ Бот v2.5 запущен. Максимально строгий отбор кандидатов 'на лету'.")
         asyncio.create_task(signal_scanner_loop(ctx.application))
         asyncio.create_task(position_monitor_loop(ctx.application))
     else:
@@ -416,7 +417,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    log.info("Autonomous Bot v2.4 starting...")
+    log.info("Autonomous Bot v2.5 starting...")
     if state.get('bot_on', False):
         asyncio.create_task(signal_scanner_loop(app))
         asyncio.create_task(position_monitor_loop(app))
