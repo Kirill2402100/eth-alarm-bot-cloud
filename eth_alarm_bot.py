@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v8.0 - Strategy v2.0 Implementation
-# • Implemented all improvements based on the v1.0 data analysis.
-# • ADX Filter: Candidates with ADX < 25 are now automatically rejected.
-# • H1 Trend Filter: LLM prompt updated to give absolute priority to trades
-#   that align with the H1 trend.
-# • New Risk/Reward: The RR_RATIO is now set to 1.8 for the new experiment.
-# • New Data Collection: The bot now calculates and logs Bollinger Bands
-#   data for future analysis, writing to a new 'v4' log sheet.
+# v8.1 - Strategy v2.1 (Hard Trend Filter)
+# • Implemented a hard code-level filter to discard all candidates that
+#   go against the H1 trend BEFORE sending them to the LLM.
+# • Updated the LLM prompt to reflect this pre-filtering step.
+# • This completely prevents the selection of counter-trend signals,
+#   addressing the PIXEL/USDT incident.
 # ============================================================================
 
 import os
@@ -58,17 +56,16 @@ def setup_google_sheets():
         gs = gspread.authorize(creds)
         spreadsheet = gs.open_by_key(SHEET_ID)
         
-        # --- НОВЫЕ ЗАГОЛОВКИ ДЛЯ АНАЛИЗА v2.0 ---
         headers = [
             "Signal_ID", "Pair", "Side", "Status", "Entry_Time_UTC", "Exit_Time_UTC",
             "Entry_Price", "Exit_Price", "SL_Price", "TP_Price",
             "MFE_Price", "MAE_Price",
             "Entry_RSI", "Entry_ADX", "H1_Trend_at_Entry",
-            "Entry_BB_Position", # Новый столбец для Полос Боллинджера
+            "Entry_BB_Position",
             "LLM_Reason"
         ]
         
-        sheet_name = "Autonomous_Trade_Log_v4" # Новый лист для чистоты данных
+        sheet_name = "Autonomous_Trade_Log_v4"
         try:
             worksheet = spreadsheet.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
@@ -87,7 +84,7 @@ def setup_google_sheets():
 TRADE_LOG_WS = setup_google_sheets()
 
 # === STATE MANAGEMENT ===
-STATE_FILE = "concurrent_bot_state_v6.json"
+STATE_FILE = "concurrent_bot_state_v7.json"
 state = {}
 def save_state():
     with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
@@ -104,17 +101,17 @@ exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
 TIMEFRAME_ENTRY = os.getenv("TF_ENTRY", "15m")
 ATR_LEN = 14
 SL_ATR_MULTIPLIER = 1.0
-RR_RATIO = 1.8 # ИЗМЕНЕНИЕ №3: Новое соотношение Риск/Прибыль
+RR_RATIO = 1.8
 
-# === LLM PROMPT ===
+# === LLM PROMPT (ИЗМЕНЕНИЕ №2) ===
 PROMPT_FINAL_APPROVAL = (
-    "Ты — главный трейдер-аналитик. Тебе предоставлен список кандидатов, у которых 9 и 21 EMA на 15-минутном графике недавно пересеклись. "
-    "Твоя задача — выбрать ОДИН, САМЫЙ ЛУЧШИЙ сетап для входа в сделку. "
-    "Оценивай силу тренда (ADX), RSI и глобальный тренд H1. "
-    # ИЗМЕНЕНИЕ №2: Усиление фильтра H1 тренда
-    "ОТДАВАЙ АБСОЛЮТНЫЙ ПРИОРИТЕТ кандидатам, направление которых (`side`) совпадает с глобальным трендом (`h1_trend`). "
-    "Твой ответ ОБЯЗАТЕЛЬНО должен быть в формате JSON и содержать полный объект выбранного тобой лучшего кандидата. "
-    "Добавь в него поле `reason` с кратким обоснованием твоего выбора."
+    "Ты — главный трейдер-аналитик. Тебе предоставлен список **уже отфильтрованных по тренду** кандидатов. Все они соответствуют глобальному тренду на H1.\n\n"
+    "ТВОЯ ЗАДАЧА:\n"
+    "1.  Проанализируй и сравни **каждого** кандидата в списке `candidates`.\n"
+    "2.  **Ты ОБЯЗАН выбрать ОДНОГО, САМОГО ЛУЧШЕГО кандидата**, основываясь на лучшей комбинации силы импульса (ADX) и RSI.\n"
+    "3.  Если все кандидаты выглядят слабо (например, очень низкий ADX у всех), ты можешь их отклонить, вернув `{'decision': 'REJECT', 'reason': 'Причина отклонения'}`.\n\n"
+    "**ТРЕБОВАНИЯ К ОТВЕТУ:**\n"
+    "Твой ответ **обязательно** должен быть в формате **JSON**. Если ты выбираешь кандидата, верни его полный объект, добавив поле `reason` с кратким обоснованием твоего выбора."
 )
 async def ask_llm(final_prompt: str):
     if not LLM_API_KEY: return None
@@ -181,8 +178,8 @@ async def signal_scanner_loop(app):
                 await asyncio.sleep(60 * 20)
                 continue
 
-            await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Рассчитываю сетапы...")
-            setups_for_llm = []
+            await broadcast_message(app, f"<b>Этап 2:</b> Найдено {len(pre_candidates)} кандидатов. Рассчитываю сетапы и фильтрую...")
+            all_setups = []
             for candidate in pre_candidates:
                 try:
                     pair, side = candidate['pair'], candidate['side']
@@ -191,13 +188,11 @@ async def signal_scanner_loop(app):
                     
                     df_h1 = pd.DataFrame(ohlcv_h1, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']); df_h1.ta.ema(length=50, append=True)
                     df_entry = pd.DataFrame(ohlcv_entry, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    # ИЗМЕНЕНИЕ №4: Добавляем расчет Полос Боллинджера
                     df_entry.ta.bbands(length=20, std=2, append=True)
                     df_entry.ta.atr(length=ATR_LEN, append=True); df_entry.ta.rsi(length=14, append=True); df_entry.ta.adx(length=14, append=True)
                     
                     last_entry, last_h1 = df_entry.iloc[-1], df_h1.iloc[-1]
                     
-                    # ИЗМЕНЕНИЕ №1: Фильтр по ADX
                     adx_value = last_entry.get('ADX_14')
                     if adx_value is None or adx_value < 25:
                         log.info(f"Candidate {pair} rejected due to low ADX: {adx_value}")
@@ -206,7 +201,6 @@ async def signal_scanner_loop(app):
                     atr_value, entry_price = last_entry.get(f'ATRr_{ATR_LEN}'), last_entry['close']
                     if any(v is None for v in [atr_value, entry_price]) or atr_value == 0: continue
                     
-                    # Определяем положение цены относительно Полос Боллинджера
                     bb_upper = last_entry.get('BBU_20_2.0')
                     bb_lower = last_entry.get('BBL_20_2.0')
                     bb_pos = "Inside"
@@ -216,20 +210,31 @@ async def signal_scanner_loop(app):
                     risk = atr_value * SL_ATR_MULTIPLIER
                     sl, tp = (entry_price - risk, entry_price + risk * RR_RATIO) if side == 'LONG' else (entry_price + risk, entry_price - risk * RR_RATIO)
                     
-                    setups_for_llm.append({
+                    all_setups.append({
                         "pair": pair, "side": side, "entry_price": entry_price, "sl": sl, "tp": tp,
                         "h1_trend": "UP" if last_h1['close'] > last_h1.get('EMA_50') else "DOWN",
                         "adx": round(adx_value, 2), "rsi": round(last_entry.get('RSI_14'), 2),
-                        "bb_pos": bb_pos # Добавляем новые данные для LLM
+                        "bb_pos": bb_pos
                     })
                 except Exception as e: log.warning(f"SCANNER: Could not process candidate {candidate['pair']}: {e}")
 
+            if not all_setups:
+                await broadcast_message(app, "ℹ️ Не удалось подготовить данные для анализа (все кандидаты отфильтрованы по ADX).")
+                await asyncio.sleep(60 * 20)
+                continue
+            
+            # --- ИЗМЕНЕНИЕ №1: ЖЁСТКИЙ ФИЛЬТР ПО ТРЕНДУ ---
+            setups_for_llm = [
+                s for s in all_setups if (s['side'] == 'LONG' and s['h1_trend'] == 'UP') or (s['side'] == 'SHORT' and s['h1_trend'] == 'DOWN')
+            ]
+
             if not setups_for_llm:
-                await broadcast_message(app, "ℹ️ Не удалось подготовить данные для анализа (все кандидаты отфильтрованы).")
+                log.info(f"All {len(all_setups)} setups were counter-trend. Skipping LLM call.")
+                await broadcast_message(app, "ℹ️ Анализ завершен. Все найденные сетапы идут против глобального тренда.")
                 await asyncio.sleep(60 * 20)
                 continue
 
-            await broadcast_message(app, f"<b>Этап 3:</b> Отправляю {len(setups_for_llm)} готовых сетапов в LLM...")
+            await broadcast_message(app, f"<b>Этап 3:</b> Отправляю {len(setups_for_llm)} отфильтрованных по тренду сетапов в LLM...")
             prompt_text = PROMPT_FINAL_APPROVAL + "\n\nКандидаты для выбора (JSON):\n" + json.dumps({"candidates": setups_for_llm})
             final_setup = await ask_llm(prompt_text)
 
@@ -306,7 +311,7 @@ async def position_monitor_loop(app):
                                 signal.get('entry_price'), current_price, signal.get('sl'), signal.get('tp'),
                                 signal.get('mfe_price'), signal.get('mae_price'),
                                 signal.get('rsi'), signal.get('adx'), signal.get('h1_trend'),
-                                signal.get('bb_pos'), # Записываем новые данные
+                                signal.get('bb_pos'),
                                 signal.get('reason', 'N/A')
                             ]
                             await asyncio.to_thread(TRADE_LOG_WS.append_row, row, value_input_option='USER_ENTERED')
@@ -348,7 +353,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not state.get('bot_on'):
         state['bot_on'] = True
         save_state()
-        await update.message.reply_text("✅ Бот v2.0 запущен. Начинаю сбор данных с новыми фильтрами.")
+        await update.message.reply_text("✅ Бот v2.1 запущен. Начинаю сбор данных с новыми фильтрами.")
         asyncio.create_task(signal_scanner_loop(ctx.application))
         asyncio.create_task(position_monitor_loop(ctx.application))
     else:
@@ -386,7 +391,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    log.info("Autonomous Bot v2.0 starting...")
+    log.info("Autonomous Bot v2.1 starting...")
     if state.get('bot_on', False):
         asyncio.create_task(signal_scanner_loop(app))
         asyncio.create_task(position_monitor_loop(app))
