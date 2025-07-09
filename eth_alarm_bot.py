@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v8.2 - Strategy v2.2 (Anomalous Candle Filter)
-# • Implemented the "Anomalous Candle Filter".
-# • The bot now rejects candidates if the signal candle's range (high-low)
-#   is more than 3 times the current ATR value.
-# • This is designed to prevent entries immediately after extreme parabolic
-#   moves, filtering out signals from unhealthy volatility.
+# v8.3 - Strategy v2.2 (Advanced Filters)
+# • Upgraded H1 Trend Filter: Now requires both fast (9) and slow (21) EMAs
+#   to be on the correct side of the main trend EMA (50) for confirmation.
+# • Added Cooldown Filter: After a signal is sent for a pair, it's put on
+#   a 4-hour cooldown and won't be scanned, preventing duplicate signals.
 # ============================================================================
 
 import os
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import uuid
 import pandas as pd
 import ccxt.async_support as ccxt
@@ -29,7 +28,8 @@ CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID = os.getenv("SHEET_ID")
 COIN_LIST_SIZE = int(os.getenv("COIN_LIST_SIZE", "100"))
 MAX_CONCURRENT_SIGNALS = int(os.getenv("MAX_CONCURRENT_SIGNALS", "10"))
-ANOMALOUS_CANDLE_MULTIPLIER = 3.0 # Множитель для фильтра аномальной свечи
+ANOMALOUS_CANDLE_MULTIPLIER = 3.0
+COOLDOWN_HOURS = 4 # Время "охлаждения" монеты в часах
 
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_API_URL = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
@@ -94,8 +94,8 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r') as f: state = json.load(f)
     if 'bot_on' not in state:
-        state.update({"bot_on": False, "monitored_signals": []})
-    log.info(f"State loaded: {len(state.get('monitored_signals', []))} signals are being monitored.")
+        state.update({"bot_on": False, "monitored_signals": [], "cooldown_list": {}})
+    log.info(f"State loaded: {len(state.get('monitored_signals', []))} signals monitored, {len(state.get('cooldown_list', {}))} pairs on cooldown.")
 
 # === EXCHANGE & STRATEGY PARAMS ===
 exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
@@ -142,6 +142,11 @@ async def signal_scanner_loop(app):
                 log.warning(f"Max concurrent signals ({MAX_CONCURRENT_SIGNALS}) reached. Scanner is pausing for 5 minutes.")
                 await asyncio.sleep(60 * 5)
                 continue
+            
+            # Очистка старых записей из списка охлаждения
+            now_ts = datetime.now(timezone.utc).timestamp()
+            cooldown_list = state.get('cooldown_list', {})
+            state['cooldown_list'] = {p: ts for p, ts in cooldown_list.items() if now_ts - ts < (COOLDOWN_HOURS * 3600)}
 
             await broadcast_message(app, f"<b>Этап 1:</b> Ищу пересечения EMA (не старше 2 свечей) среди топ-<b>{COIN_LIST_SIZE}</b> монет...")
             pre_candidates = []
@@ -153,23 +158,35 @@ async def signal_scanner_loop(app):
             for pair in coin_list:
                 if len(pre_candidates) >= 10: break
                 if not state.get('bot_on'): return
+                # ИЗМЕНЕНИЕ №7: Проверка на "охлаждение"
+                if pair in state.get('cooldown_list', {}):
+                    log.info(f"Pair {pair} is on cooldown. Skipping.")
+                    continue
                 try:
                     ohlcv = await exchange.fetch_ohlcv(pair, timeframe=TIMEFRAME_ENTRY, limit=50)
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     if len(df) < 22: continue
                     df.ta.ema(length=9, append=True)
                     df.ta.ema(length=21, append=True)
+                    df.ta.atr(length=ATR_LEN, append=True) # ATR нужен для фильтра аномалий
                     
                     for i in range(len(df) - 1, len(df) - 6, -1):
                         if i < 1: break
                         candles_since_cross = (len(df) - 1) - i
                         if candles_since_cross > 2: break
                         last, prev = df.iloc[i], df.iloc[i-1]
+                        
+                        candle_range = last['high'] - last['low']
+                        atr_on_signal = last.get(f'ATRr_{ATR_LEN}')
+                        if atr_on_signal and candle_range > (atr_on_signal * ANOMALOUS_CANDLE_MULTIPLIER):
+                            log.info(f"Pre-candidate {pair} rejected due to Anomalous Candle.")
+                            break # Прерываем поиск для этой монеты, т.к. свеча аномальная
+
                         side = None
                         if prev.get('EMA_9') <= prev.get('EMA_21') and last.get('EMA_9') > last.get('EMA_21'): side = 'LONG'
                         elif prev.get('EMA_9') >= prev.get('EMA_21') and last.get('EMA_9') < last.get('EMA_21'): side = 'SHORT'
                         if side:
-                            pre_candidates.append({"pair": pair, "side": side, "signal_candle": last})
+                            pre_candidates.append({"pair": pair, "side": side})
                             log.info(f"Found pre-candidate: {pair}, Side: {side}, {candles_since_cross} candles ago.")
                             break
                 except Exception: continue
@@ -183,14 +200,12 @@ async def signal_scanner_loop(app):
             all_setups = []
             for candidate in pre_candidates:
                 try:
-                    pair, side, signal_candle = candidate['pair'], candidate['side'], candidate['signal_candle']
+                    pair, side = candidate['pair'], candidate['side']
                     ohlcv_h1 = await exchange.fetch_ohlcv(pair, '1h', limit=100)
                     ohlcv_entry = await exchange.fetch_ohlcv(pair, TIMEFRAME_ENTRY, limit=100)
                     
-                    df_h1 = pd.DataFrame(ohlcv_h1, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']); df_h1.ta.ema(length=50, append=True)
-                    df_entry = pd.DataFrame(ohlcv_entry, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                    df_entry.ta.bbands(length=20, std=2, append=True)
-                    df_entry.ta.atr(length=ATR_LEN, append=True); df_entry.ta.rsi(length=14, append=True); df_entry.ta.adx(length=14, append=True)
+                    df_h1 = pd.DataFrame(ohlcv_h1, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']); df_h1.ta.ema(length=9, append=True); df_h1.ta.ema(length=21, append=True); df_h1.ta.ema(length=50, append=True)
+                    df_entry = pd.DataFrame(ohlcv_entry, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']); df_entry.ta.bbands(length=20, std=2, append=True); df_entry.ta.atr(length=ATR_LEN, append=True); df_entry.ta.rsi(length=14, append=True); df_entry.ta.adx(length=14, append=True)
                     
                     last_entry, last_h1 = df_entry.iloc[-1], df_h1.iloc[-1]
                     
@@ -199,12 +214,13 @@ async def signal_scanner_loop(app):
                         log.info(f"Candidate {pair} rejected due to low ADX: {adx_value:.2f}")
                         continue
 
-                    # --- ИЗМЕНЕНИЕ №5: ФИЛЬТР АНОМАЛЬНОЙ СВЕЧИ ---
-                    candle_range = signal_candle['high'] - signal_candle['low']
-                    atr_on_signal = signal_candle.get(f'ATRr_{ATR_LEN}') # ATR на момент сигнала
-                    if atr_on_signal and candle_range > (atr_on_signal * ANOMALOUS_CANDLE_MULTIPLIER):
-                        log.info(f"Candidate {pair} rejected due to Anomalous Candle. Range: {candle_range:.4f}, ATR*3: {(atr_on_signal * ANOMALOUS_CANDLE_MULTIPLIER):.4f}")
-                        continue
+                    # --- ИЗМЕНЕНИЕ №6: УЛУЧШЕННЫЙ ФИЛЬТР ТРЕНДА ---
+                    h1_ema_fast = last_h1.get('EMA_9')
+                    h1_ema_slow = last_h1.get('EMA_21')
+                    h1_ema_trend = last_h1.get('EMA_50')
+                    h1_trend = "NEUTRAL"
+                    if h1_ema_fast > h1_ema_slow and h1_ema_slow > h1_ema_trend: h1_trend = "UP"
+                    elif h1_ema_fast < h1_ema_slow and h1_ema_slow < h1_ema_trend: h1_trend = "DOWN"
 
                     atr_value, entry_price = last_entry.get(f'ATRr_{ATR_LEN}'), last_entry['close']
                     if any(v is None for v in [atr_value, entry_price]) or atr_value == 0: continue
@@ -219,7 +235,7 @@ async def signal_scanner_loop(app):
                     
                     all_setups.append({
                         "pair": pair, "side": side, "entry_price": entry_price, "sl": sl, "tp": tp,
-                        "h1_trend": "UP" if last_h1['close'] > last_h1.get('EMA_50') else "DOWN",
+                        "h1_trend": h1_trend,
                         "adx": round(adx_value, 2), "rsi": round(last_entry.get('RSI_14'), 2),
                         "bb_pos": bb_pos
                     })
@@ -230,12 +246,10 @@ async def signal_scanner_loop(app):
                 await asyncio.sleep(60 * 20)
                 continue
             
-            setups_for_llm = [
-                s for s in all_setups if (s['side'] == 'LONG' and s['h1_trend'] == 'UP') or (s['side'] == 'SHORT' and s['h1_trend'] == 'DOWN')
-            ]
+            setups_for_llm = [s for s in all_setups if (s['side'] == 'LONG' and s['h1_trend'] == 'UP') or (s['side'] == 'SHORT' and s['h1_trend'] == 'DOWN')]
 
             if not setups_for_llm:
-                log.info(f"All {len(all_setups)} setups were counter-trend. Skipping LLM call.")
+                log.info(f"All {len(all_setups)} setups were counter-trend or neutral. Skipping LLM call.")
                 await broadcast_message(app, "ℹ️ Анализ завершен. Все найденные сетапы идут против глобального тренда.")
                 await asyncio.sleep(60 * 20)
                 continue
@@ -252,9 +266,11 @@ async def signal_scanner_loop(app):
                 final_setup['mae_price'] = entry_p
                 
                 state['monitored_signals'].append(final_setup)
+                # Добавляем монету в список охлаждения
+                state['cooldown_list'][final_setup['pair']] = datetime.now(timezone.utc).timestamp()
                 save_state()
                 
-                log.info(f"SCANNER: LLM chose {final_setup['pair']}. Added to monitoring list.")
+                log.info(f"SCANNER: LLM chose {final_setup['pair']}. Added to monitoring and cooldown list.")
                 message = (f"🔔 <b>ЛУЧШИЙ СЕТАП! (ID: {final_setup['signal_id']})</b> 🔔\n\n"
                            f"<b>Монета:</b> <code>{final_setup.get('pair')}</code>\n<b>Направление:</b> <b>{final_setup.get('side')}</b>\n"
                            f"<b>Цена входа (расчетная):</b> <code>{format_price(final_setup.get('entry_price'))}</code>\n"
