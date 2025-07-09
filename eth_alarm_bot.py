@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v8.1 - Strategy v2.1 (Hard Trend Filter)
-# • Implemented a hard code-level filter to discard all candidates that
-#   go against the H1 trend BEFORE sending them to the LLM.
-# • Updated the LLM prompt to reflect this pre-filtering step.
-# • This completely prevents the selection of counter-trend signals,
-#   addressing the PIXEL/USDT incident.
+# v8.2 - Strategy v2.2 (Anomalous Candle Filter)
+# • Implemented the "Anomalous Candle Filter".
+# • The bot now rejects candidates if the signal candle's range (high-low)
+#   is more than 3 times the current ATR value.
+# • This is designed to prevent entries immediately after extreme parabolic
+#   moves, filtering out signals from unhealthy volatility.
 # ============================================================================
 
 import os
@@ -29,6 +29,7 @@ CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID = os.getenv("SHEET_ID")
 COIN_LIST_SIZE = int(os.getenv("COIN_LIST_SIZE", "100"))
 MAX_CONCURRENT_SIGNALS = int(os.getenv("MAX_CONCURRENT_SIGNALS", "10"))
+ANOMALOUS_CANDLE_MULTIPLIER = 3.0 # Множитель для фильтра аномальной свечи
 
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_API_URL = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
@@ -84,7 +85,7 @@ def setup_google_sheets():
 TRADE_LOG_WS = setup_google_sheets()
 
 # === STATE MANAGEMENT ===
-STATE_FILE = "concurrent_bot_state_v7.json"
+STATE_FILE = "concurrent_bot_state_v8.json"
 state = {}
 def save_state():
     with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
@@ -103,13 +104,13 @@ ATR_LEN = 14
 SL_ATR_MULTIPLIER = 1.0
 RR_RATIO = 1.8
 
-# === LLM PROMPT (ИЗМЕНЕНИЕ №2) ===
+# === LLM PROMPT ===
 PROMPT_FINAL_APPROVAL = (
-    "Ты — главный трейдер-аналитик. Тебе предоставлен список **уже отфильтрованных по тренду** кандидатов. Все они соответствуют глобальному тренду на H1.\n\n"
+    "Ты — главный трейдер-аналитик. Тебе предоставлен список **уже отфильтрованных по тренду и аномальной волатильности** кандидатов. Все они соответствуют глобальному тренду на H1 и не имеют экстремальных свечей на входе.\n\n"
     "ТВОЯ ЗАДАЧА:\n"
     "1.  Проанализируй и сравни **каждого** кандидата в списке `candidates`.\n"
     "2.  **Ты ОБЯЗАН выбрать ОДНОГО, САМОГО ЛУЧШЕГО кандидата**, основываясь на лучшей комбинации силы импульса (ADX) и RSI.\n"
-    "3.  Если все кандидаты выглядят слабо (например, очень низкий ADX у всех), ты можешь их отклонить, вернув `{'decision': 'REJECT', 'reason': 'Причина отклонения'}`.\n\n"
+    "3.  Если все кандидаты выглядят слабо, ты можешь их отклонить, вернув `{'decision': 'REJECT', 'reason': 'Причина отклонения'}`.\n\n"
     "**ТРЕБОВАНИЯ К ОТВЕТУ:**\n"
     "Твой ответ **обязательно** должен быть в формате **JSON**. Если ты выбираешь кандидата, верни его полный объект, добавив поле `reason` с кратким обоснованием твоего выбора."
 )
@@ -168,7 +169,7 @@ async def signal_scanner_loop(app):
                         if prev.get('EMA_9') <= prev.get('EMA_21') and last.get('EMA_9') > last.get('EMA_21'): side = 'LONG'
                         elif prev.get('EMA_9') >= prev.get('EMA_21') and last.get('EMA_9') < last.get('EMA_21'): side = 'SHORT'
                         if side:
-                            pre_candidates.append({"pair": pair, "side": side})
+                            pre_candidates.append({"pair": pair, "side": side, "signal_candle": last})
                             log.info(f"Found pre-candidate: {pair}, Side: {side}, {candles_since_cross} candles ago.")
                             break
                 except Exception: continue
@@ -182,7 +183,7 @@ async def signal_scanner_loop(app):
             all_setups = []
             for candidate in pre_candidates:
                 try:
-                    pair, side = candidate['pair'], candidate['side']
+                    pair, side, signal_candle = candidate['pair'], candidate['side'], candidate['signal_candle']
                     ohlcv_h1 = await exchange.fetch_ohlcv(pair, '1h', limit=100)
                     ohlcv_entry = await exchange.fetch_ohlcv(pair, TIMEFRAME_ENTRY, limit=100)
                     
@@ -195,14 +196,20 @@ async def signal_scanner_loop(app):
                     
                     adx_value = last_entry.get('ADX_14')
                     if adx_value is None or adx_value < 25:
-                        log.info(f"Candidate {pair} rejected due to low ADX: {adx_value}")
+                        log.info(f"Candidate {pair} rejected due to low ADX: {adx_value:.2f}")
+                        continue
+
+                    # --- ИЗМЕНЕНИЕ №5: ФИЛЬТР АНОМАЛЬНОЙ СВЕЧИ ---
+                    candle_range = signal_candle['high'] - signal_candle['low']
+                    atr_on_signal = signal_candle.get(f'ATRr_{ATR_LEN}') # ATR на момент сигнала
+                    if atr_on_signal and candle_range > (atr_on_signal * ANOMALOUS_CANDLE_MULTIPLIER):
+                        log.info(f"Candidate {pair} rejected due to Anomalous Candle. Range: {candle_range:.4f}, ATR*3: {(atr_on_signal * ANOMALOUS_CANDLE_MULTIPLIER):.4f}")
                         continue
 
                     atr_value, entry_price = last_entry.get(f'ATRr_{ATR_LEN}'), last_entry['close']
                     if any(v is None for v in [atr_value, entry_price]) or atr_value == 0: continue
                     
-                    bb_upper = last_entry.get('BBU_20_2.0')
-                    bb_lower = last_entry.get('BBL_20_2.0')
+                    bb_upper, bb_lower = last_entry.get('BBU_20_2.0'), last_entry.get('BBL_20_2.0')
                     bb_pos = "Inside"
                     if entry_price > bb_upper: bb_pos = "Above_Upper"
                     elif entry_price < bb_lower: bb_pos = "Below_Lower"
@@ -219,11 +226,10 @@ async def signal_scanner_loop(app):
                 except Exception as e: log.warning(f"SCANNER: Could not process candidate {candidate['pair']}: {e}")
 
             if not all_setups:
-                await broadcast_message(app, "ℹ️ Не удалось подготовить данные для анализа (все кандидаты отфильтрованы по ADX).")
+                await broadcast_message(app, "ℹ️ Не удалось подготовить данные для анализа (все кандидаты отфильтрованы).")
                 await asyncio.sleep(60 * 20)
                 continue
             
-            # --- ИЗМЕНЕНИЕ №1: ЖЁСТКИЙ ФИЛЬТР ПО ТРЕНДУ ---
             setups_for_llm = [
                 s for s in all_setups if (s['side'] == 'LONG' and s['h1_trend'] == 'UP') or (s['side'] == 'SHORT' and s['h1_trend'] == 'DOWN')
             ]
@@ -234,7 +240,7 @@ async def signal_scanner_loop(app):
                 await asyncio.sleep(60 * 20)
                 continue
 
-            await broadcast_message(app, f"<b>Этап 3:</b> Отправляю {len(setups_for_llm)} отфильтрованных по тренду сетапов в LLM...")
+            await broadcast_message(app, f"<b>Этап 3:</b> Отправляю {len(setups_for_llm)} отфильтрованных сетапов в LLM...")
             prompt_text = PROMPT_FINAL_APPROVAL + "\n\nКандидаты для выбора (JSON):\n" + json.dumps({"candidates": setups_for_llm})
             final_setup = await ask_llm(prompt_text)
 
@@ -353,7 +359,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not state.get('bot_on'):
         state['bot_on'] = True
         save_state()
-        await update.message.reply_text("✅ Бот v2.1 запущен. Начинаю сбор данных с новыми фильтрами.")
+        await update.message.reply_text("✅ Бот v2.2 запущен. Начинаю сбор данных с новыми фильтрами.")
         asyncio.create_task(signal_scanner_loop(ctx.application))
         asyncio.create_task(position_monitor_loop(ctx.application))
     else:
@@ -391,7 +397,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    log.info("Autonomous Bot v2.1 starting...")
+    log.info("Autonomous Bot v2.2 starting...")
     if state.get('bot_on', False):
         asyncio.create_task(signal_scanner_loop(app))
         asyncio.create_task(position_monitor_loop(app))
