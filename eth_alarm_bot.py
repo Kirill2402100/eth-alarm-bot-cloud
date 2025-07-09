@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v8.3 - Strategy v2.2 (Advanced Filters)
-# • Upgraded H1 Trend Filter: Now requires both fast (9) and slow (21) EMAs
-#   to be on the correct side of the main trend EMA (50) for confirmation.
-# • Added Cooldown Filter: After a signal is sent for a pair, it's put on
-#   a 4-hour cooldown and won't be scanned, preventing duplicate signals.
+# v8.4 - Strategy v2.3 (Stable Trend Filter)
+# • Added H1 Trend Stability Filter: The H1 trend condition (e.g., for UP:
+#   EMA_9 > EMA_21 > EMA_50) must now be true for the last 3 consecutive
+#   H1 candles to be considered valid, preventing entries on weak bounces.
 # ============================================================================
 
 import os
@@ -158,7 +157,6 @@ async def signal_scanner_loop(app):
             for pair in coin_list:
                 if len(pre_candidates) >= 10: break
                 if not state.get('bot_on'): return
-                # ИЗМЕНЕНИЕ №7: Проверка на "охлаждение"
                 if pair in state.get('cooldown_list', {}):
                     log.info(f"Pair {pair} is on cooldown. Skipping.")
                     continue
@@ -168,7 +166,7 @@ async def signal_scanner_loop(app):
                     if len(df) < 22: continue
                     df.ta.ema(length=9, append=True)
                     df.ta.ema(length=21, append=True)
-                    df.ta.atr(length=ATR_LEN, append=True) # ATR нужен для фильтра аномалий
+                    df.ta.atr(length=ATR_LEN, append=True)
                     
                     for i in range(len(df) - 1, len(df) - 6, -1):
                         if i < 1: break
@@ -180,7 +178,7 @@ async def signal_scanner_loop(app):
                         atr_on_signal = last.get(f'ATRr_{ATR_LEN}')
                         if atr_on_signal and candle_range > (atr_on_signal * ANOMALOUS_CANDLE_MULTIPLIER):
                             log.info(f"Pre-candidate {pair} rejected due to Anomalous Candle.")
-                            break # Прерываем поиск для этой монеты, т.к. свеча аномальная
+                            break
 
                         side = None
                         if prev.get('EMA_9') <= prev.get('EMA_21') and last.get('EMA_9') > last.get('EMA_21'): side = 'LONG'
@@ -207,20 +205,38 @@ async def signal_scanner_loop(app):
                     df_h1 = pd.DataFrame(ohlcv_h1, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']); df_h1.ta.ema(length=9, append=True); df_h1.ta.ema(length=21, append=True); df_h1.ta.ema(length=50, append=True)
                     df_entry = pd.DataFrame(ohlcv_entry, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']); df_entry.ta.bbands(length=20, std=2, append=True); df_entry.ta.atr(length=ATR_LEN, append=True); df_entry.ta.rsi(length=14, append=True); df_entry.ta.adx(length=14, append=True)
                     
-                    last_entry, last_h1 = df_entry.iloc[-1], df_h1.iloc[-1]
+                    if len(df_h1) < 53 or len(df_entry) < 21: continue # Проверка на достаточность данных
+                    
+                    last_entry = df_entry.iloc[-1]
                     
                     adx_value = last_entry.get('ADX_14')
                     if adx_value is None or adx_value < 25:
                         log.info(f"Candidate {pair} rejected due to low ADX: {adx_value:.2f}")
                         continue
 
-                    # --- ИЗМЕНЕНИЕ №6: УЛУЧШЕННЫЙ ФИЛЬТР ТРЕНДА ---
-                    h1_ema_fast = last_h1.get('EMA_9')
-                    h1_ema_slow = last_h1.get('EMA_21')
-                    h1_ema_trend = last_h1.get('EMA_50')
-                    h1_trend = "NEUTRAL"
-                    if h1_ema_fast > h1_ema_slow and h1_ema_slow > h1_ema_trend: h1_trend = "UP"
-                    elif h1_ema_fast < h1_ema_slow and h1_ema_slow < h1_ema_trend: h1_trend = "DOWN"
+                    # --- ИЗМЕНЕНИЕ №8: ФИЛЬТР СТАБИЛЬНОСТИ ТРЕНДА H1 ---
+                    is_stable_trend = False
+                    # Проверяем последние 3 часовые свечи
+                    recent_h1_candles = df_h1.iloc[-3:]
+                    if len(recent_h1_candles) == 3:
+                        is_up_trend = True
+                        is_down_trend = True
+                        for _, row in recent_h1_candles.iterrows():
+                            h1_ema_fast = row.get('EMA_9')
+                            h1_ema_slow = row.get('EMA_21')
+                            h1_ema_trend = row.get('EMA_50')
+                            if not (h1_ema_fast > h1_ema_slow and h1_ema_slow > h1_ema_trend):
+                                is_up_trend = False
+                            if not (h1_ema_fast < h1_ema_slow and h1_ema_slow < h1_ema_trend):
+                                is_down_trend = False
+                        
+                        if is_up_trend: h1_trend = "UP"
+                        elif is_down_trend: h1_trend = "DOWN"
+                        else: h1_trend = "NEUTRAL"
+                    else:
+                        h1_trend = "NEUTRAL" # Недостаточно данных для проверки стабильности
+                    
+                    # ----------------------------------------------------
 
                     atr_value, entry_price = last_entry.get(f'ATRr_{ATR_LEN}'), last_entry['close']
                     if any(v is None for v in [atr_value, entry_price]) or atr_value == 0: continue
@@ -249,8 +265,8 @@ async def signal_scanner_loop(app):
             setups_for_llm = [s for s in all_setups if (s['side'] == 'LONG' and s['h1_trend'] == 'UP') or (s['side'] == 'SHORT' and s['h1_trend'] == 'DOWN')]
 
             if not setups_for_llm:
-                log.info(f"All {len(all_setups)} setups were counter-trend or neutral. Skipping LLM call.")
-                await broadcast_message(app, "ℹ️ Анализ завершен. Все найденные сетапы идут против глобального тренда.")
+                log.info(f"All {len(all_setups)} setups were counter-trend, neutral or unstable. Skipping LLM call.")
+                await broadcast_message(app, "ℹ️ Анализ завершен. Все найденные сетапы идут против стабильного глобального тренда.")
                 await asyncio.sleep(60 * 20)
                 continue
 
@@ -266,7 +282,6 @@ async def signal_scanner_loop(app):
                 final_setup['mae_price'] = entry_p
                 
                 state['monitored_signals'].append(final_setup)
-                # Добавляем монету в список охлаждения
                 state['cooldown_list'][final_setup['pair']] = datetime.now(timezone.utc).timestamp()
                 save_state()
                 
@@ -375,7 +390,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not state.get('bot_on'):
         state['bot_on'] = True
         save_state()
-        await update.message.reply_text("✅ Бот v2.2 запущен. Начинаю сбор данных с новыми фильтрами.")
+        await update.message.reply_text("✅ Бот v2.3 запущен. Начинаю сбор данных с фильтром стабильности тренда.")
         asyncio.create_task(signal_scanner_loop(ctx.application))
         asyncio.create_task(position_monitor_loop(ctx.application))
     else:
@@ -413,7 +428,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    log.info("Autonomous Bot v2.2 starting...")
+    log.info("Autonomous Bot v2.3 starting...")
     if state.get('bot_on', False):
         asyncio.create_task(signal_scanner_loop(app))
         asyncio.create_task(position_monitor_loop(app))
