@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.4 - Diagnostic Mode
+# v3.5 - Bugfix & Diagnostics Accuracy
 # Changelog 10‑Jul‑2025 (Europe/Belgrade):
-# • New Module: Added detailed rejection stats logging. Bot now reports exactly which filter
-#   is blocking candidates and how many, allowing for data-driven tuning.
+# • Bugfix: Volatility percentage calculation is now done manually for accuracy.
+# • Bugfix: Diagnostics now correctly track rejections due to insufficient data,
+#   providing a complete picture of the filtering process.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -76,7 +77,7 @@ def setup_sheets():
         log.error("Sheets init failed: %s", e)
 
 # === State ================================================================
-STATE_FILE = "bot_state_v3_4.json"
+STATE_FILE = "bot_state_v3_5.json"
 state = {}
 def load_state():
     global state
@@ -153,8 +154,12 @@ async def get_market_snapshot():
         regime = "BULLISH"
         if last_btc['close'] < last_btc['EMA_50']:
             regime = "BEARISH"
-            
-        atr_percent = last_btc['ATRr_14']
+        
+        # ИЗМЕНЕНИЕ: Ручной и надежный расчет ATR в %
+        absolute_atr = last_btc['ATR_14']
+        close_price = last_btc['close']
+        atr_percent = (absolute_atr / close_price) * 100 if close_price > 0 else 0
+
         if atr_percent < 2.5: volatility = "Низкая"
         elif atr_percent < 5: volatility = "Умеренная"
         else: volatility = "Высокая"
@@ -189,10 +194,10 @@ async def scanner(app):
                 key=lambda x:x[1]['quoteVolume'], reverse=True
             )[:COIN_LIST_SIZE]
             
-            # ИЗМЕНЕНИЕ: Инициализация счетчиков для диагностики
+            # ИЗМЕНЕНИЕ: Улучшенная диагностика
             rejection_stats = {
-                "LOW_ADX": 0, "NO_CROSS": 0, "H1_TAILWIND": 0, 
-                "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0
+                "INSUFFICIENT_DATA": 0, "LOW_ADX": 0, "NO_CROSS": 0, 
+                "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0
             }
             
             pre = []
@@ -202,7 +207,8 @@ async def scanner(app):
                 try:
                     df15 = pd.DataFrame (await exchange.fetch_ohlcv(sym, TF_ENTRY, limit=50),
                         columns=["timestamp", "open", "high", "low", "close", "volume"])
-                    if len(df15)<50: continue
+                    if len(df15)<50:
+                        rejection_stats["INSUFFICIENT_DATA"] += 1; continue
                     
                     df15.ta.ema(length=9, append=True)
                     df15.ta.ema(length=21, append=True)
@@ -210,7 +216,8 @@ async def scanner(app):
                     df15.ta.adx(length=14, append=True)
                     last15 = df15.iloc[-1]
 
-                    if f"ATR_{ATR_LEN}" not in df15.columns or pd.isna(last15[f"ATR_{ATR_LEN}"]): continue
+                    if f"ATR_{ATR_LEN}" not in df15.columns or pd.isna(last15[f"ATR_{ATR_LEN}"]):
+                        rejection_stats["INSUFFICIENT_DATA"] += 1; continue
 
                     adx = last15["ADX_14"]; side = None
                     if adx < MIN_M15_ADX:
@@ -235,7 +242,8 @@ async def scanner(app):
                     df1h.ta.ema(length=50,append=True)
                     last1h = df1h.iloc[-1]
                     
-                    if pd.isna(last1h['EMA_50']): continue
+                    if pd.isna(last1h['EMA_50']):
+                        rejection_stats["INSUFFICIENT_DATA"] += 1; continue
 
                     if (side == "LONG" and last1h['close'] < last1h['EMA_50']) or \
                        (side == "SHORT" and last1h['close'] > last1h['EMA_50']):
@@ -245,25 +253,21 @@ async def scanner(app):
                 except Exception as e:
                     log.warning("Scan %s: %s", sym, e)
             
-            # ИЗМЕНЕНИЕ: Формирование и отправка диагностического отчета
             if not pre:
                 duration = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
-                total_rejected = sum(rejection_stats.values())
                 
-                report_msg = (f"✅ <b>Поиск завершен за {duration:.0f} сек.</b> Подходящих сетапов не найдено.\n\n"
+                report_msg = (f"✅ <b>Поиск завершен за {duration:.0f} сек.</b> Кандидатов нет.\n\n"
                               f"📊 <b>Диагностика фильтров (из {len(pairs)} монет):</b>\n"
-                              f"- <code>{rejection_stats['LOW_ADX']:<4}</code> отсеяно по низкому ADX\n"
-                              f"- <code>{rejection_stats['H1_TAILWIND']:<4}</code> отсеяно по H1 фильтру\n"
-                              f"- <code>{rejection_stats['NO_CROSS']:<4}</code> не найдено пересечения EMA\n"
-                              f"- <code>{rejection_stats['ANOMALOUS_CANDLE']:<4}</code> отсеяно по аномальной свече\n"
-                              f"- <code>{rejection_stats['MARKET_REGIME']:<4}</code> отсеяно из-за режима рынка\n\n"
-                              f"<i>Кандидатов не прошло: {total_rejected}</i>")
+                              f"<code>- {rejection_stats['INSUFFICIENT_DATA']:<4}</code> отсеяно по недостатку данных\n"
+                              f"<code>- {rejection_stats['LOW_ADX']:<4}</code> отсеяно по низкому ADX\n"
+                              f"<code>- {rejection_stats['H1_TAILWIND']:<4}</code> отсеяно по H1 фильтру\n"
+                              f"<code>- {rejection_stats['NO_CROSS']:<4}</code> не найдено пересечения EMA\n"
+                              f"<code>- {rejection_stats['ANOMALOUS_CANDLE']:<4}</code> отсеяно по аномальной свече\n"
+                              f"<code>- {rejection_stats['MARKET_REGIME']:<4}</code> отсеяно из-за режима рынка")
 
                 await broadcast(app, report_msg)
                 await asyncio.sleep(900); continue
 
-            # ... (остальная логика остается без изменений) ...
-            
             await broadcast(app, f"📊 <b>Найдено {len(pre)} кандидатов.</b> Отправляю на детальный анализ и оценку LLM...")
             setups_for_llm=[]
             for c in pre:
@@ -468,7 +472,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(cid)
     if not state["bot_on"]:
         state["bot_on"]=True; save_state()
-        await update.message.reply_text("✅ <b>Бот v3.4 (Diagnostic) запущен.</b>"); 
+        await update.message.reply_text("✅ <b>Бот v3.5 (Diagnostic+) запущен.</b>"); 
         asyncio.create_task(scanner(ctx.application))
         asyncio.create_task(monitor(ctx.application))
         asyncio.create_task(daily_pnl_report(ctx.application))
@@ -498,5 +502,5 @@ if __name__=="__main__":
         asyncio.create_task(scanner(app))
         asyncio.create_task(monitor(app))
         asyncio.create_task(daily_pnl_report(app))
-    log.info("Bot v3.4 (Diagnostic) started.")
+    log.info("Bot v3.5 (Diagnostic+) started.")
     app.run_polling()
