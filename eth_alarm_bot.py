@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.8 - Spot Market Analysis
+# v3.9 - Bybit Data Source
 # Changelog 10‑Jul‑2025 (Europe/Belgrade):
-# • Major Fix: Switched all data fetching (tickers, ohlcv) from SWAP market
-#   to SPOT market to resolve the persistent "insufficient data" issue from the
-#   unreliable SWAP API.
+# • Major Change: Switched the entire data-fetching pipeline from MEXC to Bybit
+#   to resolve the persistent API data issues. Bybit is the new data source.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -77,7 +76,7 @@ def setup_sheets():
         log.error("Sheets init failed: %s", e)
 
 # === State ================================================================
-STATE_FILE = "bot_state_v3_8.json"
+STATE_FILE = "bot_state_v3_9.json"
 state = {}
 def load_state():
     global state
@@ -91,9 +90,8 @@ def save_state():
     json.dump(state, open(STATE_FILE,"w"), indent=2)
 
 # === Exchange & Strategy ==================================================
-# ИЗМЕНЕНИЕ: Создаем два клиента. Один для данных (SPOT), другой для торговли (SWAP)
-exchange_swap = ccxt.mexc({'options': {'defaultType':'swap'}})
-exchange_spot = ccxt.mexc({'options': {'defaultType':'spot'}})
+# ИЗМЕНЕНИЕ: Переключаемся на Bybit как на основной источник данных
+exchange_data = ccxt.bybit()
 
 TF_ENTRY  = os.getenv("TF_ENTRY", "15m")
 ATR_LEN   = 14
@@ -135,8 +133,7 @@ async def broadcast(app, txt:str):
 # === Main loops ===========================================================
 async def get_market_snapshot():
     try:
-        # Используем СПОТ для данных
-        ohlcv_btc = await exchange_spot.fetch_ohlcv('BTC/USDT', '1d', limit=51)
+        ohlcv_btc = await exchange_data.fetch_ohlcv('BTC/USDT', '1d', limit=51)
         df_btc = pd.DataFrame(ohlcv_btc, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df_btc.ta.ema(length=50, append=True)
         df_btc.ta.atr(length=14, append=True)
@@ -167,7 +164,7 @@ async def scanner(app):
             snapshot = await get_market_snapshot()
             market_regime = snapshot['regime']
             
-            msg = (f"🔍 <b>Начинаю сканирование рынка...</b>\n"
+            msg = (f"🔍 <b>Начинаю сканирование рынка (Источник: Bybit)...</b>\n"
                    f"<i>Режим:</i> {market_regime} | <i>Волатильность:</i> {snapshot['volatility']} (ATR {snapshot['volatility_percent']})")
             await broadcast(app, msg)
 
@@ -176,9 +173,9 @@ async def scanner(app):
             now = datetime.now(timezone.utc).timestamp()
             state["cooldown"] = {p:t for p,t in state["cooldown"].items() if now-t < COOLDOWN_HOURS*3600}
             
-            # Используем СПОТ для данных
+            tickers = await exchange_data.fetch_tickers()
             pairs = sorted(
-                ((s,t) for s,t in (await exchange_spot.fetch_tickers()).items() if s.endswith('/USDT') and t['quoteVolume']),
+                ((s,t) for s,t in tickers.items() if s.endswith('/USDT') and t.get('quoteVolume')),
                 key=lambda x:x[1]['quoteVolume'], reverse=True
             )[:COIN_LIST_SIZE]
             
@@ -190,8 +187,7 @@ async def scanner(app):
                 if sym in state["cooldown"]: continue
                 try:
                     log.info(f"Scanning ({i+1}/{len(pairs)}): {sym}")
-                    # Используем СПОТ для данных
-                    df15 = pd.DataFrame (await exchange_spot.fetch_ohlcv(sym, TF_ENTRY, limit=40),
+                    df15 = pd.DataFrame (await exchange_data.fetch_ohlcv(sym, TF_ENTRY, limit=40),
                         columns=["timestamp", "open", "high", "low", "close", "volume"])
                     if len(df15) < 35:
                         rejection_stats["INSUFFICIENT_DATA"] += 1; continue
@@ -221,8 +217,7 @@ async def scanner(app):
                     if (last15["high"]-last15["low"]) > last15[f"ATR_{ATR_LEN}"]*ANOMALOUS_CANDLE_MULT:
                         rejection_stats["ANOMALOUS_CANDLE"] += 1; continue
                     
-                    # Используем СПОТ для данных
-                    df1h = pd.DataFrame(await exchange_spot.fetch_ohlcv(sym, "1h", limit=51),
+                    df1h = pd.DataFrame(await exchange_data.fetch_ohlcv(sym, "1h", limit=51),
                         columns=["timestamp", "open", "high", "low", "close", "volume"])
                     df1h.ta.ema(length=50,append=True)
                     last1h = df1h.iloc[-1]
@@ -256,8 +251,7 @@ async def scanner(app):
             setups_for_llm=[]
             for c in pre:
                 try:
-                    # Используем СПОТ для данных
-                    df = pd.DataFrame(await exchange_spot.fetch_ohlcv(c["pair"], TF_ENTRY, limit=100),
+                    df = pd.DataFrame(await exchange_data.fetch_ohlcv(c["pair"], TF_ENTRY, limit=100),
                         columns=["timestamp", "open", "high", "low", "close", "volume"])
                     df.ta.bbands(length=20, std=2, append=True); df.ta.atr(length=ATR_LEN, append=True)
                     df.ta.rsi(length=14, append=True); df.ta.adx(length=14, append=True)
@@ -329,8 +323,7 @@ async def monitor(app):
             await asyncio.sleep(30); continue
         for s in list(state["monitored_signals"]):
             try:
-                # Для мониторинга цены используем SWAP, т.к. там исполнение
-                price = (await exchange_swap.fetch_ticker(s["pair"].replace("/", "") + ":USDT"))["last"]
+                price = (await exchange_data.fetch_ticker(s["pair"]))["last"]
                 if not price: continue
                 
                 if s["side"]=="LONG":
@@ -417,7 +410,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(cid)
     if not state["bot_on"]:
         state["bot_on"]=True; save_state()
-        await update.message.reply_text("✅ <b>Бот v3.8 (Spot Analysis) запущен.</b>"); 
+        await update.message.reply_text("✅ <b>Бот v3.9 (Bybit Data) запущен.</b>"); 
         asyncio.create_task(scanner(ctx.application))
         asyncio.create_task(monitor(ctx.application))
         asyncio.create_task(daily_pnl_report(ctx.application))
@@ -447,5 +440,5 @@ if __name__=="__main__":
         asyncio.create_task(scanner(app))
         asyncio.create_task(monitor(app))
         asyncio.create_task(daily_pnl_report(app))
-    log.info("Bot v3.8 (Spot Analysis) started.")
+    log.info("Bot v3.9 (Bybit Data) started.")
     app.run_polling()
