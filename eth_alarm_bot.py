@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.6 - Polite Scanner
+# v3.7 - Data Adaptation
 # Changelog 10‑Jul‑2025 (Europe/Belgrade):
-# • Fix: Added a small delay (0.5s) between each coin scan to avoid API rate-limiting
-#   by the exchange, which was preventing data retrieval.
+# • Fix: Reduced the historical data requirement from 50 to 35 candles as a
+#   workaround for the exchange API not providing sufficient data history.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -76,7 +76,7 @@ def setup_sheets():
         log.error("Sheets init failed: %s", e)
 
 # === State ================================================================
-STATE_FILE = "bot_state_v3_6.json"
+STATE_FILE = "bot_state_v3_7.json"
 state = {}
 def load_state():
     global state
@@ -203,9 +203,10 @@ async def scanner(app):
                 if sym in state["cooldown"]: continue
                 try:
                     log.info(f"Scanning ({i+1}/{len(pairs)}): {sym}")
-                    df15 = pd.DataFrame (await exchange.fetch_ohlcv(sym, TF_ENTRY, limit=50),
+                    # ИЗМЕНЕНИЕ: Запрашиваем меньше данных, но проверяем наличие достаточного минимума
+                    df15 = pd.DataFrame (await exchange.fetch_ohlcv(sym, TF_ENTRY, limit=40),
                         columns=["timestamp", "open", "high", "low", "close", "volume"])
-                    if len(df15)<50:
+                    if len(df15) < 35:
                         rejection_stats["INSUFFICIENT_DATA"] += 1; continue
                     
                     df15.ta.ema(length=9, append=True)
@@ -251,7 +252,6 @@ async def scanner(app):
                 except Exception as e:
                     log.warning("Scan %s: %s", sym, e)
                 
-                # ИЗМЕНЕНИЕ: Добавлена пауза для снижения нагрузки на API
                 await asyncio.sleep(0.5)
             
             if not pre:
@@ -473,7 +473,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(cid)
     if not state["bot_on"]:
         state["bot_on"]=True; save_state()
-        await update.message.reply_text("✅ <b>Бот v3.6 (Polite) запущен.</b>"); 
+        await update.message.reply_text("✅ <b>Бот v3.7 (Data Adapted) запущен.</b>"); 
         asyncio.create_task(scanner(ctx.application))
         asyncio.create_task(monitor(ctx.application))
         asyncio.create_task(daily_pnl_report(ctx.application))
@@ -503,5 +503,5 @@ if __name__=="__main__":
         asyncio.create_task(scanner(app))
         asyncio.create_task(monitor(app))
         asyncio.create_task(daily_pnl_report(app))
-    log.info("Bot v3.6 (Polite) started.")
+    log.info("Bot v3.7 (Data Adapted) started.")
     app.run_polling()
