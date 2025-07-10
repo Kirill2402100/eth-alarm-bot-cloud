@@ -9,6 +9,7 @@
 # • Google‑Sheets: logs now go to worksheet 'Autonomous_Trade_Log_v5'.
 # • ATR KeyError Fix: Added checks for ATR availability before use.
 # • Stability Fix: Added 30s timeout to exchange requests to prevent hangs.
+# • UX Update: Added notification on scan completion even if no setups found.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -94,7 +95,6 @@ def save_state():
     json.dump(state, open(STATE_FILE,"w"), indent=2)
 
 # === Exchange & Strategy ==================================================
-# ИЗМЕНЕНИЕ: Добавлен таймаут для предотвращения зависаний
 exchange  = ccxt.mexc({
     'options': {'defaultType':'swap'},
     'timeout': 30000,  # 30 секунд в миллисекундах
@@ -146,16 +146,17 @@ async def broadcast(app, txt:str):
 async def scanner(app):
     while state["bot_on"]:
         try:
+            # ИЗМЕНЕНИЕ: Замеряем время начала сканирования
+            scan_start_time = datetime.now(timezone.utc)
+
             if len(state["monitored_signals"]) >= MAX_CONCURRENT_SIGNALS:
                 await asyncio.sleep(300); continue
-            # purge cooldown
+            
             now = datetime.now(timezone.utc).timestamp()
             state["cooldown"] = {p:t for p,t in state["cooldown"].items() if now-t < COOLDOWN_HOURS*3600}
             
-            # Stage 1 – initial scan
             await broadcast(app, f"🔍 Stage 1: scanning top‑{COIN_LIST_SIZE} for EMA‑cross + ADX≥{MIN_M15_ADX} ...")
             
-            # ИЗМЕНЕНИЕ: Добавлены логи для отладки
             log.info("Fetching tickers from exchange...")
             tickers = await exchange.fetch_tickers()
             log.info(f"Successfully fetched {len(tickers)} tickers.")
@@ -170,25 +171,23 @@ async def scanner(app):
                 if sym in state["cooldown"]: continue
                 try:
                     df15 = pd.DataFrame (await exchange.fetch_ohlcv(sym, TF_ENTRY, limit=50),
-    columns=["timestamp", "open", "high", "low", "close", "volume"]
-)
+                        columns=["timestamp", "open", "high", "low", "close", "volume"])
                     if len(df15)<30: continue
                     df15.ta.ema(length=9, append=True)
                     df15.ta.ema(length=21, append=True)
-                    df15.ta.atr(length=ATR_LEN, append=True)  # ATR_14
+                    df15.ta.atr(length=ATR_LEN, append=True)
                     df15.ta.adx(length=14, append=True)
                     last, prev = df15.iloc[-1], df15.iloc[-2]
 
-                    # Защита от отсутствия ATR
                     if f"ATR_{ATR_LEN}" not in df15.columns or pd.isna(last[f"ATR_{ATR_LEN}"]):
                         log.debug(f"{sym}: reject - no ATR_{ATR_LEN} (insufficient data)")
                         continue
 
-                    adx = last["ADX_14"];  side = None
+                    adx = last["ADX_14"]; side = None
                     if adx < MIN_M15_ADX: continue
-                    # EMA cross
+                    
                     side = None
-                    for i in range(1, 4):         # последние 3 свечи
+                    for i in range(1, 4):
                         cur  = df15.iloc[-i]
                         prev = df15.iloc[-i-1]
                         if prev["EMA_9"] <= prev["EMA_21"] and cur["EMA_9"] > cur["EMA_21"]:
@@ -198,13 +197,12 @@ async def scanner(app):
                     if not side:
                         log.debug(f"{sym}: reject – no EMA cross in last 3 bars")
                         continue
-                    # anomalous candle
+                    
                     atr = last[f"ATR_{ATR_LEN}"]
                     if (last["high"]-last["low"]) > atr*ANOMALOUS_CANDLE_MULT: continue
-                    # H1 trend
+                    
                     df1h = pd.DataFrame(await exchange.fetch_ohlcv(sym, "1h", limit=100),
-    columns=["timestamp", "open", "high", "low", "close", "volume"]
-)
+                        columns=["timestamp", "open", "high", "low", "close", "volume"])
                     df1h.ta.ema(length=9,append=True); df1h.ta.ema(length=21,append=True); df1h.ta.ema(length=50,append=True)
                     recent = df1h.iloc[-3:]
                     up   = all(r["EMA_9"]>r["EMA_21"]>r["EMA_50"] for _,r in recent.iterrows())
@@ -213,35 +211,37 @@ async def scanner(app):
                     pre.append({"pair":sym,"side":side,"h1_trend":"UP" if up else "DOWN"})
                 except Exception as e:
                     log.warning("Scan %s: %s", sym, e)
+            
+            # ИЗМЕНЕНИЕ: Уведомление, если после Stage 1 ничего не найдено
             if not pre:
+                duration = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
+                await broadcast(app, f"✅ Scan finished. No setups found. Took {duration:.0f}s.")
                 await asyncio.sleep(900); continue
-            # Stage 2 – enrich
+
             await broadcast(app, f"📊 Stage 2: {len(pre)} candidates → enrich for LLM.")
             setups=[]
             for c in pre:
                 try:
                     df = pd.DataFrame(await exchange.fetch_ohlcv(c["pair"], TF_ENTRY, limit=100),
-    columns=["timestamp", "open", "high", "low", "close", "volume"]
-)  
+                        columns=["timestamp", "open", "high", "low", "close", "volume"])
                     df.ta.bbands(length=20, std=2, append=True)
                     df.ta.atr(length=ATR_LEN, append=True)
                     df.ta.rsi(length=14, append=True)
                     df.ta.adx(length=14, append=True)
                     last = df.iloc[-1]
                     
-                    # Защита от отсутствия ATR
                     if f"ATR_{ATR_LEN}" not in df.columns or pd.isna(last[f"ATR_{ATR_LEN}"]):
                         log.debug(f"{c['pair']}: reject - no ATR_{ATR_LEN} (insufficient data)")
                         continue
 
                     adx = round(float(last["ADX_14"]),2)
-                    if adx < MIN_M15_ADX: continue  # second gate
+                    if adx < MIN_M15_ADX: continue
                     entry = last["close"]; risk = last[f"ATR_{ATR_LEN}"]*SL_ATR_MULT
                     sl,tp = (entry-risk, entry+risk*RR_RATIO) if c["side"]=="LONG" else (entry+risk, entry-risk*RR_RATIO)
                     bb_pos="Inside"
                     if entry>last["BBU_20_2.0"]: bb_pos="Above_Upper"
                     elif entry<last["BBL_20_2.0"]: bb_pos="Below_Lower"
-                    # H1 ATR%
+                    
                     df1h = pd.DataFrame(await exchange.fetch_ohlcv(c["pair"],'1h',limit=60),
                                         columns=["ts","o","h","l","c","v"])
                     df1h.ta.atr(length=ATR_LEN, append=True)
@@ -252,9 +252,13 @@ async def scanner(app):
                         "bb_pos":bb_pos,"h1_atr_pct":h1_atr_pct
                     })
                 except Exception as e: log.warning("Enrich %s: %s", c["pair"], e)
+            
+            # ИЗМЕНЕНИЕ: Уведомление, если после Stage 2 ничего не найдено
             if not setups:
+                duration = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
+                await broadcast(app, f"✅ Scan finished. No setups passed enrichment. Took {duration:.0f}s.")
                 await asyncio.sleep(900); continue
-            # Stage 3 – LLM
+
             await broadcast(app, "🤖 Stage 3: sending setups to LLM ...")
             llm_obj = await ask_llm(PROMPT + "\n\n" + json.dumps({"candidates":setups}))
             if llm_obj and llm_obj.get("pair"):
@@ -270,7 +274,11 @@ async def scanner(app):
                 save_state()
                 await broadcast(app, f"🚀 NEW SETUP {llm_obj['pair']} ({llm_obj['side']}) – ID {sig_id}")
             else:
-                await broadcast(app, f"ℹ️ LLM rejected: {llm_obj.get('reason','no response') if llm_obj else 'no response'}")
+                # ИЗМЕНЕНИЕ: Уведомление, если LLM отклонил сетапы
+                duration = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
+                reason = llm_obj.get('reason','no response') if llm_obj else 'no response'
+                await broadcast(app, f"✅ Scan finished. LLM rejected setups: {reason}. Took {duration:.0f}s.")
+            
             await asyncio.sleep(900)
         except Exception as e:
             log.error("Scanner critical: %s", e, exc_info=True)
