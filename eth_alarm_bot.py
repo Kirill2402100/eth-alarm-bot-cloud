@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v4.1 - Total Diagnostics
+# v4.2 - Forced Error Logging
 # Changelog 10‑Jul‑2025 (Europe/Belgrade):
-# • Diagnostics Fix: Added an "ERRORS" counter to the diagnostic report to
-#   catch and count exceptions during the scan loop, providing a complete picture.
+# • Fix: Added a direct print() statement for exceptions to ensure error visibility
+#   on logging platforms that might hide WARNING level logs.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -76,7 +76,7 @@ def setup_sheets():
         log.error("Sheets init failed: %s", e)
 
 # === State ================================================================
-STATE_FILE = "bot_state_v4_1.json"
+STATE_FILE = "bot_state_v4_2.json"
 state = {}
 def load_state():
     global state
@@ -181,7 +181,6 @@ async def scanner(app):
                 key=lambda x:x[1]['quoteVolume'], reverse=True
             )[:COIN_LIST_SIZE]
             
-            # ИЗМЕНЕНИЕ: Добавлен счетчик ошибок
             rejection_stats = {
                 "ERRORS": 0, "INSUFFICIENT_DATA": 0, "LOW_ADX": 0, "NO_CROSS": 0, 
                 "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0
@@ -237,9 +236,9 @@ async def scanner(app):
 
                     pre.append({"pair":sym, "side":side})
                 except Exception as e:
-                    # ИЗМЕНЕНИЕ: Ловим и считаем ошибки
-                    log.warning(f"Scan ERROR on {sym}: {e}")
                     rejection_stats["ERRORS"] += 1
+                    # ИЗМЕНЕНИЕ: Принудительный вывод ошибки в лог
+                    print(f"!!! CAUGHT EXCEPTION on {sym} !!! --- {e}")
                 
                 await asyncio.sleep(0.5)
             
@@ -256,14 +255,13 @@ async def scanner(app):
                               f"<code>- {rejection_stats['MARKET_REGIME']:<4}</code> отсеяно из-за режима рынка")
                 await broadcast(app, report_msg); await asyncio.sleep(900); continue
 
-            # ... (остальная логика)
+            # ... (rest of the logic remains the same)
             
         except Exception as e:
             log.error("Scanner critical: %s", e, exc_info=True)
             await asyncio.sleep(300)
 
-# ... (остальной код monitor, daily_pnl_report, и т.д. остается без изменений) ...
-
+# ... (the rest of the code for monitor, daily_pnl_report, etc. remains unchanged) ...
 async def monitor(app):
     while state["bot_on"]:
         if not state["monitored_signals"]:
@@ -357,7 +355,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(cid)
     if not state["bot_on"]:
         state["bot_on"]=True; save_state()
-        await update.message.reply_text("✅ <b>Бот v4.1 (Total Diagnostics) запущен.</b>"); 
+        await update.message.reply_text("✅ <b>Бот v4.2 (Forced Log) запущен.</b>"); 
         asyncio.create_task(scanner(ctx.application))
         asyncio.create_task(monitor(ctx.application))
         asyncio.create_task(daily_pnl_report(ctx.application))
@@ -387,5 +385,5 @@ if __name__=="__main__":
         asyncio.create_task(scanner(app))
         asyncio.create_task(monitor(app))
         asyncio.create_task(daily_pnl_report(app))
-    log.info("Bot v4.1 (Total Diagnostics) started.")
+    log.info("Bot v4.2 (Forced Log) started.")
     app.run_polling()
