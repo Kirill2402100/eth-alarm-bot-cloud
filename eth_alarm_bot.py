@@ -8,6 +8,7 @@
 # • New metrics logged: H1_ATR_percent, MFE_R, MAE_R, LLM_Confidence.
 # • Google‑Sheets: logs now go to worksheet 'Autonomous_Trade_Log_v5'.
 # • ATR KeyError Fix: Added checks for ATR availability before use.
+# • Stability Fix: Added 30s timeout to exchange requests to prevent hangs.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -93,7 +94,11 @@ def save_state():
     json.dump(state, open(STATE_FILE,"w"), indent=2)
 
 # === Exchange & Strategy ==================================================
-exchange  = ccxt.mexc({'options': {'defaultType':'swap'}})
+# ИЗМЕНЕНИЕ: Добавлен таймаут для предотвращения зависаний
+exchange  = ccxt.mexc({
+    'options': {'defaultType':'swap'},
+    'timeout': 30000,  # 30 секунд в миллисекундах
+})
 TF_ENTRY  = os.getenv("TF_ENTRY", "15m")
 ATR_LEN   = 14
 SL_ATR_MULT  = 1.5
@@ -146,9 +151,15 @@ async def scanner(app):
             # purge cooldown
             now = datetime.now(timezone.utc).timestamp()
             state["cooldown"] = {p:t for p,t in state["cooldown"].items() if now-t < COOLDOWN_HOURS*3600}
+            
             # Stage 1 – initial scan
             await broadcast(app, f"🔍 Stage 1: scanning top‑{COIN_LIST_SIZE} for EMA‑cross + ADX≥{MIN_M15_ADX} ...")
+            
+            # ИЗМЕНЕНИЕ: Добавлены логи для отладки
+            log.info("Fetching tickers from exchange...")
             tickers = await exchange.fetch_tickers()
+            log.info(f"Successfully fetched {len(tickers)} tickers.")
+            
             pairs = sorted(
                 ((s,t) for s,t in tickers.items() if s.endswith(':USDT') and t['quoteVolume']),
                 key=lambda x:x[1]['quoteVolume'], reverse=True
@@ -168,7 +179,7 @@ async def scanner(app):
                     df15.ta.adx(length=14, append=True)
                     last, prev = df15.iloc[-1], df15.iloc[-2]
 
-                    # ИЗМЕНЕНИЕ 1: Защита от отсутствия ATR
+                    # Защита от отсутствия ATR
                     if f"ATR_{ATR_LEN}" not in df15.columns or pd.isna(last[f"ATR_{ATR_LEN}"]):
                         log.debug(f"{sym}: reject - no ATR_{ATR_LEN} (insufficient data)")
                         continue
@@ -218,7 +229,7 @@ async def scanner(app):
                     df.ta.adx(length=14, append=True)
                     last = df.iloc[-1]
                     
-                    # ИЗМЕНЕНИЕ 2: Защита от отсутствия ATR
+                    # Защита от отсутствия ATR
                     if f"ATR_{ATR_LEN}" not in df.columns or pd.isna(last[f"ATR_{ATR_LEN}"]):
                         log.debug(f"{c['pair']}: reject - no ATR_{ATR_LEN} (insufficient data)")
                         continue
