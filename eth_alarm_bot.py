@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v8.7 - Strategy v2.6  (Ultimate "On‑the‑Fly" Filtering – refactored)
+# v3.0 - Weighted Decision System
 # Changelog 10‑Jul‑2025 (Europe/Belgrade):
-# • Bug‑fix ①  – candle_range now compared to ATR_14 (absolute), not ATRr_14.
-# • Bug‑fix ②  – second ADX ≥ 25 check just before LLM call.
-# • Risk        – SL = 1.5 × ATR,  TP = 2.2 × ATR  (RR ≈ 1 : 1.47).
-# • New metrics logged: H1_ATR_percent, MFE_R, MAE_R, LLM_Confidence.
-# • Google‑Sheets: logs now go to worksheet 'Autonomous_Trade_Log_v5'.
-# • ATR KeyError Fix: Added checks for ATR availability before use.
-# • Stability Fix: Added 30s timeout to exchange requests to prevent hangs.
-# • UX Update: Added notification on scan completion even if no setups found.
+# • New Module: LLM now scores candidates 1-10 instead of choosing one.
+# • New Module: Dynamic Position Sizing ($50/$30/$20) based on LLM score.
+# • New Module: Market Regime Filter based on BTC Daily EMA(50). Blocks LONGs in bearish market.
+# • New Module: P&L is now calculated and logged to Google Sheets.
+# • Strategy Tuning: Initial filters (H1 Trend, ADX) are relaxed to feed more candidates to the LLM.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -52,13 +49,15 @@ def fmt(price: float | None) -> str:
 TRADE_LOG_WS = None
 SHEET_NAME   = "Autonomous_Trade_Log_v5"
 
+# ИЗМЕНЕНИЕ: Добавлены новые колонки для расширенной аналитики
 HEADERS = [
     "Signal_ID","Pair","Side","Status",
     "Entry_Time_UTC","Exit_Time_UTC",
     "Entry_Price","Exit_Price","SL_Price","TP_Price",
     "MFE_Price","MAE_Price","MFE_R","MAE_R",
-    "Entry_RSI","Entry_ADX","H1_Trend_at_Entry","H1_ATR_percent",
-    "Entry_BB_Position","LLM_Reason","LLM_Confidence"
+    "Entry_RSI","Entry_ADX","H1_Trend_at_Entry",
+    "Entry_BB_Position","LLM_Reason",
+    "Confidence_Score", "Position_Size_USD", "Leverage", "PNL_USD", "PNL_Percent"
 ]
 
 def setup_sheets():
@@ -81,7 +80,7 @@ def setup_sheets():
         log.error("Sheets init failed: %s", e)
 
 # === State ================================================================
-STATE_FILE = "bot_state_v2_6.json"
+STATE_FILE = "bot_state_v3_0.json" # Новое имя файла для новой версии
 state = {}
 def load_state():
     global state
@@ -97,21 +96,23 @@ def save_state():
 # === Exchange & Strategy ==================================================
 exchange  = ccxt.mexc({
     'options': {'defaultType':'swap'},
-    'timeout': 30000,  # 30 секунд в миллисекундах
+    'timeout': 30000,
 })
 TF_ENTRY  = os.getenv("TF_ENTRY", "15m")
 ATR_LEN   = 14
 SL_ATR_MULT  = 1.5
 RR_RATIO     = 2.2
+# ИЗМЕНЕНИЕ: Ослабление фильтра ADX
 MIN_M15_ADX  = 20
+MIN_CONFIDENCE_SCORE = 6 # Минимальный балл от LLM для входа в сделку
 
 # === LLM prompt ===========================================================
+# ИЗМЕНЕНИЕ: Новый промпт для скоринга
 PROMPT = (
-    "Ты — главный трейдер-аналитик. Перед тобой список candidates, уже прошедших "
-    "тройной фильтр (M15 EMA‑кросс, H1 устойчивый тренд, ADX≥25). "
-    "Выбери ровно ОДИН лучший сетап по комбинации (ADX, RSI). "
-    "Верни JSON: либо весь объект кандидата + field 'reason', либо "
-    "{'decision':'REJECT','reason':'...'}."
+    "Ты — главный трейдер-аналитик. Проанализируй КАЖДОГО кандидата из списка ниже. Для каждого кандидата верни:"
+    "1. 'confidence_score': твою уверенность в успехе сделки по шкале от 1 до 10."
+    "2. 'reason': краткое обоснование оценки (2-3 предложения), обращая внимание на комбинацию ADX, RSI и положение цены относительно BBands."
+    "Верни ТОЛЬКО JSON-массив с объектами по каждому кандидату, без лишних слов."
 )
 
 async def ask_llm(prompt: str):
@@ -120,8 +121,7 @@ async def ask_llm(prompt: str):
         "model": LLM_MODEL_ID,
         "messages":[{"role":"user","content":prompt}],
         "temperature":0.4,
-        "response_format":{"type":"json_object"},
-        "logprobs":True
+        "response_format":{"type":"json_object"}
     }
     hdrs = {"Authorization":f"Bearer {LLM_API_KEY}","Content-Type":"application/json"}
     try:
@@ -129,9 +129,15 @@ async def ask_llm(prompt: str):
             async with s.post(LLM_API_URL, json=payload, headers=hdrs, timeout=180) as r:
                 data = await r.json()
                 content = data["choices"][0]["message"]["content"]
-                obj = json.loads(content)
-                obj["llm_confidence"] = data["choices"][0].get("logprobs",{}).get("token_logprobs","N/A")
-                return obj
+                # Ожидаем, что LLM вернет объект с ключом "candidates" или просто массив
+                response_data = json.loads(content)
+                if isinstance(response_data, dict) and "candidates" in response_data:
+                    return response_data["candidates"]
+                elif isinstance(response_data, list):
+                    return response_data
+                else:
+                    log.error(f"LLM returned unexpected format: {response_data}")
+                    return []
     except Exception as e:
         log.error("LLM error: %s", e)
         return None
@@ -143,19 +149,36 @@ async def broadcast(app, txt:str):
         except Exception as e: log.error("Send fail %s: %s", cid, e)
 
 # === Main loops ===========================================================
+async def get_market_regime():
+    try:
+        ohlcv_btc = await exchange.fetch_ohlcv('BTC/USDT', '1d', limit=51)
+        df_btc = pd.DataFrame(ohlcv_btc, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df_btc.ta.ema(length=50, append=True)
+        last_btc = df_btc.iloc[-1]
+        if last_btc['close'] < last_btc['EMA_50']:
+            return "BEARISH"
+        return "BULLISH"
+    except Exception as e:
+        log.warning(f"Could not fetch BTC market regime: {e}")
+        return "BULLISH" # По умолчанию разрешаем все сделки
+
 async def scanner(app):
     while state["bot_on"]:
         try:
-            # ИЗМЕНЕНИЕ: Замеряем время начала сканирования
             scan_start_time = datetime.now(timezone.utc)
-
             if len(state["monitored_signals"]) >= MAX_CONCURRENT_SIGNALS:
                 await asyncio.sleep(300); continue
             
+            # ИЗМЕНЕНИЕ: Фильтр рыночного режима
+            market_regime = await get_market_regime()
+            log.info(f"Market Regime: {market_regime}")
+            if market_regime == "BEARISH":
+                await broadcast(app, "📉 Market regime is BEARISH. LONG trades are disabled.")
+
             now = datetime.now(timezone.utc).timestamp()
             state["cooldown"] = {p:t for p,t in state["cooldown"].items() if now-t < COOLDOWN_HOURS*3600}
             
-            await broadcast(app, f"🔍 Stage 1: scanning top‑{COIN_LIST_SIZE} for EMA‑cross + ADX≥{MIN_M15_ADX} ...")
+            await broadcast(app, f"🔍 Stage 1: scanning top‑{COIN_LIST_SIZE} for setups (ADX≥{MIN_M15_ADX})...")
             
             log.info("Fetching tickers from exchange...")
             tickers = await exchange.fetch_tickers()
@@ -177,49 +200,48 @@ async def scanner(app):
                     df15.ta.ema(length=21, append=True)
                     df15.ta.atr(length=ATR_LEN, append=True)
                     df15.ta.adx(length=14, append=True)
-                    last, prev = df15.iloc[-1], df15.iloc[-2]
+                    last15 = df15.iloc[-1]
 
-                    if f"ATR_{ATR_LEN}" not in df15.columns or pd.isna(last[f"ATR_{ATR_LEN}"]):
-                        log.debug(f"{sym}: reject - no ATR_{ATR_LEN} (insufficient data)")
+                    if f"ATR_{ATR_LEN}" not in df15.columns or pd.isna(last15[f"ATR_{ATR_LEN}"]):
                         continue
 
-                    adx = last["ADX_14"]; side = None
+                    adx = last15["ADX_14"]; side = None
                     if adx < MIN_M15_ADX: continue
                     
                     side = None
                     for i in range(1, 4):
-                        cur  = df15.iloc[-i]
-                        prev = df15.iloc[-i-1]
-                        if prev["EMA_9"] <= prev["EMA_21"] and cur["EMA_9"] > cur["EMA_21"]:
-                            side = "LONG"; break
-                        if prev["EMA_9"] >= prev["EMA_21"] and cur["EMA_9"] < cur["EMA_21"]:
-                            side = "SHORT"; break
-                    if not side:
-                        log.debug(f"{sym}: reject – no EMA cross in last 3 bars")
-                        continue
+                        cur, prev = df15.iloc[-i], df15.iloc[-i-1]
+                        if prev["EMA_9"] <= prev["EMA_21"] and cur["EMA_9"] > cur["EMA_21"]: side = "LONG"; break
+                        if prev["EMA_9"] >= prev["EMA_21"] and cur["EMA_9"] < cur["EMA_21"]: side = "SHORT"; break
+                    if not side: continue
                     
-                    atr = last[f"ATR_{ATR_LEN}"]
-                    if (last["high"]-last["low"]) > atr*ANOMALOUS_CANDLE_MULT: continue
+                    # Применяем фильтр режима рынка
+                    if market_regime == "BEARISH" and side == "LONG": continue
+
+                    if (last15["high"]-last15["low"]) > last15[f"ATR_{ATR_LEN}"]*ANOMALOUS_CANDLE_MULT: continue
                     
-                    df1h = pd.DataFrame(await exchange.fetch_ohlcv(sym, "1h", limit=100),
+                    # ИЗМЕНЕНИЕ: Ослабление H1 фильтра
+                    df1h = pd.DataFrame(await exchange.fetch_ohlcv(sym, "1h", limit=51),
                         columns=["timestamp", "open", "high", "low", "close", "volume"])
                     df1h.ta.ema(length=9,append=True); df1h.ta.ema(length=21,append=True); df1h.ta.ema(length=50,append=True)
-                    recent = df1h.iloc[-3:]
-                    up   = all(r["EMA_9"]>r["EMA_21"]>r["EMA_50"] for _,r in recent.iterrows())
-                    down = all(r["EMA_9"]<r["EMA_21"]<r["EMA_50"] for _,r in recent.iterrows())
-                    if (side=="LONG" and not up) or (side=="SHORT" and not down): continue
-                    pre.append({"pair":sym,"side":side,"h1_trend":"UP" if up else "DOWN"})
+                    last1h = df1h.iloc[-1]
+                    h1_trend = "NEUTRAL"
+                    if last1h["EMA_9"] > last1h["EMA_21"] > last1h["EMA_50"]: h1_trend = "UP"
+                    if last1h["EMA_9"] < last1h["EMA_21"] < last1h["EMA_50"]: h1_trend = "DOWN"
+
+                    if (side=="LONG" and h1_trend != "UP") or (side=="SHORT" and h1_trend != "DOWN"): continue
+
+                    pre.append({"pair":sym, "side":side, "h1_trend":h1_trend})
                 except Exception as e:
                     log.warning("Scan %s: %s", sym, e)
             
-            # ИЗМЕНЕНИЕ: Уведомление, если после Stage 1 ничего не найдено
             if not pre:
                 duration = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
                 await broadcast(app, f"✅ Scan finished. No setups found. Took {duration:.0f}s.")
                 await asyncio.sleep(900); continue
 
-            await broadcast(app, f"📊 Stage 2: {len(pre)} candidates → enrich for LLM.")
-            setups=[]
+            await broadcast(app, f"📊 Stage 2: {len(pre)} candidates → enriching for LLM.")
+            setups_for_llm=[]
             for c in pre:
                 try:
                     df = pd.DataFrame(await exchange.fetch_ohlcv(c["pair"], TF_ENTRY, limit=100),
@@ -230,54 +252,85 @@ async def scanner(app):
                     df.ta.adx(length=14, append=True)
                     last = df.iloc[-1]
                     
-                    if f"ATR_{ATR_LEN}" not in df.columns or pd.isna(last[f"ATR_{ATR_LEN}"]):
-                        log.debug(f"{c['pair']}: reject - no ATR_{ATR_LEN} (insufficient data)")
-                        continue
+                    if f"ATR_{ATR_LEN}" not in df.columns or pd.isna(last[f"ATR_{ATR_LEN}"]): continue
 
-                    adx = round(float(last["ADX_14"]),2)
-                    if adx < MIN_M15_ADX: continue
-                    entry = last["close"]; risk = last[f"ATR_{ATR_LEN}"]*SL_ATR_MULT
-                    sl,tp = (entry-risk, entry+risk*RR_RATIO) if c["side"]=="LONG" else (entry+risk, entry-risk*RR_RATIO)
+                    entry = last["close"]
                     bb_pos="Inside"
                     if entry>last["BBU_20_2.0"]: bb_pos="Above_Upper"
                     elif entry<last["BBL_20_2.0"]: bb_pos="Below_Lower"
                     
-                    df1h = pd.DataFrame(await exchange.fetch_ohlcv(c["pair"],'1h',limit=60),
-                                        columns=["ts","o","h","l","c","v"])
-                    df1h.ta.atr(length=ATR_LEN, append=True)
-                    h1_atr_pct = round(float(df1h.iloc[-1][f"ATR_{ATR_LEN}"]/df1h.iloc[-1]["c"]*100),2)
-                    setups.append({
-                        "pair":c["pair"],"side":c["side"],"entry_price":entry,"sl":sl,"tp":tp,
-                        "h1_trend":c["h1_trend"],"adx":adx,"rsi":round(float(last["RSI_14"]),2),
-                        "bb_pos":bb_pos,"h1_atr_pct":h1_atr_pct
+                    setups_for_llm.append({
+                        "pair":c["pair"], "side":c["side"], "entry_price":entry,
+                        "adx":round(float(last["ADX_14"]),2), "rsi":round(float(last["RSI_14"]),2),
+                        "bb_pos":bb_pos, "sl_atr_mult": SL_ATR_MULT, "rr_ratio": RR_RATIO,
+                        "atr_val": last[f"ATR_{ATR_LEN}"]
                     })
                 except Exception as e: log.warning("Enrich %s: %s", c["pair"], e)
             
-            # ИЗМЕНЕНИЕ: Уведомление, если после Stage 2 ничего не найдено
-            if not setups:
+            if not setups_for_llm:
                 duration = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
                 await broadcast(app, f"✅ Scan finished. No setups passed enrichment. Took {duration:.0f}s.")
                 await asyncio.sleep(900); continue
 
-            await broadcast(app, "🤖 Stage 3: sending setups to LLM ...")
-            llm_obj = await ask_llm(PROMPT + "\n\n" + json.dumps({"candidates":setups}))
-            if llm_obj and llm_obj.get("pair"):
-                sig_id = str(uuid.uuid4())[:8]
-                llm_obj.update({
-                    "signal_id":sig_id,
-                    "entry_time_utc":datetime.now(timezone.utc).isoformat(),
-                    "mfe_price":llm_obj["entry_price"],
-                    "mae_price":llm_obj["entry_price"]
-                })
-                state["monitored_signals"].append(llm_obj)
-                state["cooldown"][llm_obj["pair"]] = now
-                save_state()
-                await broadcast(app, f"🚀 NEW SETUP {llm_obj['pair']} ({llm_obj['side']}) – ID {sig_id}")
-            else:
-                # ИЗМЕНЕНИЕ: Уведомление, если LLM отклонил сетапы
-                duration = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
-                reason = llm_obj.get('reason','no response') if llm_obj else 'no response'
-                await broadcast(app, f"✅ Scan finished. LLM rejected setups: {reason}. Took {duration:.0f}s.")
+            await broadcast(app, f"🤖 Stage 3: Sending {len(setups_for_llm)} setups to LLM for scoring...")
+            scored_candidates = await ask_llm(PROMPT + "\n\n" + json.dumps({"candidates":setups_for_llm}))
+            
+            if not scored_candidates:
+                await broadcast(app, "ℹ️ LLM did not return any scored candidates.")
+                await asyncio.sleep(900); continue
+            
+            # ИЗМЕНЕНИЕ: Новая логика выбора и динамического сайзинга
+            final_candidates = []
+            for i, scored in enumerate(scored_candidates):
+                original_setup = setups_for_llm[i]
+                if scored.get('confidence_score', 0) >= MIN_CONFIDENCE_SCORE:
+                    original_setup.update(scored)
+                    final_candidates.append(original_setup)
+            
+            if not final_candidates:
+                await broadcast(app, f"✅ Scan finished. No setups met min score of {MIN_CONFIDENCE_SCORE}. Took {(datetime.now(timezone.utc) - scan_start_time).total_seconds():.0f}s.")
+                await asyncio.sleep(900); continue
+
+            # Сортировка: сначала по убыванию score, потом по убыванию adx
+            final_candidates.sort(key=lambda x: (x.get('confidence_score', 0), x.get('adx', 0)), reverse=True)
+            best_setup = final_candidates[0]
+            
+            # Определение размера позиции
+            score = best_setup.get('confidence_score', 0)
+            if score >= 9: position_size_usd = 50
+            elif score >= 7: position_size_usd = 30
+            else: position_size_usd = 20
+
+            # Расчет SL/TP
+            entry = best_setup["entry_price"]
+            risk = best_setup["atr_val"] * SL_ATR_MULT
+            sl,tp = (entry-risk, entry+risk*RR_RATIO) if best_setup["side"]=="LONG" else (entry+risk, entry-risk*RR_RATIO)
+            
+            sig_id = str(uuid.uuid4())[:8]
+            signal_to_monitor = {
+                "signal_id": sig_id,
+                "entry_time_utc": datetime.now(timezone.utc).isoformat(),
+                "pair": best_setup["pair"], "side": best_setup["side"],
+                "entry_price": entry, "sl": sl, "tp": tp,
+                "mfe_price": entry, "mae_price": entry,
+                "confidence_score": score,
+                "position_size_usd": position_size_usd,
+                "leverage": 100,
+                "reason": best_setup.get("reason"),
+                "adx": best_setup.get("adx"), "rsi": best_setup.get("rsi"),
+                "bb_pos": best_setup.get("bb_pos")
+            }
+            
+            state["monitored_signals"].append(signal_to_monitor)
+            state["cooldown"][best_setup["pair"]] = now
+            save_state()
+            
+            msg = (f"🚀 **NEW SETUP**\n\n"
+                   f"**Pair:** {best_setup['pair']} ({best_setup['side']})\n"
+                   f"**Score:** {score}/10\n"
+                   f"**Recommended Size:** ${position_size_usd} (Leverage 100x)\n"
+                   f"**Reason:** {best_setup.get('reason', 'N/A')}")
+            await broadcast(app, msg)
             
             await asyncio.sleep(900)
         except Exception as e:
@@ -292,32 +345,49 @@ async def monitor(app):
             try:
                 price = (await exchange.fetch_ticker(s["pair"]))["last"]
                 if not price: continue
+                
+                # MFE/MAE
                 if s["side"]=="LONG":
                     if price>s["mfe_price"]: s["mfe_price"]=price
                     if price<s["mae_price"]: s["mae_price"]=price
                 else:
                     if price<s["mfe_price"]: s["mfe_price"]=price
                     if price>s["mae_price"]: s["mae_price"]=price
+                
                 hit=None
-                if (s["side"]=="LONG" and price>=s["tp"]) or (s["side"]=="SHORT" and price<=s["tp"]):
-                    hit="TP_HIT"
-                elif (s["side"]=="LONG" and price<=s["sl"]) or (s["side"]=="SHORT" and price>=s["sl"]):
-                    hit="SL_HIT"
+                if (s["side"]=="LONG" and price>=s["tp"]) or (s["side"]=="SHORT" and price<=s["tp"]): hit="TP_HIT"
+                elif (s["side"]=="LONG" and price<=s["sl"]) or (s["side"]=="SHORT" and price>=s["sl"]): hit="SL_HIT"
+                
                 if hit:
                     risk = abs(s["entry_price"]-s["sl"])
-                    mfe_r = round(abs(s["mfe_price"]-s["entry_price"])/risk,2)
-                    mae_r = round(abs(s["mae_price"]-s["entry_price"])/risk,2)
+                    mfe_r = round(abs(s["mfe_price"]-s["entry_price"])/risk, 2) if risk > 0 else 0
+                    mae_r = round(abs(s["mae_price"]-s["entry_price"])/risk, 2) if risk > 0 else 0
+                    
+                    # ИЗМЕНЕНИЕ: Расчет PNL
+                    leverage = s.get("leverage", 100)
+                    position_size = s.get("position_size_usd", 0)
+                    exit_price = s['tp'] if hit == 'TP_HIT' else s['sl']
+                    
+                    price_change = (exit_price - s['entry_price']) / s['entry_price']
+                    if s["side"] == "SHORT": price_change = -price_change
+                    
+                    pnl_percent = price_change * leverage * 100
+                    pnl_usd = position_size * (pnl_percent / 100)
+
                     if TRADE_LOG_WS:
                         row=[
                             s["signal_id"],s["pair"],s["side"],hit,
                             s["entry_time_utc"],datetime.now(timezone.utc).isoformat(),
-                            s["entry_price"],price,s["sl"],s["tp"],
+                            s["entry_price"],exit_price,s["sl"],s["tp"],
                             s["mfe_price"],s["mae_price"],mfe_r,mae_r,
-                            s.get("rsi"),s.get("adx"),s.get("h1_trend"),s.get("h1_atr_pct"),
-                            s.get("bb_pos"),s.get("reason"),s.get("llm_confidence","N/A")
+                            s.get("rsi"),s.get("adx"),s.get("h1_trend"),
+                            s.get("bb_pos"),s.get("reason"),
+                            s.get("confidence_score"), s.get("position_size_usd"), s.get("leverage"),
+                            pnl_usd, pnl_percent
                         ]
                         await asyncio.to_thread(TRADE_LOG_WS.append_row,row,value_input_option='USER_ENTERED')
-                    await broadcast(app, f"✖️ Closed {s['pair']} ({hit}) @ {fmt(price)}")
+                    
+                    await broadcast(app, f"✖️ Closed {s['pair']} ({hit}) @ {fmt(exit_price)}\nPNL: ${pnl_usd:.2f} ({pnl_percent:.2f}%)")
                     state["monitored_signals"].remove(s); save_state()
             except Exception as e: log.error("Monitor %s: %s", s.get("signal_id"), e)
         await asyncio.sleep(60)
@@ -328,7 +398,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(cid)
     if not state["bot_on"]:
         state["bot_on"]=True; save_state()
-        await update.message.reply_text("✅ Бот v2.6 запущен."); asyncio.create_task(scanner(ctx.application)); asyncio.create_task(monitor(ctx.application))
+        await update.message.reply_text("✅ Бот v3.0 запущен."); asyncio.create_task(scanner(ctx.application)); asyncio.create_task(monitor(ctx.application))
     else:
         await update.message.reply_text("ℹ️ Уже запущен.")
 
@@ -349,5 +419,5 @@ if __name__=="__main__":
     app.add_handler(CommandHandler("status",cmd_status))
     if state["bot_on"]:
         asyncio.create_task(scanner(app)); asyncio.create_task(monitor(app))
-    log.info("Bot v2.6 started.")
+    log.info("Bot v3.0 started.")
     app.run_polling()
