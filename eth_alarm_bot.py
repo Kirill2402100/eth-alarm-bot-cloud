@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # ============================================================================
 # v8.7 - Strategy v2.6  (Ultimate "On‑the‑Fly" Filtering – refactored)
-# Changelog 10‑Jul‑2025 (Europe/Belgrade):
-# • Bug‑fix ①  – candle_range now compared to ATR_14 (absolute), not ATRr_14.
-# • Bug‑fix ②  – second ADX ≥ 25 check just before LLM call.
-# • Risk       – SL = 1.5 × ATR,  TP = 2.2 × ATR  (RR ≈ 1 : 1.47).
+# Changelog 10‑Jul‑2025 (Europe/Belgrade):
+# • Bug‑fix ①  – candle_range now compared to ATR_14 (absolute), not ATRr_14.
+# • Bug‑fix ②  – second ADX ≥ 25 check just before LLM call.
+# • Risk        – SL = 1.5 × ATR,  TP = 2.2 × ATR  (RR ≈ 1 : 1.47).
 # • New metrics logged: H1_ATR_percent, MFE_R, MAE_R, LLM_Confidence.
 # • Google‑Sheets: logs now go to worksheet 'Autonomous_Trade_Log_v5'.
+# • ATR KeyError Fix: Added checks for ATR availability before use.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -20,13 +21,13 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # === ENV / Logging =========================================================
-BOT_TOKEN              = os.getenv("BOT_TOKEN")
-CHAT_IDS               = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
-SHEET_ID               = os.getenv("SHEET_ID")
-COIN_LIST_SIZE         = int(os.getenv("COIN_LIST_SIZE", "300"))
-MAX_CONCURRENT_SIGNALS = int(os.getenv("MAX_CONCURRENT_SIGNALS", "10"))
-ANOMALOUS_CANDLE_MULT  = 3.0
-COOLDOWN_HOURS         = 4
+BOT_TOKEN               = os.getenv("BOT_TOKEN")
+CHAT_IDS                = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
+SHEET_ID                = os.getenv("SHEET_ID")
+COIN_LIST_SIZE          = int(os.getenv("COIN_LIST_SIZE", "300"))
+MAX_CONCURRENT_SIGNALS  = int(os.getenv("MAX_CONCURRENT_SIGNALS", "10"))
+ANOMALOUS_CANDLE_MULT = 3.0
+COOLDOWN_HOURS          = 4
 
 LLM_API_KEY   = os.getenv("LLM_API_KEY")
 LLM_API_URL   = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
@@ -145,7 +146,7 @@ async def scanner(app):
             # purge cooldown
             now = datetime.now(timezone.utc).timestamp()
             state["cooldown"] = {p:t for p,t in state["cooldown"].items() if now-t < COOLDOWN_HOURS*3600}
-            # Stage 1 – initial scan
+            # Stage 1 – initial scan
             await broadcast(app, f"🔍 Stage 1: scanning top‑{COIN_LIST_SIZE} for EMA‑cross + ADX≥{MIN_M15_ADX} ...")
             tickers = await exchange.fetch_tickers()
             pairs = sorted(
@@ -163,26 +164,32 @@ async def scanner(app):
                     if len(df15)<30: continue
                     df15.ta.ema(length=9, append=True)
                     df15.ta.ema(length=21, append=True)
-                    df15.ta.atr(length=ATR_LEN, append=True)   # ATR_14
+                    df15.ta.atr(length=ATR_LEN, append=True)  # ATR_14
                     df15.ta.adx(length=14, append=True)
                     last, prev = df15.iloc[-1], df15.iloc[-2]
+
+                    # ИЗМЕНЕНИЕ 1: Защита от отсутствия ATR
+                    if f"ATR_{ATR_LEN}" not in df15.columns or pd.isna(last[f"ATR_{ATR_LEN}"]):
+                        log.debug(f"{sym}: reject - no ATR_{ATR_LEN} (insufficient data)")
+                        continue
+
                     adx = last["ADX_14"];  side = None
                     if adx < MIN_M15_ADX: continue
                     # EMA cross
                     side = None
-                    for i in range(1, 4):          # последние 3 свечи
+                    for i in range(1, 4):         # последние 3 свечи
                         cur  = df15.iloc[-i]
                         prev = df15.iloc[-i-1]
                         if prev["EMA_9"] <= prev["EMA_21"] and cur["EMA_9"] > cur["EMA_21"]:
-                           side = "LONG"; break
+                            side = "LONG"; break
                         if prev["EMA_9"] >= prev["EMA_21"] and cur["EMA_9"] < cur["EMA_21"]:
-                           side = "SHORT"; break
-                        if not side:
-                            log.debug(f"{sym}: reject – no EMA cross in last 3 bars")
-                            continue
-    # anomalous candle
+                            side = "SHORT"; break
+                    if not side:
+                        log.debug(f"{sym}: reject – no EMA cross in last 3 bars")
+                        continue
+                    # anomalous candle
                     atr = last[f"ATR_{ATR_LEN}"]
-                    if (last["h"]-last["l"]) > atr*ANOMALOUS_CANDLE_MULT: continue
+                    if (last["high"]-last["low"]) > atr*ANOMALOUS_CANDLE_MULT: continue
                     # H1 trend
                     df1h = pd.DataFrame(await exchange.fetch_ohlcv(sym, "1h", limit=100),
     columns=["timestamp", "open", "high", "low", "close", "volume"]
@@ -204,15 +211,21 @@ async def scanner(app):
                 try:
                     df = pd.DataFrame(await exchange.fetch_ohlcv(c["pair"], TF_ENTRY, limit=100),
     columns=["timestamp", "open", "high", "low", "close", "volume"]
-)   
+)  
                     df.ta.bbands(length=20, std=2, append=True)
                     df.ta.atr(length=ATR_LEN, append=True)
                     df.ta.rsi(length=14, append=True)
                     df.ta.adx(length=14, append=True)
                     last = df.iloc[-1]
+                    
+                    # ИЗМЕНЕНИЕ 2: Защита от отсутствия ATR
+                    if f"ATR_{ATR_LEN}" not in df.columns or pd.isna(last[f"ATR_{ATR_LEN}"]):
+                        log.debug(f"{c['pair']}: reject - no ATR_{ATR_LEN} (insufficient data)")
+                        continue
+
                     adx = round(float(last["ADX_14"]),2)
-                    if adx < MIN_M15_ADX: continue   # second gate
-                    entry = last["c"]; risk = last[f"ATR_{ATR_LEN}"]*SL_ATR_MULT
+                    if adx < MIN_M15_ADX: continue  # second gate
+                    entry = last["close"]; risk = last[f"ATR_{ATR_LEN}"]*SL_ATR_MULT
                     sl,tp = (entry-risk, entry+risk*RR_RATIO) if c["side"]=="LONG" else (entry+risk, entry-risk*RR_RATIO)
                     bb_pos="Inside"
                     if entry>last["BBU_20_2.0"]: bb_pos="Above_Upper"
