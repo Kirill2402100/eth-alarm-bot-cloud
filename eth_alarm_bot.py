@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.1 - Enhanced UX & Reporting
+# v3.3 - High-Frequency Hybrid Model (Tuning)
 # Changelog 10‑Jul‑2025 (Europe/Belgrade):
-# • UX: All Telegram messages are now in Russian, well-formatted, and more informative.
-# • New Module: Market Volatility Report. Bot now analyzes BTC ATR% and reports on market volatility.
-# • New Module: Daily P&L Report. A new task now runs every 24h to summarize and report the P&L.
+# • TP Adjusted: RR_RATIO is now 1.5 to further increase Win Rate for the high-frequency model.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -77,7 +75,7 @@ def setup_sheets():
         log.error("Sheets init failed: %s", e)
 
 # === State ================================================================
-STATE_FILE = "bot_state_v3_1.json"
+STATE_FILE = "bot_state_v3_3.json"
 state = {}
 def load_state():
     global state
@@ -98,7 +96,8 @@ exchange  = ccxt.mexc({
 TF_ENTRY  = os.getenv("TF_ENTRY", "15m")
 ATR_LEN   = 14
 SL_ATR_MULT  = 1.5
-RR_RATIO     = 2.2
+# ИЗМЕНЕНИЕ: Финальная корректировка Take Profit
+RR_RATIO     = 1.5
 MIN_M15_ADX  = 20
 MIN_CONFIDENCE_SCORE = 6
 
@@ -196,7 +195,7 @@ async def scanner(app):
                 try:
                     df15 = pd.DataFrame (await exchange.fetch_ohlcv(sym, TF_ENTRY, limit=50),
                         columns=["timestamp", "open", "high", "low", "close", "volume"])
-                    if len(df15)<30: continue
+                    if len(df15)<50: continue
                     df15.ta.ema(length=9, append=True)
                     df15.ta.ema(length=21, append=True)
                     df15.ta.atr(length=ATR_LEN, append=True)
@@ -221,15 +220,15 @@ async def scanner(app):
                     
                     df1h = pd.DataFrame(await exchange.fetch_ohlcv(sym, "1h", limit=51),
                         columns=["timestamp", "open", "high", "low", "close", "volume"])
-                    df1h.ta.ema(length=9,append=True); df1h.ta.ema(length=21,append=True); df1h.ta.ema(length=50,append=True)
+                    df1h.ta.ema(length=50,append=True)
                     last1h = df1h.iloc[-1]
-                    h1_trend = "NEUTRAL"
-                    if last1h["EMA_9"] > last1h["EMA_21"] > last1h["EMA_50"]: h1_trend = "UP"
-                    if last1h["EMA_9"] < last1h["EMA_21"] < last1h["EMA_50"]: h1_trend = "DOWN"
+                    
+                    if pd.isna(last1h['EMA_50']): continue
 
-                    if (side=="LONG" and h1_trend != "UP") or (side=="SHORT" and h1_trend != "DOWN"): continue
+                    if (side == "LONG" and last1h['close'] < last1h['EMA_50']): continue
+                    if (side == "SHORT" and last1h['close'] > last1h['EMA_50']): continue
 
-                    pre.append({"pair":sym, "side":side, "h1_trend":h1_trend})
+                    pre.append({"pair":sym, "side":side})
                 except Exception as e:
                     log.warning("Scan %s: %s", sym, e)
             
@@ -260,7 +259,7 @@ async def scanner(app):
                     setups_for_llm.append({
                         "pair":c["pair"], "side":c["side"], "entry_price":entry,
                         "adx":round(float(last["ADX_14"]),2), "rsi":round(float(last["RSI_14"]),2),
-                        "bb_pos":bb_pos, "sl_atr_mult": SL_ATR_MULT, "rr_ratio": RR_RATIO,
+                        "bb_pos":bb_pos,
                         "atr_val": last[f"ATR_{ATR_LEN}"]
                     })
                 except Exception as e: log.warning("Enrich %s: %s", c["pair"], e)
@@ -293,9 +292,9 @@ async def scanner(app):
             best_setup = final_candidates[0]
             
             score = best_setup.get('confidence_score', 0)
-            if score >= 9: position_size_usd = 50
-            elif score >= 7: position_size_usd = 30
-            else: position_size_usd = 20
+            if score >= 9: position_size_usd = 25
+            elif score >= 7: position_size_usd = 15
+            else: position_size_usd = 10
 
             entry = best_setup["entry_price"]
             risk = best_setup["atr_val"] * SL_ATR_MULT
@@ -393,7 +392,6 @@ async def monitor(app):
 
 async def daily_pnl_report(app):
     while True:
-        # Ждем до следующего дня, до 00:05 UTC
         now = datetime.now(timezone.utc)
         tomorrow = now + timedelta(days=1)
         next_run = tomorrow.replace(hour=0, minute=5, second=0, microsecond=0)
@@ -429,6 +427,9 @@ async def daily_pnl_report(app):
                        f"<b>Прибыльных сделок:</b> {wins}\n"
                        f"<b>Убыточных сделок:</b> {losses}")
                 await broadcast(app, msg)
+            else:
+                 log.info("No trades closed in the last 24 hours to report.")
+
 
         except Exception as e:
             log.error(f"Daily P&L report failed: {e}")
@@ -440,7 +441,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(cid)
     if not state["bot_on"]:
         state["bot_on"]=True; save_state()
-        await update.message.reply_text("✅ <b>Бот v3.1 запущен.</b>"); 
+        await update.message.reply_text("✅ <b>Бот v3.3 запущен.</b>"); 
         asyncio.create_task(scanner(ctx.application))
         asyncio.create_task(monitor(ctx.application))
         asyncio.create_task(daily_pnl_report(ctx.application))
@@ -470,5 +471,5 @@ if __name__=="__main__":
         asyncio.create_task(scanner(app))
         asyncio.create_task(monitor(app))
         asyncio.create_task(daily_pnl_report(app))
-    log.info("Bot v3.1 started.")
+    log.info("Bot v3.3 started.")
     app.run_polling()
