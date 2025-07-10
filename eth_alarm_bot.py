@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v4.6 - MEXC Verbose
+# v4.7 - MEXC Verbose (Syntax Fix)
 # Changelog 10‑Jul‑2025 (Europe/Belgrade):
-# • Reverted data source to MEXC with verbose mode enabled to get a definitive
-#   low-level error log from the original problematic source.
+# • Critical Fix: Corrected a fatal IndentationError from the previous version.
+# • The bot is now correctly configured to debug the MEXC data source.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -76,7 +76,7 @@ def setup_sheets():
         log.error("Sheets init failed: %s", e)
 
 # === State ================================================================
-STATE_FILE = "bot_state_v4_6.json"
+STATE_FILE = "bot_state_v4_7.json"
 state = {}
 def load_state():
     global state
@@ -90,8 +90,8 @@ def save_state():
     json.dump(state, open(STATE_FILE,"w"), indent=2)
 
 # === Exchange & Strategy ==================================================
-# ИЗМЕНЕНИЕ: Возвращаемся к MEXC и включаем verbose режим
 exchange_data = ccxt.mexc({'options': {'defaultType':'spot'}, 'verbose': True})
+exchange_exec = ccxt.mexc({'options': {'defaultType':'swap'}})
 
 TF_ENTRY  = os.getenv("TF_ENTRY", "15m")
 ATR_LEN   = 14
@@ -100,7 +100,6 @@ RR_RATIO     = 1.5
 MIN_M15_ADX  = 20
 MIN_CONFIDENCE_SCORE = 6
 
-# ... (остальной код остается идентичным версии 4.4, так как изменения касаются только инициализации exchange_data) ...
 # === LLM prompt ===========================================================
 PROMPT = (
     "Ты — главный трейдер-аналитик. Проанализируй КАЖДОГО кандидата из списка ниже. Для каждого кандидата верни:"
@@ -259,43 +258,79 @@ async def scanner(app):
                               f"<code>- {rejection_stats['MARKET_REGIME']:<4}</code> отсеяно из-за режима рынка")
                 await broadcast(app, report_msg); await asyncio.sleep(900); continue
 
-            # ... (rest of the logic remains the same)
+            await broadcast(app, f"📊 <b>Найдено {len(pre)} кандидатов.</b> Отправляю на детальный анализ и оценку LLM...")
+            setups_for_llm=[]
+            for c in pre:
+                try:
+                    df = pd.DataFrame(await exchange_data.fetch_ohlcv(c["pair"], TF_ENTRY, limit=100),
+                        columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    
+                    for col in ["open", "high", "low", "close", "volume"]: df[col] = pd.to_numeric(df[col])
+                    
+                    df.ta.bbands(length=20, std=2, append=True); df.ta.atr(length=ATR_LEN, append=True)
+                    df.ta.rsi(length=14, append=True); df.ta.adx(length=14, append=True)
+                    last = df.iloc[-1]
+                    
+                    if f"ATR_{ATR_LEN}" not in df.columns or pd.isna(last[f"ATR_{ATR_LEN}"]): continue
+
+                    entry = last["close"]; bb_pos="Внутри канала"
+                    if entry>last["BBU_20_2.0"]: bb_pos="Выше верхней границы"
+                    elif entry<last["BBL_20_2.0"]: bb_pos="Ниже нижней границы"
+                    
+                    setups_for_llm.append({"pair":c["pair"], "side":c["side"], "entry_price":entry, "adx":round(float(last["ADX_14"]),2), "rsi":round(float(last["RSI_14"]),2), "bb_pos":bb_pos, "atr_val": last[f"ATR_{ATR_LEN}"]})
+                except Exception as e: log.warning("Enrich %s: %s", c["pair"], e)
             
+            if not setups_for_llm:
+                await broadcast(app, f"✅ <b>Анализ завершен...</b> Ни один кандидат не прошел углубленную проверку."); await asyncio.sleep(900); continue
+
+            scored_candidates = await ask_llm(PROMPT + "\n\n" + json.dumps({"candidates":setups_for_llm}))
+            
+            if not scored_candidates: await broadcast(app, "❗️ <b>LLM не вернул оценки.</b>"); await asyncio.sleep(900); continue
+            
+            final_candidates = []
+            for i, scored in enumerate(scored_candidates):
+                if i < len(setups_for_llm):
+                    original_setup = setups_for_llm[i]
+                    if scored.get('confidence_score', 0) >= MIN_CONFIDENCE_SCORE:
+                        original_setup.update(scored); final_candidates.append(original_setup)
+            
+            if not final_candidates:
+                await broadcast(app, f"✅ <b>Анализ завершен...</b> Ни один сетап не получил достаточной оценки (>{MIN_CONFIDENCE_SCORE})."); await asyncio.sleep(900); continue
+
+            final_candidates.sort(key=lambda x: (x.get('confidence_score', 0), x.get('adx', 0)), reverse=True)
+            best_setup = final_candidates[0]
+            
+            score = best_setup.get('confidence_score', 0)
+            if score >= 9: position_size_usd = 25
+            elif score >= 7: position_size_usd = 15
+            else: position_size_usd = 10
+
+            entry = best_setup["entry_price"]; risk = best_setup["atr_val"] * SL_ATR_MULT
+            sl,tp = (entry-risk, entry+risk*RR_RATIO) if best_setup["side"]=="LONG" else (entry+risk, entry-risk*RR_RATIO)
+            
+            sig_id = str(uuid.uuid4())[:8]
+            signal_to_monitor = {
+                "signal_id": sig_id, "entry_time_utc": datetime.now(timezone.utc).isoformat(),
+                "pair": best_setup["pair"], "side": best_setup["side"], "entry_price": entry, "sl": sl, "tp": tp,
+                "mfe_price": entry, "mae_price": entry, "confidence_score": score, "position_size_usd": position_size_usd,
+                "leverage": 100, "reason": best_setup.get("reason"), "adx": best_setup.get("adx"), "rsi": best_setup.get("rsi"), "bb_pos": best_setup.get("bb_pos")
+            }
+            
+            state["monitored_signals"].append(signal_to_monitor)
+            state["cooldown"][best_setup["pair"]] = now
+            save_state()
+            
+            msg = (f"🚀 <b>НОВЫЙ СИГНАЛ</b> 🚀\n\n"
+                   f"<b>Инструмент:</b> <code>{best_setup['pair']}</code>\n<b>Направление:</b> {best_setup['side']}\n\n"
+                   f"⭐ <b>Оценка LLM: {score}/10</b>\n💵 <b>Рекомендуемый размер: ${position_size_usd}</b> (плечо 100x)\n\n"
+                   f"<i>Обоснование: {best_setup.get('reason', 'N/A')}</i>\n\n"
+                   f"<b>Вход:</b> <code>{fmt(entry)}</code>\n<b>Stop Loss:</b> <code>{fmt(sl)}</code>\n<b>Take Profit:</b> <code>{fmt(tp)}</code>")
+            await broadcast(app, msg)
+            await asyncio.sleep(900)
         except Exception as e:
             log.error("Scanner critical: %s", e, exc_info=True)
             await asyncio.sleep(300)
 
-async def monitor(app):
-    # This function would need to be adapted if we were executing trades on MEXC
-    # For now, it will use the Bybit data source for price checks
-    while state["bot_on"]:
-        if not state["monitored_signals"]: await asyncio.sleep(30); continue
-        # ... (rest of monitor logic)
-
-async def daily_pnl_report(app):
-    # This function is data-source independent
-    while True:
-        # ... (rest of daily_pnl_report logic)
-
-# === Telegram commands =====================================================
-async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    cid=update.effective_chat.id
-    ctx.application.chat_ids.add(cid)
-    if not state["bot_on"]:
-        state["bot_on"]=True; save_state()
-        await update.message.reply_text("✅ <b>Бот v4.6 (MEXC Verbose) запущен.</b>"); 
-        asyncio.create_task(scanner(ctx.application))
-        asyncio.create_task(monitor(ctx.application))
-        asyncio.create_task(daily_pnl_report(ctx.application))
-    else:
-        await update.message.reply_text("ℹ️ Бот уже запущен.")
-
-# ... (cmd_stop, cmd_status, and full implementations of monitor/daily_report)
-async def a_full_implementation_of_monitor_and_daily_report_is_needed_here():
-    pass # Placeholder so the file is valid. I'll copy the full functions.
-# NOTE TO SELF: copy the full monitor and daily_report functions before finishing.
-
-# ... Copying full functions now ...
 async def monitor(app):
     while state["bot_on"]:
         if not state["monitored_signals"]:
@@ -303,6 +338,7 @@ async def monitor(app):
             continue
         for s in list(state["monitored_signals"]):
             try:
+                # Для мониторинга используем Bybit, т.к. он наш источник данных
                 price = (await exchange_data.fetch_ticker(s["pair"]))["last"]
                 if not price: continue
                 
@@ -384,6 +420,19 @@ async def daily_pnl_report(app):
         except Exception as e:
             log.error(f"Daily P&L report failed: {e}")
 
+# === Telegram commands =====================================================
+async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    cid=update.effective_chat.id
+    ctx.application.chat_ids.add(cid)
+    if not state["bot_on"]:
+        state["bot_on"]=True; save_state()
+        await update.message.reply_text("✅ <b>Бот v4.7 (MEXC Verbose) запущен.</b>"); 
+        asyncio.create_task(scanner(ctx.application))
+        asyncio.create_task(monitor(ctx.application))
+        asyncio.create_task(daily_pnl_report(ctx.application))
+    else:
+        await update.message.reply_text("ℹ️ Бот уже запущен.")
+
 async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     state["bot_on"]=False; save_state(); await update.message.reply_text("🛑 <b>Бот остановлен.</b>")
 
@@ -394,7 +443,6 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
            f"<b>Режим рынка:</b> {snapshot['regime']}\n"
            f"<b>Волатильность:</b> {snapshot['volatility']} (ATR {snapshot['volatility_percent']})")
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
-
 
 # === Entrypoint ============================================================
 if __name__=="__main__":
@@ -408,5 +456,5 @@ if __name__=="__main__":
         asyncio.create_task(scanner(app))
         asyncio.create_task(monitor(app))
         asyncio.create_task(daily_pnl_report(app))
-    log.info("Bot v4.6 (MEXC Verbose) started.")
+    log.info("Bot v4.7 (MEXC Verbose) started.")
     app.run_polling()
