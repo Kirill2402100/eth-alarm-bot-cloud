@@ -157,8 +157,9 @@ async def scanner(app):
                 if len(pre)>=10: break
                 if sym in state["cooldown"]: continue
                 try:
-                    df15 = pd.DataFrame(await exchange.fetch_ohlcv(sym, TF_ENTRY, limit=50),
-                                        columns=["ts","o","h","l","c","v"])
+                    df15 = pd.DataFrame (await exchange.fetch_ohlcv(sym, TF_ENTRY, limit=50),
+    columns=["timestamp", "open", "high", "low", "close", "volume"]
+)
                     if len(df15)<30: continue
                     df15.ta.ema(length=9, append=True)
                     df15.ta.ema(length=21, append=True)
@@ -175,8 +176,9 @@ async def scanner(app):
                     atr = last[f"ATR_{ATR_LEN}"]
                     if (last["h"]-last["l"]) > atr*ANOMALOUS_CANDLE_MULT: continue
                     # H1 trend
-                    df1h = pd.DataFrame(await exchange.fetch_ohlcv(sym,'1h',limit=100),
-                                        columns=["ts","o","h","l","c","v"])
+                    df1h = pd.DataFrame(await exchange.fetch_ohlcv(sym, "1h", limit=100),
+    columns=["timestamp", "open", "high", "low", "close", "volume"]
+)
                     df1h.ta.ema(length=9,append=True); df1h.ta.ema(length=21,append=True); df1h.ta.ema(length=50,append=True)
                     recent = df1h.iloc[-3:]
                     up   = all(r["EMA_9"]>r["EMA_21"]>r["EMA_50"] for _,r in recent.iterrows())
@@ -193,7 +195,8 @@ async def scanner(app):
             for c in pre:
                 try:
                     df = pd.DataFrame(await exchange.fetch_ohlcv(c["pair"], TF_ENTRY, limit=100),
-                                      columns=["ts","o","h","l","c","v"])
+    columns=["timestamp", "open", "high", "low", "close", "volume"]
+)   
                     df.ta.bbands(length=20, std=2, append=True)
                     df.ta.atr(length=ATR_LEN, append=True)
                     df.ta.rsi(length=14, append=True)
