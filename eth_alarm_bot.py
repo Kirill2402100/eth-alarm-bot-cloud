@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.3 - High-Frequency Hybrid Model (Tuning)
+# v3.4 - Diagnostic Mode
 # Changelog 10‑Jul‑2025 (Europe/Belgrade):
-# • TP Adjusted: RR_RATIO is now 1.5 to further increase Win Rate for the high-frequency model.
+# • New Module: Added detailed rejection stats logging. Bot now reports exactly which filter
+#   is blocking candidates and how many, allowing for data-driven tuning.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -75,7 +76,7 @@ def setup_sheets():
         log.error("Sheets init failed: %s", e)
 
 # === State ================================================================
-STATE_FILE = "bot_state_v3_3.json"
+STATE_FILE = "bot_state_v3_4.json"
 state = {}
 def load_state():
     global state
@@ -96,7 +97,6 @@ exchange  = ccxt.mexc({
 TF_ENTRY  = os.getenv("TF_ENTRY", "15m")
 ATR_LEN   = 14
 SL_ATR_MULT  = 1.5
-# ИЗМЕНЕНИЕ: Финальная корректировка Take Profit
 RR_RATIO     = 1.5
 MIN_M15_ADX  = 20
 MIN_CONFIDENCE_SCORE = 6
@@ -188,6 +188,13 @@ async def scanner(app):
                 ((s,t) for s,t in (await exchange.fetch_tickers()).items() if s.endswith(':USDT') and t['quoteVolume']),
                 key=lambda x:x[1]['quoteVolume'], reverse=True
             )[:COIN_LIST_SIZE]
+            
+            # ИЗМЕНЕНИЕ: Инициализация счетчиков для диагностики
+            rejection_stats = {
+                "LOW_ADX": 0, "NO_CROSS": 0, "H1_TAILWIND": 0, 
+                "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0
+            }
+            
             pre = []
             for sym,_ in pairs:
                 if len(pre)>=10: break
@@ -196,6 +203,7 @@ async def scanner(app):
                     df15 = pd.DataFrame (await exchange.fetch_ohlcv(sym, TF_ENTRY, limit=50),
                         columns=["timestamp", "open", "high", "low", "close", "volume"])
                     if len(df15)<50: continue
+                    
                     df15.ta.ema(length=9, append=True)
                     df15.ta.ema(length=21, append=True)
                     df15.ta.atr(length=ATR_LEN, append=True)
@@ -205,18 +213,22 @@ async def scanner(app):
                     if f"ATR_{ATR_LEN}" not in df15.columns or pd.isna(last15[f"ATR_{ATR_LEN}"]): continue
 
                     adx = last15["ADX_14"]; side = None
-                    if adx < MIN_M15_ADX: continue
+                    if adx < MIN_M15_ADX:
+                        rejection_stats["LOW_ADX"] += 1; continue
                     
                     side = None
                     for i in range(1, 4):
                         cur, prev = df15.iloc[-i], df15.iloc[-i-1]
                         if prev["EMA_9"] <= prev["EMA_21"] and cur["EMA_9"] > cur["EMA_21"]: side = "LONG"; break
                         if prev["EMA_9"] >= prev["EMA_21"] and cur["EMA_9"] < cur["EMA_21"]: side = "SHORT"; break
-                    if not side: continue
+                    if not side:
+                        rejection_stats["NO_CROSS"] += 1; continue
                     
-                    if market_regime == "BEARISH" and side == "LONG": continue
+                    if market_regime == "BEARISH" and side == "LONG":
+                        rejection_stats["MARKET_REGIME"] += 1; continue
 
-                    if (last15["high"]-last15["low"]) > last15[f"ATR_{ATR_LEN}"]*ANOMALOUS_CANDLE_MULT: continue
+                    if (last15["high"]-last15["low"]) > last15[f"ATR_{ATR_LEN}"]*ANOMALOUS_CANDLE_MULT:
+                        rejection_stats["ANOMALOUS_CANDLE"] += 1; continue
                     
                     df1h = pd.DataFrame(await exchange.fetch_ohlcv(sym, "1h", limit=51),
                         columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -225,18 +237,33 @@ async def scanner(app):
                     
                     if pd.isna(last1h['EMA_50']): continue
 
-                    if (side == "LONG" and last1h['close'] < last1h['EMA_50']): continue
-                    if (side == "SHORT" and last1h['close'] > last1h['EMA_50']): continue
+                    if (side == "LONG" and last1h['close'] < last1h['EMA_50']) or \
+                       (side == "SHORT" and last1h['close'] > last1h['EMA_50']):
+                        rejection_stats["H1_TAILWIND"] += 1; continue
 
                     pre.append({"pair":sym, "side":side})
                 except Exception as e:
                     log.warning("Scan %s: %s", sym, e)
             
+            # ИЗМЕНЕНИЕ: Формирование и отправка диагностического отчета
             if not pre:
                 duration = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
-                await broadcast(app, f"✅ <b>Поиск завершен за {duration:.0f} сек.</b> Подходящих сетапов не найдено.")
+                total_rejected = sum(rejection_stats.values())
+                
+                report_msg = (f"✅ <b>Поиск завершен за {duration:.0f} сек.</b> Подходящих сетапов не найдено.\n\n"
+                              f"📊 <b>Диагностика фильтров (из {len(pairs)} монет):</b>\n"
+                              f"- <code>{rejection_stats['LOW_ADX']:<4}</code> отсеяно по низкому ADX\n"
+                              f"- <code>{rejection_stats['H1_TAILWIND']:<4}</code> отсеяно по H1 фильтру\n"
+                              f"- <code>{rejection_stats['NO_CROSS']:<4}</code> не найдено пересечения EMA\n"
+                              f"- <code>{rejection_stats['ANOMALOUS_CANDLE']:<4}</code> отсеяно по аномальной свече\n"
+                              f"- <code>{rejection_stats['MARKET_REGIME']:<4}</code> отсеяно из-за режима рынка\n\n"
+                              f"<i>Кандидатов не прошло: {total_rejected}</i>")
+
+                await broadcast(app, report_msg)
                 await asyncio.sleep(900); continue
 
+            # ... (остальная логика остается без изменений) ...
+            
             await broadcast(app, f"📊 <b>Найдено {len(pre)} кандидатов.</b> Отправляю на детальный анализ и оценку LLM...")
             setups_for_llm=[]
             for c in pre:
@@ -441,7 +468,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(cid)
     if not state["bot_on"]:
         state["bot_on"]=True; save_state()
-        await update.message.reply_text("✅ <b>Бот v3.3 запущен.</b>"); 
+        await update.message.reply_text("✅ <b>Бот v3.4 (Diagnostic) запущен.</b>"); 
         asyncio.create_task(scanner(ctx.application))
         asyncio.create_task(monitor(ctx.application))
         asyncio.create_task(daily_pnl_report(ctx.application))
@@ -471,5 +498,5 @@ if __name__=="__main__":
         asyncio.create_task(scanner(app))
         asyncio.create_task(monitor(app))
         asyncio.create_task(daily_pnl_report(app))
-    log.info("Bot v3.3 started.")
+    log.info("Bot v3.4 (Diagnostic) started.")
     app.run_polling()
