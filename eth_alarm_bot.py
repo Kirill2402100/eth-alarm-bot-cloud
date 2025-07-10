@@ -97,7 +97,7 @@ TF_ENTRY  = os.getenv("TF_ENTRY", "15m")
 ATR_LEN   = 14
 SL_ATR_MULT  = 1.5
 RR_RATIO     = 2.2
-MIN_M15_ADX  = 25
+MIN_M15_ADX  = 20
 
 # === LLM prompt ===========================================================
 PROMPT = (
@@ -169,10 +169,18 @@ async def scanner(app):
                     adx = last["ADX_14"];  side = None
                     if adx < MIN_M15_ADX: continue
                     # EMA cross
-                    if prev["EMA_9"]<=prev["EMA_21"] and last["EMA_9"]>last["EMA_21"]: side="LONG"
-                    elif prev["EMA_9"]>=prev["EMA_21"] and last["EMA_9"]<last["EMA_21"]: side="SHORT"
-                    if not side: continue
-                    # anomalous candle
+                    side = None
+                    for i in range(1, 4):          # последние 3 свечи
+                        cur  = df15.iloc[-i]
+                        prev = df15.iloc[-i-1]
+                        if prev["EMA_9"] <= prev["EMA_21"] and cur["EMA_9"] > cur["EMA_21"]:
+                           side = "LONG"; break
+                        if prev["EMA_9"] >= prev["EMA_21"] and cur["EMA_9"] < cur["EMA_21"]:
+                           side = "SHORT"; break
+                        if not side:
+                            log.debug(f"{sym}: reject – no EMA cross in last 3 bars")
+                            continue
+    # anomalous candle
                     atr = last[f"ATR_{ATR_LEN}"]
                     if (last["h"]-last["l"]) > atr*ANOMALOUS_CANDLE_MULT: continue
                     # H1 trend
