@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.5 - Bugfix & Diagnostics Accuracy
+# v3.6 - Polite Scanner
 # Changelog 10‑Jul‑2025 (Europe/Belgrade):
-# • Bugfix: Volatility percentage calculation is now done manually for accuracy.
-# • Bugfix: Diagnostics now correctly track rejections due to insufficient data,
-#   providing a complete picture of the filtering process.
+# • Fix: Added a small delay (0.5s) between each coin scan to avoid API rate-limiting
+#   by the exchange, which was preventing data retrieval.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -77,7 +76,7 @@ def setup_sheets():
         log.error("Sheets init failed: %s", e)
 
 # === State ================================================================
-STATE_FILE = "bot_state_v3_5.json"
+STATE_FILE = "bot_state_v3_6.json"
 state = {}
 def load_state():
     global state
@@ -155,7 +154,6 @@ async def get_market_snapshot():
         if last_btc['close'] < last_btc['EMA_50']:
             regime = "BEARISH"
         
-        # ИЗМЕНЕНИЕ: Ручной и надежный расчет ATR в %
         absolute_atr = last_btc['ATR_14']
         close_price = last_btc['close']
         atr_percent = (absolute_atr / close_price) * 100 if close_price > 0 else 0
@@ -194,17 +192,17 @@ async def scanner(app):
                 key=lambda x:x[1]['quoteVolume'], reverse=True
             )[:COIN_LIST_SIZE]
             
-            # ИЗМЕНЕНИЕ: Улучшенная диагностика
             rejection_stats = {
                 "INSUFFICIENT_DATA": 0, "LOW_ADX": 0, "NO_CROSS": 0, 
                 "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0
             }
             
             pre = []
-            for sym,_ in pairs:
+            for i, (sym, _) in enumerate(pairs):
                 if len(pre)>=10: break
                 if sym in state["cooldown"]: continue
                 try:
+                    log.info(f"Scanning ({i+1}/{len(pairs)}): {sym}")
                     df15 = pd.DataFrame (await exchange.fetch_ohlcv(sym, TF_ENTRY, limit=50),
                         columns=["timestamp", "open", "high", "low", "close", "volume"])
                     if len(df15)<50:
@@ -224,8 +222,8 @@ async def scanner(app):
                         rejection_stats["LOW_ADX"] += 1; continue
                     
                     side = None
-                    for i in range(1, 4):
-                        cur, prev = df15.iloc[-i], df15.iloc[-i-1]
+                    for j in range(1, 4):
+                        cur, prev = df15.iloc[-j], df15.iloc[-j-1]
                         if prev["EMA_9"] <= prev["EMA_21"] and cur["EMA_9"] > cur["EMA_21"]: side = "LONG"; break
                         if prev["EMA_9"] >= prev["EMA_21"] and cur["EMA_9"] < cur["EMA_21"]: side = "SHORT"; break
                     if not side:
@@ -252,6 +250,9 @@ async def scanner(app):
                     pre.append({"pair":sym, "side":side})
                 except Exception as e:
                     log.warning("Scan %s: %s", sym, e)
+                
+                # ИЗМЕНЕНИЕ: Добавлена пауза для снижения нагрузки на API
+                await asyncio.sleep(0.5)
             
             if not pre:
                 duration = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
@@ -472,7 +473,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(cid)
     if not state["bot_on"]:
         state["bot_on"]=True; save_state()
-        await update.message.reply_text("✅ <b>Бот v3.5 (Diagnostic+) запущен.</b>"); 
+        await update.message.reply_text("✅ <b>Бот v3.6 (Polite) запущен.</b>"); 
         asyncio.create_task(scanner(ctx.application))
         asyncio.create_task(monitor(ctx.application))
         asyncio.create_task(daily_pnl_report(ctx.application))
@@ -502,5 +503,5 @@ if __name__=="__main__":
         asyncio.create_task(scanner(app))
         asyncio.create_task(monitor(app))
         asyncio.create_task(daily_pnl_report(app))
-    log.info("Bot v3.5 (Diagnostic+) started.")
+    log.info("Bot v3.6 (Polite) started.")
     app.run_polling()
