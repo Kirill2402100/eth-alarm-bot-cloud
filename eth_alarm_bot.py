@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.4.2 - Final Startup Logic Fix
+# v3.4.4 - Blacklist Update
 # Changelog 11‑Jul‑2025 (Europe/Belgrade):
-# • Corrected the task startup logic to ensure scanner/monitor start correctly
-#   on /start command and auto-resume on application restart.
+# • Added USD1 to the stablecoin blacklist.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -28,6 +27,10 @@ COOLDOWN_HOURS          = 4
 TREND_ADX_THRESHOLD     = 25
 TREND_RR_RATIO          = 1.5
 FLAT_RR_RATIO           = 1.0
+
+# --- Черный список стейблкоинов ---
+STABLECOIN_BLACKLIST = {'FDUSD', 'USDC', 'DAI', 'USDE', 'TUSD', 'BUSD', 'USDP', 'GUSD', 'USD1'}
+
 
 LLM_API_KEY  = os.getenv("LLM_API_KEY")
 LLM_API_URL  = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
@@ -205,10 +208,15 @@ async def scanner(app):
             )[:COIN_LIST_SIZE]
             
             log.info(f"Found {len(pairs)} USDT pairs present on both Spot and Futures markets.")
-            rejection_stats = { "ERRORS": 0, "INSUFFICIENT_DATA": 0, "NO_CROSS": 0, "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0 }
+            rejection_stats = { "ERRORS": 0, "INSUFFICIENT_DATA": 0, "NO_CROSS": 0, "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0, "BLACKLISTED": 0 }
             pre_candidates = []
 
             for i, (sym, _) in enumerate(pairs):
+                base_currency = sym.split('/')[0]
+                if base_currency in STABLECOIN_BLACKLIST:
+                    rejection_stats["BLACKLISTED"] += 1
+                    continue
+
                 if sym in state["cooldown"]: continue
                 try:
                     ohlcv_data = await exchange_spot.fetch_ohlcv(sym, TF_ENTRY, limit=100)
@@ -253,6 +261,7 @@ async def scanner(app):
                 duration = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
                 report_msg = (f"✅ <b>Поиск завершен за {duration:.0f} сек.</b> Кандидатов нет.\n\n"
                               f"📊 <b>Диагностика фильтров (из {len(pairs)} монет):</b>\n"
+                              f"<code>- {rejection_stats['BLACKLISTED']:<4}</code> отсеяно по черному списку\n"
                               f"<code>- {rejection_stats['ERRORS']:<4}</code> отсеяно из-за ошибок\n"
                               f"<code>- {rejection_stats['INSUFFICIENT_DATA']:<4}</code> отсеяно по недостатку данных\n"
                               f"<code>- {rejection_stats['H1_TAILWIND']:<4}</code> отсеяно по H1 фильтру\n"
@@ -324,7 +333,7 @@ async def scanner(app):
         except Exception as e:
             log.error("Scanner critical: %s", e, exc_info=True)
             await asyncio.sleep(300)
-        await asyncio.sleep(10) # Brief sleep at the end of the loop
+        await asyncio.sleep(10)
 
 async def monitor(app: Application):
     while state.get("bot_on", False):
@@ -428,7 +437,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not state.get("bot_on"):
         state["bot_on"] = True
         save_state()
-        await update.message.reply_text("✅ <b>Бот v3.4.2 (Startup Fix) запущен.</b>")
+        await update.message.reply_text("✅ <b>Бот v3.4.4 (Blacklist Update) запущен.</b>")
         if not hasattr(ctx.application, '_scanner_task') or ctx.application._scanner_task.done():
              log.info("Starting scanner task from /start command...")
              ctx.application._scanner_task = asyncio.create_task(scanner(ctx.application))
@@ -453,9 +462,6 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app: Application):
     log.info("Bot application initialized. Checking prior state...")
-    await exchange_spot.load_markets()
-    await exchange_futures.load_markets()
-    
     if state.get("bot_on"):
         log.info("Bot was ON before restart. Auto-starting tasks...")
         app._scanner_task = asyncio.create_task(scanner(app))
@@ -475,5 +481,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     
-    log.info("Bot v3.4.2 (Startup Fix) started.")
+    log.info("Bot v3.4.4 (Blacklist Update) started.")
     app.run_polling()
