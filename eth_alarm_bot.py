@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v4.6 - Final Data Fix
+# v5.2 - Ultra-Polite MEXC Scanner
 # Changelog 10‑Jul‑2025 (Europe/Belgrade):
-# • Final Fix: The fetch_tickers call is now filtered to request ONLY spot
-#   tickers, ensuring data requests match the available market data.
+# • Increased scan delay to 1.5s per coin to avoid MEXC rate-limiting.
+# • Simplified MEXC config based on analysis of the working bot.
+# • This is the final attempt to make the high-frequency MEXC scan work.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -47,12 +48,8 @@ TRADE_LOG_WS = None
 SHEET_NAME   = "Autonomous_Trade_Log_v5"
 
 HEADERS = [
-    "Signal_ID","Pair","Side","Status",
-    "Entry_Time_UTC","Exit_Time_UTC",
-    "Entry_Price","Exit_Price","SL_Price","TP_Price",
-    "MFE_Price","MAE_Price","MFE_R","MAE_R",
-    "Entry_RSI","Entry_ADX","H1_Trend_at_Entry",
-    "Entry_BB_Position","LLM_Reason",
+    "Signal_ID","Pair","Side","Status", "Entry_Time_UTC","Exit_Time_UTC", "Entry_Price","Exit_Price","SL_Price","TP_Price",
+    "MFE_Price","MAE_Price","MFE_R","MAE_R", "Entry_RSI","Entry_ADX","H1_Trend_at_Entry", "Entry_BB_Position","LLM_Reason",
     "Confidence_Score", "Position_Size_USD", "Leverage", "PNL_USD", "PNL_Percent"
 ]
 
@@ -76,7 +73,7 @@ def setup_sheets():
         log.error("Sheets init failed: %s", e)
 
 # === State ================================================================
-STATE_FILE = "bot_state_v4_6.json"
+STATE_FILE = "bot_state_v5_2.json"
 state = {}
 def load_state():
     global state
@@ -90,8 +87,7 @@ def save_state():
     json.dump(state, open(STATE_FILE,"w"), indent=2)
 
 # === Exchange & Strategy ==================================================
-exchange_data = ccxt.bybit({'options': {'defaultType':'spot'}})
-exchange_exec = ccxt.mexc({'options': {'defaultType':'swap'}})
+exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
 
 TF_ENTRY  = os.getenv("TF_ENTRY", "15m")
 ATR_LEN   = 14
@@ -133,7 +129,7 @@ async def broadcast(app, txt:str):
 # === Main loops ===========================================================
 async def get_market_snapshot():
     try:
-        ohlcv_btc = await exchange_data.fetch_ohlcv('BTC/USDT', '1d', limit=51, params={'category':'spot'})
+        ohlcv_btc = await exchange.fetch_ohlcv('BTC_USDT', '1d')
         if not ohlcv_btc: raise ValueError("Received empty OHLCV data for BTC")
         
         df_btc = pd.DataFrame(ohlcv_btc, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -164,25 +160,18 @@ async def scanner(app):
         try:
             scan_start_time = datetime.now(timezone.utc)
             if len(state["monitored_signals"]) >= MAX_CONCURRENT_SIGNALS: await asyncio.sleep(300); continue
-            
             snapshot = await get_market_snapshot()
             market_regime = snapshot['regime']
-            
-            msg = (f"🔍 <b>Начинаю сканирование рынка (Источник: Bybit Spot)...</b>\n"
+            msg = (f"🔍 <b>Начинаю сканирование рынка (Источник: MEXC SWAP)...</b>\n"
                    f"<i>Режим:</i> {market_regime} | <i>Волатильность:</i> {snapshot['volatility']} (ATR {snapshot['volatility_percent']})")
             await broadcast(app, msg)
-
             if market_regime == "BEARISH": await broadcast(app, "❗️ <b>Рынок в медвежьей фазе.</b> Длинные позиции (LONG) отключены.")
-
             now = datetime.now(timezone.utc).timestamp()
             state["cooldown"] = {p:t for p,t in state["cooldown"].items() if now-t < COOLDOWN_HOURS*3600}
             
-            # ИЗМЕНЕНИЕ: Запрашиваем тикеры только со спотового рынка
-            tickers = await exchange_data.fetch_tickers(params={'category': 'spot'})
-            pairs = sorted(
-                ((s,t) for s,t in tickers.items() if s.endswith('/USDT') and t.get('quoteVolume')),
-                key=lambda x:x[1]['quoteVolume'], reverse=True
-            )[:COIN_LIST_SIZE]
+            # Для фьючерсов MEXC символы обычно без "/"
+            tickers = await exchange.fetch_tickers()
+            pairs = sorted(((s,t) for s,t in tickers.items() if s.endswith('USDT') and not s.endswith('_USDT') and t.get('quoteVolume')), key=lambda x:x[1]['quoteVolume'], reverse=True)[:COIN_LIST_SIZE]
             
             rejection_stats = { "ERRORS": 0, "INSUFFICIENT_DATA": 0, "LOW_ADX": 0, "NO_CROSS": 0, "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0 }
             
@@ -192,21 +181,19 @@ async def scanner(app):
                 if sym in state["cooldown"]: continue
                 try:
                     log.info(f"Scanning ({i+1}/{len(pairs)}): {sym}")
-                    df15 = pd.DataFrame (await exchange_data.fetch_ohlcv(sym, TF_ENTRY, limit=40),
-                        columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    df15 = pd.DataFrame (await exchange.fetch_ohlcv(sym, TF_ENTRY, limit=40), columns=["timestamp", "open", "high", "low", "close", "volume"])
                     if len(df15) < 35:
                         rejection_stats["INSUFFICIENT_DATA"] += 1; continue
                     
                     numeric_cols = ["open", "high", "low", "close", "volume"]
                     for col in numeric_cols: df15[col] = pd.to_numeric(df15[col])
-
+                    
                     df15.ta.ema(length=9, append=True); df15.ta.ema(length=21, append=True)
                     df15.ta.atr(length=ATR_LEN, append=True); df15.ta.adx(length=14, append=True)
                     last15 = df15.iloc[-1]
 
                     if f"ATR_{ATR_LEN}" not in df15.columns or pd.isna(last15[f"ATR_{ATR_LEN}"]):
                         rejection_stats["INSUFFICIENT_DATA"] += 1; continue
-
                     adx = last15["ADX_14"]; side = None
                     if adx < MIN_M15_ADX:
                         rejection_stats["LOW_ADX"] += 1; continue
@@ -225,10 +212,8 @@ async def scanner(app):
                     if (last15["high"]-last15["low"]) > last15[f"ATR_{ATR_LEN}"]*ANOMALOUS_CANDLE_MULT:
                         rejection_stats["ANOMALOUS_CANDLE"] += 1; continue
                     
-                    df1h = pd.DataFrame(await exchange_data.fetch_ohlcv(sym, "1h", limit=51),
-                        columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    df1h = pd.DataFrame(await exchange.fetch_ohlcv(sym, "1h"), columns=["timestamp", "open", "high", "low", "close", "volume"])
                     for col in numeric_cols: df1h[col] = pd.to_numeric(df1h[col])
-
                     df1h.ta.ema(length=50,append=True)
                     last1h = df1h.iloc[-1]
                     
@@ -244,7 +229,8 @@ async def scanner(app):
                     rejection_stats["ERRORS"] += 1
                     log.warning(f"Scan ERROR on {sym}: {e}")
                 
-                await asyncio.sleep(0.5)
+                # ИЗМЕНЕНИЕ: Увеличена пауза для обхода Rate Limit
+                await asyncio.sleep(1.5)
             
             if not pre:
                 duration = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
@@ -267,71 +253,52 @@ async def scanner(app):
 
 async def monitor(app):
     while state["bot_on"]:
-        if not state["monitored_signals"]:
-            await asyncio.sleep(30)
-            continue
+        if not state["monitored_signals"]: await asyncio.sleep(30); continue
         for s in list(state["monitored_signals"]):
             try:
-                price = (await exchange_data.fetch_ticker(s["pair"]))["last"]
+                price = (await exchange.fetch_ticker(s["pair"]))["last"]
                 if not price: continue
-                
                 if s["side"]=="LONG":
                     if price>s["mfe_price"]: s["mfe_price"]=price
                     if price<s["mae_price"]: s["mae_price"]=price
                 else:
                     if price<s["mfe_price"]: s["mfe_price"]=price
                     if price>s["mae_price"]: s["mae_price"]=price
-                
                 hit=None; exit_price = None
                 if (s["side"]=="LONG" and price>=s["tp"]): hit, exit_price = "TP_HIT", s["tp"]
                 elif (s["side"]=="SHORT" and price<=s["tp"]): hit, exit_price = "TP_HIT", s["tp"]
                 elif (s["side"]=="LONG" and price<=s["sl"]): hit, exit_price = "SL_HIT", s["sl"]
                 elif (s["side"]=="SHORT" and price>=s["sl"]): hit, exit_price = "SL_HIT", s["sl"]
-                
                 if hit:
                     risk = abs(s["entry_price"]-s["sl"])
                     mfe_r = round(abs(s["mfe_price"]-s["entry_price"])/risk, 2) if risk > 0 else 0
                     mae_r = round(abs(s["mae_price"]-s["entry_price"])/risk, 2) if risk > 0 else 0
-                    
                     leverage = s.get("leverage", 100); position_size = s.get("position_size_usd", 0)
                     price_change = (exit_price - s['entry_price']) / s['entry_price']
                     if s["side"] == "SHORT": price_change = -price_change
-                    
                     pnl_percent = price_change * leverage * 100
                     pnl_usd = position_size * (pnl_percent / 100)
-
                     if TRADE_LOG_WS:
-                        row=[
-                            s["signal_id"],s["pair"],s["side"],hit, s["entry_time_utc"],datetime.now(timezone.utc).isoformat(),
-                            s["entry_price"],exit_price,s["sl"],s["tp"], s["mfe_price"],s["mae_price"],mfe_r,mae_r,
-                            s.get("rsi"),s.get("adx"),"N/A", s.get("bb_pos"),s.get("reason"), s.get("confidence_score"),
-                            s.get("position_size_usd"), s.get("leverage"), pnl_usd, pnl_percent
-                        ]
+                        row=[ s["signal_id"],s["pair"],s["side"],hit, s["entry_time_utc"],datetime.now(timezone.utc).isoformat(), s["entry_price"],exit_price,s["sl"],s["tp"], s["mfe_price"],s["mae_price"],mfe_r,mae_r, s.get("rsi"),s.get("adx"),"N/A", s.get("bb_pos"),s.get("reason"), s.get("confidence_score"), s.get("position_size_usd"), s.get("leverage"), pnl_usd, pnl_percent ]
                         await asyncio.to_thread(TRADE_LOG_WS.append_row,row,value_input_option='USER_ENTERED')
-                    
                     status_emoji = "✅" if hit == "TP_HIT" else "❌"
-                    msg = (f"{status_emoji} <b>СДЕЛКА ЗАКРЫТА</b> ({hit})\n\n"
-                           f"<b>Инструмент:</b> <code>{s['pair']}</code>\n<b>Результат: ${pnl_usd:+.2f} ({pnl_percent:+.2f}%)</b>")
+                    msg = (f"{status_emoji} <b>СДЕЛКА ЗАКРЫТА</b> ({hit})\n\n" f"<b>Инструмент:</b> <code>{s['pair']}</code>\n<b>Результат: ${pnl_usd:+.2f} ({pnl_percent:+.2f}%)</b>")
                     await broadcast(app, msg)
                     state["monitored_signals"].remove(s); save_state()
             except Exception as e: log.error("Monitor %s: %s", s.get("signal_id"), e)
         await asyncio.sleep(60)
-
 async def daily_pnl_report(app):
     while True:
         now = datetime.now(timezone.utc)
         tomorrow = now + timedelta(days=1)
         next_run = tomorrow.replace(hour=0, minute=5, second=0, microsecond=0)
         await asyncio.sleep((next_run - now).total_seconds())
-
         if not TRADE_LOG_WS: continue
         log.info("Running daily P&L report...")
-
         try:
             records = await asyncio.to_thread(TRADE_LOG_WS.get_all_records)
             now = datetime.now(timezone.utc)
             total_pnl = 0; wins = 0; losses = 0
-
             for rec in records:
                 try:
                     exit_time_str = rec.get("Exit_Time_UTC")
@@ -343,32 +310,25 @@ async def daily_pnl_report(app):
                         if pnl > 0: wins += 1
                         elif pnl < 0: losses += 1
                 except (ValueError, TypeError): continue
-
             if wins > 0 or losses > 0:
-                msg = (f"📈 <b>Ежедневный отчет по P&L</b>\n\n"
-                       f"<b>Результат за 24ч:</b> ${total_pnl:+.2f}\n"
-                       f"<b>Прибыльных сделок:</b> {wins}\n<b>Убыточных сделок:</b> {losses}")
+                msg = (f"📈 <b>Ежедневный отчет по P&L</b>\n\n" f"<b>Результат за 24ч:</b> ${total_pnl:+.2f}\n" f"<b>Прибыльных сделок:</b> {wins}\n<b>Убыточных сделок:</b> {losses}")
                 await broadcast(app, msg)
             else: log.info("No trades closed in the last 24 hours to report.")
         except Exception as e:
             log.error(f"Daily P&L report failed: {e}")
-
-# === Telegram commands =====================================================
 async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     cid=update.effective_chat.id
     ctx.application.chat_ids.add(cid)
     if not state["bot_on"]:
         state["bot_on"]=True; save_state()
-        await update.message.reply_text("✅ <b>Бот v4.6 (Final Data Fix) запущен.</b>"); 
+        await update.message.reply_text("✅ <b>Бот v5.2 (Ultra-Polite MEXC) запущен.</b>"); 
         asyncio.create_task(scanner(ctx.application))
         asyncio.create_task(monitor(ctx.application))
         asyncio.create_task(daily_pnl_report(ctx.application))
     else:
         await update.message.reply_text("ℹ️ Бот уже запущен.")
-
 async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     state["bot_on"]=False; save_state(); await update.message.reply_text("🛑 <b>Бот остановлен.</b>")
-
 async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     snapshot = await get_market_snapshot()
     msg = (f"<b>Состояние бота:</b> {'✅ ON' if state['bot_on'] else '🛑 OFF'}\n"
@@ -376,7 +336,6 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
            f"<b>Режим рынка:</b> {snapshot['regime']}\n"
            f"<b>Волатильность:</b> {snapshot['volatility']} (ATR {snapshot['volatility_percent']})")
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
-
 # === Entrypoint ============================================================
 if __name__=="__main__":
     load_state(); setup_sheets()
@@ -389,5 +348,5 @@ if __name__=="__main__":
         asyncio.create_task(scanner(app))
         asyncio.create_task(monitor(app))
         asyncio.create_task(daily_pnl_report(app))
-    log.info("Bot v4.6 (Final Data Fix) started.")
+    log.info("Bot v5.2 (Ultra-Polite MEXC) started.")
     app.run_polling()
