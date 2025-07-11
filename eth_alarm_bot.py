@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.4.1 - Final Unified Code
+# v3.4.2 - Final Startup Logic Fix
 # Changelog 11‑Jul‑2025 (Europe/Belgrade):
-# • Unified all patches into a single, complete file.
-# • Bot now synchronizes futures and spot markets to trade only valid pairs.
-# • Fixed hardcoded exchange name in Telegram notifications.
+# • Corrected the task startup logic to ensure scanner/monitor start correctly
+#   on /start command and auto-resume on application restart.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -94,7 +93,6 @@ def save_state():
         json.dump(state, f, indent=2)
 
 # === Exchange & Strategy ==================================================
-# Создаем два объекта биржи: для спота (анализ) и фьючерсов (проверка)
 exchange_spot = ccxt.mexc({'options': {'defaultType': 'spot'}})
 exchange_futures = ccxt.mexc({'options': {'defaultType': 'swap'}})
 
@@ -326,6 +324,7 @@ async def scanner(app):
         except Exception as e:
             log.error("Scanner critical: %s", e, exc_info=True)
             await asyncio.sleep(300)
+        await asyncio.sleep(10) # Brief sleep at the end of the loop
 
 async def monitor(app: Application):
     while state.get("bot_on", False):
@@ -358,7 +357,7 @@ async def monitor(app: Application):
                     leverage = s.get("leverage", 100)
                     position_size = s.get("position_size_usd", 0)
                     
-                    if s['entry_price'] == 0: continue # Avoid division by zero
+                    if s['entry_price'] == 0: continue
                     price_change_percent = ((exit_price - s['entry_price']) / s['entry_price'])
                     if s["side"] == "SHORT": price_change_percent = -price_change_percent
                     
@@ -388,9 +387,9 @@ async def monitor(app: Application):
 
 async def daily_pnl_report(app: Application):
     while True:
-        await asyncio.sleep(3600) # Check every hour
+        await asyncio.sleep(3600) 
         now = datetime.now(timezone.utc)
-        if now.hour != 0 or now.minute > 5: continue # Run once just after midnight UTC
+        if now.hour != 0 or now.minute > 5: continue
 
         if not TRADE_LOG_WS: continue
         log.info("Running daily P&L report...")
@@ -429,7 +428,13 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not state.get("bot_on"):
         state["bot_on"] = True
         save_state()
-        await update.message.reply_text("✅ <b>Бот v3.4.1 (MEXC Sync) запущен.</b>")
+        await update.message.reply_text("✅ <b>Бот v3.4.2 (Startup Fix) запущен.</b>")
+        if not hasattr(ctx.application, '_scanner_task') or ctx.application._scanner_task.done():
+             log.info("Starting scanner task from /start command...")
+             ctx.application._scanner_task = asyncio.create_task(scanner(ctx.application))
+        if not hasattr(ctx.application, '_monitor_task') or ctx.application._monitor_task.done():
+             log.info("Starting monitor task from /start command...")
+             ctx.application._monitor_task = asyncio.create_task(monitor(ctx.application))
     else:
         await update.message.reply_text("ℹ️ Бот уже запущен.")
 
@@ -447,28 +452,28 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
 async def post_init(app: Application):
-    # This function is now simplified, tasks are managed by the main loop
-    log.info("Bot fully initialized.")
-    pass
+    log.info("Bot application initialized. Checking prior state...")
+    await exchange_spot.load_markets()
+    await exchange_futures.load_markets()
+    
+    if state.get("bot_on"):
+        log.info("Bot was ON before restart. Auto-starting tasks...")
+        app._scanner_task = asyncio.create_task(scanner(app))
+        app._monitor_task = asyncio.create_task(monitor(app))
+    
+    app._pnl_task = asyncio.create_task(daily_pnl_report(app))
+    log.info("Background task scheduler is configured.")
 
 if __name__ == "__main__":
     load_state()
     setup_sheets()
     
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.chat_ids = set(CHAT_IDS)
     
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     
-    loop = asyncio.get_event_loop()
-    loop.create_task(app.initialize())
-    
-    # Start main background tasks
-    loop.create_task(scanner(app))
-    loop.create_task(monitor(app))
-    loop.create_task(daily_pnl_report(app))
-    
-    log.info("Bot v3.4.1 (MEXC Sync) started.")
+    log.info("Bot v3.4.2 (Startup Fix) started.")
     app.run_polling()
