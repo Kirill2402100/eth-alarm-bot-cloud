@@ -287,24 +287,34 @@ async def daily_pnl_report(app: Application):
         except Exception as e:
             log.error(f"Daily P&L report failed: {e}")
             async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    cid=update.effective_chat.id; ctx.application.chat_ids.add(cid)
-    if not state.get("monitoring"):
-        state["monitoring"]=True; save_state()
-        await update.message.reply_text("✅ <b>Бот v6.2 (Final Fix) запущен.</b>"); 
+    # Добавлен отступ для всего тела функции
+    cid=update.effective_chat.id
+    ctx.application.chat_ids.add(cid)
+    if not state.get("bot_on"): # Исправлен ключ на 'bot_on' как в state
+        state["bot_on"]=True
+        save_state()
+        await update.message.reply_text("✅ <b>Бот v6.2 (Final Fix) запущен.</b>")
         asyncio.create_task(scanner(ctx.application))
         asyncio.create_task(monitor(ctx.application))
         asyncio.create_task(daily_pnl_report(ctx.application))
-    else: await update.message.reply_text("ℹ️ Бот уже запущен.")
+    else:
+        await update.message.reply_text("ℹ️ Бот уже запущен.")
+
 async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    state["monitoring"]=False; save_state(); await update.message.reply_text("🛑 <b>Бот остановлен.</b>")
+    # Добавлен отступ
+    state["bot_on"]=False # Исправлен ключ на 'bot_on'
+    save_state()
+    await update.message.reply_text("🛑 <b>Бот остановлен.</b>")
+
 async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    # Добавлен отступ
     snapshot = await get_market_snapshot()
-    msg = (f"<b>Состояние бота:</b> {'✅ ON' if state.get('monitoring') else '🛑 OFF'}\n"
+    msg = (f"<b>Состояние бота:</b> {'✅ ON' if state.get('bot_on') else '🛑 OFF'}\n" # Исправлен ключ
            f"<b>Активных сигналов:</b> {len(state['monitored_signals'])}/{MAX_CONCURRENT_SIGNALS}\n"
            f"<b>Режим рынка:</b> {snapshot['regime']}\n"
            f"<b>Волатильность:</b> {snapshot['volatility']} (ATR {snapshot['volatility_percent']})")
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
-async def post_init(app: Application):
+    async def post_init(app: Application):
     log.info("Explicitly loading markets...")
     await exchange.load_markets(True) # Force reload
     log.info("Markets loaded.")
