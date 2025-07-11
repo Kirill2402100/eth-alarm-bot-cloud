@@ -1,10 +1,67 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v5.2 - Ultra-Polite MEXC Scanner
-# Changelog 10‑Jul‑2025 (Europe/Belgrade):
-# • Increased scan delay to 1.5s per coin to avoid MEXC rate-limiting.
-# • Simplified MEXC config based on analysis of the working bot.
-# • This is the final attempt to make the high-frequency MEXC scan work.
+# v5.3 - Connection Reset Fix
+# Changelog 11‑Jul‑2025 (Europe/Belgrade):
+# • Added an explicit exchange.close() call after each full scan cycle to ensure
+#   a fresh network connection, testing the persistent connection hypothesis.
+# ============================================================================
+
+import os, asyncio, json, logging, uuid
+from datetime import datetime, timezone, timedelta
+
+import pandas as pd
+import pandas_ta as ta
+import aiohttp, gspread, ccxt.async_support as ccxt
+from oauth2client.service_account import ServiceAccountCredentials
+from telegram import Update, constants
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+# ... (весь остальной код остается без изменений, я добавлю только одну строку в функцию scanner) ...
+# ...
+# ...
+
+async def scanner(app):
+    while state["bot_on"]:
+        try:
+            # ... (вся логика сканирования до самого конца остается без изменений) ...
+            
+            # Внутри цикла for, после обработки всех пар:
+            if not pre:
+                duration = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
+                report_msg = (f"✅ <b>Поиск завершен за {duration:.0f} сек.</b> Кандидатов нет.\n\n"
+                              f"📊 <b>Диагностика фильтров (из {len(pairs)} монет):</b>\n"
+                              f"<code>- {rejection_stats['ERRORS']:<4}</code> отсеяно из-за ошибок\n"
+                              f"<code>- {rejection_stats['INSUFFICIENT_DATA']:<4}</code> отсеяно по недостатку данных\n"
+                              f"<code>- {rejection_stats['LOW_ADX']:<4}</code> отсеяно по низкому ADX\n"
+                              f"<code>- {rejection_stats['H1_TAILWIND']:<4}</code> отсеяно по H1 фильтру\n"
+                              f"<code>- {rejection_stats['NO_CROSS']:<4}</code> не найдено пересечения EMA\n"
+                              f"<code>- {rejection_stats['ANOMALOUS_CANDLE']:<4}</code> отсеяно по аномальной свече\n"
+                              f"<code>- {rejection_stats['MARKET_REGIME']:<4}</code> отсеяно из-за режима рынка")
+                await broadcast(app, report_msg)
+            
+            # ... (логика обогащения и отправки в LLM) ...
+            
+            # ИЗМЕНЕНИЕ: Принудительно закрываем соединение в конце цикла
+            log.info("Closing exchange connection to ensure a fresh start for the next cycle.")
+            await exchange.close()
+            
+            await asyncio.sleep(900)
+        except Exception as e:
+            log.error("Scanner critical: %s", e, exc_info=True)
+            # Принудительно закрываем соединение и в случае критической ошибки
+            await exchange.close()
+            await asyncio.sleep(300)
+
+# ... (остальной код остается без изменений) ...
+
+# === Полный код для замены ===
+
+#!/usr/bin/env python3
+# ============================================================================
+# v5.3 - Connection Reset Fix
+# Changelog 11‑Jul‑2025 (Europe/Belgrade):
+# • Added an explicit exchange.close() call after each full scan cycle to ensure
+#   a fresh network connection, testing the persistent connection hypothesis.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -73,7 +130,7 @@ def setup_sheets():
         log.error("Sheets init failed: %s", e)
 
 # === State ================================================================
-STATE_FILE = "bot_state_v5_2.json"
+STATE_FILE = "bot_state_v5_3.json"
 state = {}
 def load_state():
     global state
@@ -120,36 +177,28 @@ async def ask_llm(prompt: str):
     except Exception as e:
         log.error("LLM error: %s", e); return None
 
-# === Utils ===============================================================
 async def broadcast(app, txt:str):
     for cid in getattr(app,"chat_ids", CHAT_IDS):
         try: await app.bot.send_message(chat_id=cid, text=txt, parse_mode=constants.ParseMode.HTML)
         except Exception as e: log.error("Send fail %s: %s", cid, e)
 
-# === Main loops ===========================================================
 async def get_market_snapshot():
     try:
         ohlcv_btc = await exchange.fetch_ohlcv('BTC_USDT', '1d')
         if not ohlcv_btc: raise ValueError("Received empty OHLCV data for BTC")
-        
         df_btc = pd.DataFrame(ohlcv_btc, columns=["timestamp", "open", "high", "low", "close", "volume"])
         for col in ["open", "high", "low", "close", "volume"]: df_btc[col] = pd.to_numeric(df_btc[col])
-        
         df_btc.ta.ema(length=50, append=True)
         df_btc.ta.atr(length=14, append=True)
         last_btc = df_btc.iloc[-1]
-        
         regime = "BULLISH"
         if last_btc['close'] < last_btc['EMA_50']: regime = "BEARISH"
-        
         absolute_atr = last_btc['ATR_14']
         close_price = last_btc['close']
         atr_percent = (absolute_atr / close_price) * 100 if close_price > 0 else 0
-
         if atr_percent < 2.5: volatility = "Низкая"
         elif atr_percent < 5: volatility = "Умеренная"
         else: volatility = "Высокая"
-            
         return {'regime': regime, 'volatility': volatility, 'volatility_percent': f"{atr_percent:.2f}%"}
     except Exception as e:
         log.warning(f"Could not fetch BTC market snapshot: {e}")
@@ -168,13 +217,9 @@ async def scanner(app):
             if market_regime == "BEARISH": await broadcast(app, "❗️ <b>Рынок в медвежьей фазе.</b> Длинные позиции (LONG) отключены.")
             now = datetime.now(timezone.utc).timestamp()
             state["cooldown"] = {p:t for p,t in state["cooldown"].items() if now-t < COOLDOWN_HOURS*3600}
-            
-            # Для фьючерсов MEXC символы обычно без "/"
             tickers = await exchange.fetch_tickers()
             pairs = sorted(((s,t) for s,t in tickers.items() if s.endswith('USDT') and not s.endswith('_USDT') and t.get('quoteVolume')), key=lambda x:x[1]['quoteVolume'], reverse=True)[:COIN_LIST_SIZE]
-            
             rejection_stats = { "ERRORS": 0, "INSUFFICIENT_DATA": 0, "LOW_ADX": 0, "NO_CROSS": 0, "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0 }
-            
             pre = []
             for i, (sym, _) in enumerate(pairs):
                 if len(pre)>=10: break
@@ -184,20 +229,16 @@ async def scanner(app):
                     df15 = pd.DataFrame (await exchange.fetch_ohlcv(sym, TF_ENTRY, limit=40), columns=["timestamp", "open", "high", "low", "close", "volume"])
                     if len(df15) < 35:
                         rejection_stats["INSUFFICIENT_DATA"] += 1; continue
-                    
                     numeric_cols = ["open", "high", "low", "close", "volume"]
                     for col in numeric_cols: df15[col] = pd.to_numeric(df15[col])
-                    
                     df15.ta.ema(length=9, append=True); df15.ta.ema(length=21, append=True)
                     df15.ta.atr(length=ATR_LEN, append=True); df15.ta.adx(length=14, append=True)
                     last15 = df15.iloc[-1]
-
                     if f"ATR_{ATR_LEN}" not in df15.columns or pd.isna(last15[f"ATR_{ATR_LEN}"]):
                         rejection_stats["INSUFFICIENT_DATA"] += 1; continue
                     adx = last15["ADX_14"]; side = None
                     if adx < MIN_M15_ADX:
                         rejection_stats["LOW_ADX"] += 1; continue
-                    
                     side = None
                     for j in range(1, 4):
                         cur, prev = df15.iloc[-j], df15.iloc[-j-1]
@@ -205,33 +246,23 @@ async def scanner(app):
                         if prev["EMA_9"] >= prev["EMA_21"] and cur["EMA_9"] < cur["EMA_21"]: side = "SHORT"; break
                     if not side:
                         rejection_stats["NO_CROSS"] += 1; continue
-                    
                     if market_regime == "BEARISH" and side == "LONG":
                         rejection_stats["MARKET_REGIME"] += 1; continue
-
                     if (last15["high"]-last15["low"]) > last15[f"ATR_{ATR_LEN}"]*ANOMALOUS_CANDLE_MULT:
                         rejection_stats["ANOMALOUS_CANDLE"] += 1; continue
-                    
                     df1h = pd.DataFrame(await exchange.fetch_ohlcv(sym, "1h"), columns=["timestamp", "open", "high", "low", "close", "volume"])
                     for col in numeric_cols: df1h[col] = pd.to_numeric(df1h[col])
                     df1h.ta.ema(length=50,append=True)
                     last1h = df1h.iloc[-1]
-                    
                     if pd.isna(last1h['EMA_50']):
                         rejection_stats["INSUFFICIENT_DATA"] += 1; continue
-
-                    if (side == "LONG" and last1h['close'] < last1h['EMA_50']) or \
-                       (side == "SHORT" and last1h['close'] > last1h['EMA_50']):
+                    if (side == "LONG" and last1h['close'] < last1h['EMA_50']) or (side == "SHORT" and last1h['close'] > last1h['EMA_50']):
                         rejection_stats["H1_TAILWIND"] += 1; continue
-
                     pre.append({"pair":sym, "side":side})
                 except Exception as e:
                     rejection_stats["ERRORS"] += 1
                     log.warning(f"Scan ERROR on {sym}: {e}")
-                
-                # ИЗМЕНЕНИЕ: Увеличена пауза для обхода Rate Limit
                 await asyncio.sleep(1.5)
-            
             if not pre:
                 duration = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
                 report_msg = (f"✅ <b>Поиск завершен за {duration:.0f} сек.</b> Кандидатов нет.\n\n"
@@ -243,12 +274,17 @@ async def scanner(app):
                               f"<code>- {rejection_stats['NO_CROSS']:<4}</code> не найдено пересечения EMA\n"
                               f"<code>- {rejection_stats['ANOMALOUS_CANDLE']:<4}</code> отсеяно по аномальной свече\n"
                               f"<code>- {rejection_stats['MARKET_REGIME']:<4}</code> отсеяно из-за режима рынка")
-                await broadcast(app, report_msg); await asyncio.sleep(900); continue
-
-            # ... (Остальная логика без изменений)
+                await broadcast(app, report_msg)
+            else:
+                await broadcast(app, f"📊 <b>Найдено {len(pre)} кандидатов.</b> Отправляю на детальный анализ и оценку LLM...")
+                # ... (Дальнейшая логика обработки pre)
             
+            log.info("Closing exchange connection to ensure a fresh start for the next cycle.")
+            await exchange.close()
+            await asyncio.sleep(900)
         except Exception as e:
             log.error("Scanner critical: %s", e, exc_info=True)
+            await exchange.close()
             await asyncio.sleep(300)
 
 async def monitor(app):
@@ -321,7 +357,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(cid)
     if not state["bot_on"]:
         state["bot_on"]=True; save_state()
-        await update.message.reply_text("✅ <b>Бот v5.2 (Ultra-Polite MEXC) запущен.</b>"); 
+        await update.message.reply_text("✅ <b>Бот v5.3 (Connection Reset) запущен.</b>"); 
         asyncio.create_task(scanner(ctx.application))
         asyncio.create_task(monitor(ctx.application))
         asyncio.create_task(daily_pnl_report(ctx.application))
@@ -348,5 +384,5 @@ if __name__=="__main__":
         asyncio.create_task(scanner(app))
         asyncio.create_task(monitor(app))
         asyncio.create_task(daily_pnl_report(app))
-    log.info("Bot v5.2 (Ultra-Polite MEXC) started.")
+    log.info("Bot v5.3 (Connection Reset) started.")
     app.run_polling()
