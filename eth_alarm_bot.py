@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.4.4 - Blacklist Update
+# v3.4.5 - Robust Market Sync Fix
 # Changelog 11‑Jul‑2025 (Europe/Belgrade):
-# • Added USD1 to the stablecoin blacklist.
+# • Moved market loading inside the main loop with forced reload
+#   to prevent stale cache issues and ensure accurate spot/futures sync.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -30,7 +31,6 @@ FLAT_RR_RATIO           = 1.0
 
 # --- Черный список стейблкоинов ---
 STABLECOIN_BLACKLIST = {'FDUSD', 'USDC', 'DAI', 'USDE', 'TUSD', 'BUSD', 'USDP', 'GUSD', 'USD1'}
-
 
 LLM_API_KEY  = os.getenv("LLM_API_KEY")
 LLM_API_URL  = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
@@ -176,14 +176,15 @@ async def get_market_snapshot():
         return {'regime': "BULLISH", 'volatility': "N/A", 'volatility_percent': "N/A"}
 
 async def scanner(app):
-    log.info("Loading markets for spot/futures sync...")
-    await exchange_spot.load_markets()
-    await exchange_futures.load_markets()
-    futures_symbols = set(exchange_futures.markets.keys())
-    log.info(f"Loaded {len(futures_symbols)} futures symbols for validation.")
-
     while state.get("bot_on", False):
         try:
+            # Загрузка рынков перенесена внутрь цикла с принудительным обновлением
+            log.info("Force-reloading markets for spot/futures sync...")
+            await exchange_spot.load_markets(True)
+            await exchange_futures.load_markets(True)
+            futures_symbols = set(exchange_futures.markets.keys())
+            log.info(f"Loaded {len(futures_symbols)} futures symbols for validation.")
+
             scan_start_time = datetime.now(timezone.utc)
             if len(state["monitored_signals"]) >= MAX_CONCURRENT_SIGNALS:
                 await asyncio.sleep(300); continue
@@ -268,72 +269,71 @@ async def scanner(app):
                               f"<code>- {rejection_stats['NO_CROSS']:<4}</code> не найдено пересечения EMA\n"
                               f"<code>- {rejection_stats['ANOMALOUS_CANDLE']:<4}</code> отсеяно по аномальной свече\n"
                               f"<code>- {rejection_stats['MARKET_REGIME']:<4}</code> отсеяно из-за режима рынка")
-                await broadcast(app, report_msg); await asyncio.sleep(900); continue
-
-            sorted_pre = sorted(pre_candidates, key=lambda x: x['adx'], reverse=True)
-            top_candidates = sorted_pre[:10]
+                await broadcast(app, report_msg)
             
-            llm_prompt_data = [f"- Pair: {c['pair']}, Side: {c['side']}, ADX: {c['adx']:.2f}, RSI: {c['rsi']:.2f}, BB_Pos: {c['bb_pos']:.2f}" for c in top_candidates]
-            full_prompt = PROMPT + "\n\n" + "КАНДИДАТЫ ДЛЯ АНАЛИЗА:\n" + "\n".join(llm_prompt_data)
-            await broadcast(app, f"📊 <b>Найдено {len(pre_candidates)} кандидатов.</b> Отправляю топ-{len(top_candidates)} с лучшим ADX на анализ LLM...")
-
-            llm_results = await ask_llm(full_prompt)
-
-            if llm_results and len(llm_results) == len(top_candidates):
-                for i, cand in enumerate(top_candidates): cand.update(llm_results[i])
-                
-                valid_candidates = [c for c in top_candidates if c.get('confidence_score', 0) >= MIN_CONFIDENCE_SCORE]
-                if not valid_candidates:
-                    await broadcast(app, "🧐 LLM не нашел достаточно уверенных сетапов. Пропускаю цикл."); continue
-
-                best_candidate = max(valid_candidates, key=lambda x: (x['confidence_score'], x['adx']))
-
-                rr_ratio = TREND_RR_RATIO if best_candidate['adx'] >= TREND_ADX_THRESHOLD else FLAT_RR_RATIO
-                score = best_candidate['confidence_score']
-                pos_size = 50 if score >= 9 else 30 if score >= 7 else 20
-                
-                entry_price, atr_val = best_candidate['entry_price'], best_candidate['atr']
-                sl_distance = atr_val * SL_ATR_MULT
-                tp_distance = sl_distance * rr_ratio
-
-                if best_candidate['side'] == 'LONG':
-                    sl_price, tp_price = entry_price - sl_distance, entry_price + tp_distance
-                else:
-                    sl_price, tp_price = entry_price + sl_distance, entry_price - tp_distance
-
-                signal_id = str(uuid.uuid4())[:8]
-                signal = {
-                    "signal_id": signal_id, "pair": best_candidate['pair'], "side": best_candidate['side'],
-                    "entry_price": entry_price, "sl": sl_price, "tp": tp_price,
-                    "entry_time_utc": datetime.now(timezone.utc).isoformat(),
-                    "status": "ACTIVE", "mfe_price": entry_price, "mae_price": entry_price,
-                    "reason": best_candidate.get('reason', 'N/A'),
-                    "confidence_score": score, "position_size_usd": pos_size,
-                    "leverage": 100, "adx": best_candidate['adx'], "rsi": best_candidate['rsi'],
-                    "bb_pos": best_candidate['bb_pos']
-                }
-                state['monitored_signals'].append(signal)
-                state['cooldown'][signal['pair']] = datetime.now(timezone.utc).timestamp()
-                save_state()
-
-                emoji = "⬆️ LONG" if signal['side'] == 'LONG' else "⬇️ SHORT"
-                msg = (f"<b>🔥 НОВЫЙ СИГНАЛ</b> ({signal_id})\n\n"
-                       f"<b>{emoji} {signal['pair']}</b>\n"
-                       f"<b>Вход:</b> <code>{fmt(signal['entry_price'])}</code>\n"
-                       f"<b>TP:</b> <code>{fmt(signal['tp'])}</code> (RR {rr_ratio:.1f}:1)\n"
-                       f"<b>SL:</b> <code>{fmt(signal['sl'])}</code>\n\n"
-                       f"<b>LLM Оценка: {signal['confidence_score']}/10</b> | <b>Размер: ${signal['position_size_usd']}</b>\n"
-                       f"<i>LLM: \"{signal['reason']}\"</i>")
-                await broadcast(app, msg)
             else:
-                await broadcast(app, "⚠️ Не удалось получить корректный ответ от LLM.")
+                sorted_pre = sorted(pre_candidates, key=lambda x: x['adx'], reverse=True)
+                top_candidates = sorted_pre[:10]
+                
+                llm_prompt_data = [f"- Pair: {c['pair']}, Side: {c['side']}, ADX: {c['adx']:.2f}, RSI: {c['rsi']:.2f}, BB_Pos: {c['bb_pos']:.2f}" for c in top_candidates]
+                full_prompt = PROMPT + "\n\n" + "КАНДИДАТЫ ДЛЯ АНАЛИЗА:\n" + "\n".join(llm_prompt_data)
+                await broadcast(app, f"📊 <b>Найдено {len(pre_candidates)} кандидатов.</b> Отправляю топ-{len(top_candidates)} с лучшим ADX на анализ LLM...")
+
+                llm_results = await ask_llm(full_prompt)
+
+                if llm_results and len(llm_results) == len(top_candidates):
+                    for i, cand in enumerate(top_candidates): cand.update(llm_results[i])
+                    
+                    valid_candidates = [c for c in top_candidates if c.get('confidence_score', 0) >= MIN_CONFIDENCE_SCORE]
+                    if not valid_candidates:
+                        await broadcast(app, "🧐 LLM не нашел достаточно уверенных сетапов. Пропускаю цикл.")
+                    else:
+                        best_candidate = max(valid_candidates, key=lambda x: (x['confidence_score'], x['adx']))
+
+                        rr_ratio = TREND_RR_RATIO if best_candidate['adx'] >= TREND_ADX_THRESHOLD else FLAT_RR_RATIO
+                        score = best_candidate['confidence_score']
+                        pos_size = 50 if score >= 9 else 30 if score >= 7 else 20
+                        
+                        entry_price, atr_val = best_candidate['entry_price'], best_candidate['atr']
+                        sl_distance = atr_val * SL_ATR_MULT
+                        tp_distance = sl_distance * rr_ratio
+
+                        if best_candidate['side'] == 'LONG':
+                            sl_price, tp_price = entry_price - sl_distance, entry_price + tp_distance
+                        else:
+                            sl_price, tp_price = entry_price + sl_distance, entry_price - tp_distance
+
+                        signal_id = str(uuid.uuid4())[:8]
+                        signal = {
+                            "signal_id": signal_id, "pair": best_candidate['pair'], "side": best_candidate['side'],
+                            "entry_price": entry_price, "sl": sl_price, "tp": tp_price,
+                            "entry_time_utc": datetime.now(timezone.utc).isoformat(), "status": "ACTIVE", 
+                            "mfe_price": entry_price, "mae_price": entry_price,
+                            "reason": best_candidate.get('reason', 'N/A'), "confidence_score": score, 
+                            "position_size_usd": pos_size, "leverage": 100, 
+                            "adx": best_candidate['adx'], "rsi": best_candidate['rsi'], "bb_pos": best_candidate['bb_pos']
+                        }
+                        state['monitored_signals'].append(signal)
+                        state['cooldown'][signal['pair']] = datetime.now(timezone.utc).timestamp()
+                        save_state()
+
+                        emoji = "⬆️ LONG" if signal['side'] == 'LONG' else "⬇️ SHORT"
+                        msg = (f"<b>🔥 НОВЫЙ СИГНАЛ</b> ({signal_id})\n\n"
+                               f"<b>{emoji} {signal['pair']}</b>\n"
+                               f"<b>Вход:</b> <code>{fmt(signal['entry_price'])}</code>\n"
+                               f"<b>TP:</b> <code>{fmt(signal['tp'])}</code> (RR {rr_ratio:.1f}:1)\n"
+                               f"<b>SL:</b> <code>{fmt(signal['sl'])}</code>\n\n"
+                               f"<b>LLM Оценка: {signal['confidence_score']}/10</b> | <b>Размер: ${signal['position_size_usd']}</b>\n"
+                               f"<i>LLM: \"{signal['reason']}\"</i>")
+                        await broadcast(app, msg)
+                else:
+                    await broadcast(app, "⚠️ Не удалось получить корректный ответ от LLM.")
             
             await asyncio.sleep(900)
 
         except Exception as e:
             log.error("Scanner critical: %s", e, exc_info=True)
             await asyncio.sleep(300)
-        await asyncio.sleep(10)
 
 async def monitor(app: Application):
     while state.get("bot_on", False):
@@ -437,7 +437,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not state.get("bot_on"):
         state["bot_on"] = True
         save_state()
-        await update.message.reply_text("✅ <b>Бот v3.4.4 (Blacklist Update) запущен.</b>")
+        await update.message.reply_text("✅ <b>Бот v3.4.5 (Robust Sync) запущен.</b>")
         if not hasattr(ctx.application, '_scanner_task') or ctx.application._scanner_task.done():
              log.info("Starting scanner task from /start command...")
              ctx.application._scanner_task = asyncio.create_task(scanner(ctx.application))
@@ -462,6 +462,13 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app: Application):
     log.info("Bot application initialized. Checking prior state...")
+    # Загрузка рынков один раз при старте приложения для начальной готовности
+    try:
+        await exchange_spot.load_markets()
+        await exchange_futures.load_markets()
+    except Exception as e:
+        log.error(f"Initial market load failed: {e}")
+
     if state.get("bot_on"):
         log.info("Bot was ON before restart. Auto-starting tasks...")
         app._scanner_task = asyncio.create_task(scanner(app))
@@ -481,5 +488,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     
-    log.info("Bot v3.4.4 (Blacklist Update) started.")
+    log.info("Bot v3.4.5 (Robust Sync) started polling.")
     app.run_polling()
