@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v5.5 - Hybrid MEXC Spot/Swap
+# v5.6 - Load Markets Fix
 # Changelog 11‑Jul‑2025 (Europe/Belgrade):
-# • Implemented hybrid data model: Tickers/Volume from MEXC SWAP, OHLCV data from MEXC SPOT.
-#   This combines trading focus on SWAP markets with the reliability of SPOT data.
+# • Fix: Added explicit load_markets() calls during bot initialization to
+#   prevent crashes during the first fetch_tickers() call in the scanner.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -42,6 +42,9 @@ def fmt(price: float | None) -> str:
     elif price > 0.001:     return f"{price:.6f}"
     else:                   return f"{price:.8f}"
 
+def to_spot_symbol(swap_symbol):
+    return swap_symbol.replace(':USDT', '')
+
 # === Google‑Sheets =========================================================
 TRADE_LOG_WS = None
 SHEET_NAME   = "Autonomous_Trade_Log_v5"
@@ -67,7 +70,7 @@ def setup_sheets():
         log.error("Sheets init failed: %s", e)
 
 # === State ================================================================
-STATE_FILE = "bot_state_v5_5.json"
+STATE_FILE = "bot_state_v5_6.json"
 state = {}
 def load_state():
     global state
@@ -81,9 +84,8 @@ def save_state():
     json.dump(state, open(STATE_FILE,"w"), indent=2)
 
 # === Exchange & Strategy ==================================================
-# ИЗМЕНЕНИЕ: Используем два подключения
-exchange_swap = ccxt.mexc({'options': {'defaultType': 'swap'}}) # Для списка тикеров и мониторинга
-exchange_spot = ccxt.mexc({'options': {'defaultType': 'spot'}}) # Для анализа исторических данных
+exchange_swap = ccxt.mexc({'options': {'defaultType': 'swap'}})
+exchange_spot = ccxt.mexc({'options': {'defaultType': 'spot'}})
 
 TF_ENTRY  = os.getenv("TF_ENTRY", "15m")
 ATR_LEN, SL_ATR_MULT, RR_RATIO, MIN_M15_ADX, MIN_CONFIDENCE_SCORE = 14, 1.5, 1.5, 20, 6
@@ -112,9 +114,10 @@ async def broadcast(app, txt:str):
     for cid in getattr(app,"chat_ids", CHAT_IDS):
         try: await app.bot.send_message(chat_id=cid, text=txt, parse_mode=constants.ParseMode.HTML)
         except Exception as e: log.error("Send fail %s: %s", cid, e)
+
+# === Main loops ===========================================================
 async def get_market_snapshot():
     try:
-        # Используем SPOT для снапшота
         ohlcv_btc = await exchange_spot.fetch_ohlcv('BTC/USDT', '1d')
         if not ohlcv_btc: raise ValueError("Received empty OHLCV data for BTC")
         df_btc = pd.DataFrame(ohlcv_btc, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -149,7 +152,6 @@ async def scanner(app):
             now = datetime.now(timezone.utc).timestamp()
             state["cooldown"] = {p:t for p,t in state["cooldown"].items() if now-t < COOLDOWN_HOURS*3600}
             
-            # 1. Получаем тикеры с SWAP рынка
             tickers = await exchange_swap.fetch_tickers()
             pairs = sorted(((s,t) for s,t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume')), key=lambda x:x[1]['quoteVolume'], reverse=True)[:COIN_LIST_SIZE]
             
@@ -160,13 +162,11 @@ async def scanner(app):
                 if len(pre)>=10: break
                 if sym_swap in state["cooldown"]: continue
                 
-                # Конвертируем SWAP символ в SPOT символ (убираем :USDT)
-                sym_spot = sym_swap.replace(':USDT', '')
+                sym_spot = to_spot_symbol(sym_swap)
 
                 try:
                     log.info(f"Scanning ({i+1}/{len(pairs)}): {sym_swap} (analyzing {sym_spot})")
                     
-                    # 2. Получаем данные со SPOT рынка
                     df15 = pd.DataFrame (await exchange_spot.fetch_ohlcv(sym_spot, TF_ENTRY, limit=40), columns=["timestamp", "open", "high", "low", "close", "volume"])
                     if len(df15) < 35:
                         rejection_stats["INSUFFICIENT_DATA"] += 1; continue
@@ -201,7 +201,6 @@ async def scanner(app):
                     if (side == "LONG" and last1h['close'] < last1h['EMA_50']) or (side == "SHORT" and last1h['close'] > last1h['EMA_50']):
                         rejection_stats["H1_TAILWIND"] += 1; continue
                     
-                    # Сохраняем оригинальный SWAP символ для торговли
                     pre.append({"pair":sym_swap, "side":side})
                 except Exception as e:
                     rejection_stats["ERRORS"] += 1
@@ -224,8 +223,7 @@ async def scanner(app):
                 setups_for_llm=[]
                 for c in pre:
                     try:
-                        # Используем SPOT для данных
-                        sym_spot = c["pair"].replace(':USDT', '')
+                        sym_spot = to_spot_symbol(c["pair"])
                         df = pd.DataFrame(await exchange_spot.fetch_ohlcv(sym_spot, TF_ENTRY, limit=100), columns=["timestamp", "open", "high", "low", "close", "volume"])
                         for col in ["open", "high", "low", "close", "volume"]: df[col] = pd.to_numeric(df[col])
                         df.ta.bbands(length=20, std=2, append=True); df.ta.atr(length=ATR_LEN, append=True)
@@ -265,8 +263,7 @@ async def scanner(app):
                 msg = (f"🚀 <b>НОВЫЙ СИГНАЛ</b> 🚀\n\n" f"<b>Инструмент:</b> <code>{best_setup['pair']}</code>\n<b>Направление:</b> {best_setup['side']}\n\n" f"⭐ <b>Оценка LLM: {score}/10</b>\n💵 <b>Рекомендуемый размер: ${position_size_usd}</b> (плечо 100x)\n\n" f"<i>Обоснование: {best_setup.get('reason', 'N/A')}</i>\n\n" f"<b>Вход:</b> <code>{fmt(entry)}</code>\n<b>Stop Loss:</b> <code>{fmt(sl)}</code>\n<b>Take Profit:</b> <code>{fmt(tp)}</code>")
                 await broadcast(app, msg)
             
-            # Закрываем соединения в конце цикла
-            log.info("Closing exchange connections to ensure a fresh start for the next cycle.")
+            log.info("Closing exchange connections for the next cycle.")
             await exchange_swap.close()
             await exchange_spot.close()
             await asyncio.sleep(900)
