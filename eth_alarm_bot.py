@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.3 - Fully Adaptive System
+# v3.4.1 - Final Unified Code
 # Changelog 11‑Jul‑2025 (Europe/Belgrade):
-# • Implemented Dynamic ADX Ranking to select top 10 candidates.
-# • Implemented Dynamic Risk/Reward based on candidate's ADX value.
-# • Implemented Dynamic Position Sizing based on LLM confidence score.
-# • Updated LLM prompt for higher quality analysis and symmetrical examples.
+# • Unified all patches into a single, complete file.
+# • Bot now synchronizes futures and spot markets to trade only valid pairs.
+# • Fixed hardcoded exchange name in Telegram notifications.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -95,7 +94,9 @@ def save_state():
         json.dump(state, f, indent=2)
 
 # === Exchange & Strategy ==================================================
-exchange = ccxt.mexc({'options': {'defaultType': 'spot'}})
+# Создаем два объекта биржи: для спота (анализ) и фьючерсов (проверка)
+exchange_spot = ccxt.mexc({'options': {'defaultType': 'spot'}})
+exchange_futures = ccxt.mexc({'options': {'defaultType': 'swap'}})
 
 TF_ENTRY  = os.getenv("TF_ENTRY", "15m")
 ATR_LEN, SL_ATR_MULT, MIN_CONFIDENCE_SCORE = 14, 1.5, 6
@@ -158,7 +159,7 @@ async def broadcast(app, txt:str):
 # === Main loops ===========================================================
 async def get_market_snapshot():
     try:
-        ohlcv_btc = await exchange.fetch_ohlcv('BTC/USDT', '1d', limit=100)
+        ohlcv_btc = await exchange_spot.fetch_ohlcv('BTC/USDT', '1d', limit=100)
         if len(ohlcv_btc) < 51: raise ValueError("Received less than 51 candles for BTC")
         df_btc = pd.DataFrame(ohlcv_btc, columns=["timestamp", "open", "high", "low", "close", "volume"])
         for col in ["open", "high", "low", "close", "volume"]: df_btc[col] = pd.to_numeric(df_btc[col])
@@ -174,6 +175,12 @@ async def get_market_snapshot():
         return {'regime': "BULLISH", 'volatility': "N/A", 'volatility_percent': "N/A"}
 
 async def scanner(app):
+    log.info("Loading markets for spot/futures sync...")
+    await exchange_spot.load_markets()
+    await exchange_futures.load_markets()
+    futures_symbols = set(exchange_futures.markets.keys())
+    log.info(f"Loaded {len(futures_symbols)} futures symbols for validation.")
+
     while state.get("bot_on", False):
         try:
             scan_start_time = datetime.now(timezone.utc)
@@ -182,7 +189,7 @@ async def scanner(app):
             
             snapshot = await get_market_snapshot()
             market_regime = snapshot['regime']
-            msg = (f"🔍 <b>Начинаю сканирование рынка (Источник: Bybit)...</b>\n"
+            msg = (f"🔍 <b>Начинаю сканирование рынка (Источник: {exchange_spot.name})...</b>\n"
                    f"<i>Режим:</i> {market_regime} | <i>Волатильность:</i> {snapshot['volatility']} (ATR {snapshot['volatility_percent']})")
             await broadcast(app, msg)
             if market_regime == "BEARISH":
@@ -191,17 +198,22 @@ async def scanner(app):
             now = datetime.now(timezone.utc).timestamp()
             state["cooldown"] = {p:t for p,t in state["cooldown"].items() if now-t < COOLDOWN_HOURS*3600}
             
-            tickers = await exchange.fetch_tickers()
-            pairs = sorted(((s,t) for s,t in tickers.items() if s.endswith('/USDT') and t.get('quoteVolume')), key=lambda x:x[1]['quoteVolume'], reverse=True)[:COIN_LIST_SIZE]
+            spot_tickers = await exchange_spot.fetch_tickers()
+            valid_spot_tickers = {s: t for s, t in spot_tickers.items() if s in futures_symbols}
+            pairs = sorted(
+                ((s,t) for s,t in valid_spot_tickers.items() if s.endswith('/USDT') and t.get('quoteVolume')), 
+                key=lambda x:x[1]['quoteVolume'], 
+                reverse=True
+            )[:COIN_LIST_SIZE]
             
+            log.info(f"Found {len(pairs)} USDT pairs present on both Spot and Futures markets.")
             rejection_stats = { "ERRORS": 0, "INSUFFICIENT_DATA": 0, "NO_CROSS": 0, "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0 }
             pre_candidates = []
 
             for i, (sym, _) in enumerate(pairs):
                 if sym in state["cooldown"]: continue
                 try:
-                    log.info(f"Scanning ({i+1}/{len(pairs)}): {sym}")
-                    ohlcv_data = await exchange.fetch_ohlcv(sym, TF_ENTRY, limit=100)
+                    ohlcv_data = await exchange_spot.fetch_ohlcv(sym, TF_ENTRY, limit=100)
                     if len(ohlcv_data) < 50: rejection_stats["INSUFFICIENT_DATA"] += 1; continue
                     
                     df15 = pd.DataFrame(ohlcv_data, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -219,7 +231,7 @@ async def scanner(app):
                     if market_regime == "BEARISH" and side == "LONG": rejection_stats["MARKET_REGIME"] += 1; continue
                     if (last15["high"]-last15["low"]) > last15[f"ATR_{ATR_LEN}"] * ANOMALOUS_CANDLE_MULT: rejection_stats["ANOMALOUS_CANDLE"] += 1; continue
                     
-                    ohlcv_h1 = await exchange.fetch_ohlcv(sym, "1h", limit=100)
+                    ohlcv_h1 = await exchange_spot.fetch_ohlcv(sym, "1h", limit=100)
                     if len(ohlcv_h1) < 51: rejection_stats["INSUFFICIENT_DATA"] += 1; continue
 
                     df1h = pd.DataFrame(ohlcv_h1, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -251,7 +263,6 @@ async def scanner(app):
                               f"<code>- {rejection_stats['MARKET_REGIME']:<4}</code> отсеяно из-за режима рынка")
                 await broadcast(app, report_msg); await asyncio.sleep(900); continue
 
-            # --- DYNAMIC ADX RANKING & LLM ANALYSIS ---
             sorted_pre = sorted(pre_candidates, key=lambda x: x['adx'], reverse=True)
             top_candidates = sorted_pre[:10]
             
@@ -270,7 +281,6 @@ async def scanner(app):
 
                 best_candidate = max(valid_candidates, key=lambda x: (x['confidence_score'], x['adx']))
 
-                # --- DYNAMIC RISK & POSITION SIZING ---
                 rr_ratio = TREND_RR_RATIO if best_candidate['adx'] >= TREND_ADX_THRESHOLD else FLAT_RR_RATIO
                 score = best_candidate['confidence_score']
                 pos_size = 50 if score >= 9 else 30 if score >= 7 else 20
@@ -324,7 +334,7 @@ async def monitor(app: Application):
         
         for s in list(state["monitored_signals"]):
             try:
-                price = (await exchange.fetch_ticker(s["pair"]))["last"]
+                price = (await exchange_spot.fetch_ticker(s["pair"]))["last"]
                 if not price: continue
 
                 if s["side"] == "LONG":
@@ -347,10 +357,12 @@ async def monitor(app: Application):
                     
                     leverage = s.get("leverage", 100)
                     position_size = s.get("position_size_usd", 0)
-                    price_change_percent = ((exit_price - s['entry_price']) / s['entry_price']) * 100
+                    
+                    if s['entry_price'] == 0: continue # Avoid division by zero
+                    price_change_percent = ((exit_price - s['entry_price']) / s['entry_price'])
                     if s["side"] == "SHORT": price_change_percent = -price_change_percent
                     
-                    pnl_percent = price_change_percent * leverage
+                    pnl_percent = price_change_percent * leverage * 100
                     pnl_usd = position_size * (pnl_percent / 100)
 
                     if TRADE_LOG_WS:
@@ -365,7 +377,7 @@ async def monitor(app: Application):
                     status_emoji = "✅" if hit == "TP_HIT" else "❌"
                     msg = (f"{status_emoji} <b>СДЕЛКА ЗАКРЫТА</b> ({hit})\n\n"
                            f"<b>Инструмент:</b> <code>{s['pair']}</code>\n"
-                           f"<b>Результат: ${pnl_usd:+.2f} ({pnl_percent/100:+.2f}%)</b>") # Corrected PNL % calculation for display
+                           f"<b>Результат: ${pnl_usd:+.2f} ({pnl_percent:+.2f}%)</b>")
                     await broadcast(app, msg)
                     
                     state["monitored_signals"].remove(s)
@@ -376,16 +388,15 @@ async def monitor(app: Application):
 
 async def daily_pnl_report(app: Application):
     while True:
+        await asyncio.sleep(3600) # Check every hour
         now = datetime.now(timezone.utc)
-        tomorrow = now + timedelta(days=1)
-        next_run = tomorrow.replace(hour=0, minute=5, second=0, microsecond=0)
-        await asyncio.sleep((next_run - now).total_seconds())
+        if now.hour != 0 or now.minute > 5: continue # Run once just after midnight UTC
 
         if not TRADE_LOG_WS: continue
         log.info("Running daily P&L report...")
         try:
             records = await asyncio.to_thread(TRADE_LOG_WS.get_all_records)
-            now = datetime.now(timezone.utc)
+            yesterday = now - timedelta(days=1)
             total_pnl, wins, losses = 0, 0, 0
 
             for rec in records:
@@ -393,7 +404,7 @@ async def daily_pnl_report(app: Application):
                     exit_time_str = rec.get("Exit_Time_UTC")
                     if not exit_time_str: continue
                     exit_time = datetime.fromisoformat(exit_time_str).replace(tzinfo=timezone.utc)
-                    if now - exit_time < timedelta(days=1):
+                    if exit_time.date() == yesterday.date():
                         pnl = float(rec.get("PNL_USD", 0))
                         total_pnl += pnl
                         if pnl > 0: wins += 1
@@ -401,12 +412,12 @@ async def daily_pnl_report(app: Application):
                 except (ValueError, TypeError): continue
             
             if wins > 0 or losses > 0:
-                msg = (f"📈 <b>Ежедневный отчет по P&L</b>\n\n"
-                       f"<b>Результат за 24ч:</b> ${total_pnl:+.2f}\n"
+                msg = (f"📈 <b>Ежедневный отчет по P&L за {yesterday.strftime('%d-%m-%Y')}</b>\n\n"
+                       f"<b>Результат:</b> ${total_pnl:+.2f}\n"
                        f"<b>Прибыльных сделок:</b> {wins}\n<b>Убыточных сделок:</b> {losses}")
                 await broadcast(app, msg)
             else:
-                log.info("No trades closed in the last 24 hours to report.")
+                log.info("No trades closed yesterday to report.")
         except Exception as e:
             log.error(f"Daily P&L report failed: {e}")
 
@@ -418,10 +429,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not state.get("bot_on"):
         state["bot_on"] = True
         save_state()
-        await update.message.reply_text("✅ <b>Бот v3.3 (Fully Adaptive) запущен.</b>")
-        asyncio.create_task(scanner(ctx.application))
-        asyncio.create_task(monitor(ctx.application))
-        # daily_pnl_report starts in post_init, no need to start it here
+        await update.message.reply_text("✅ <b>Бот v3.4.1 (MEXC Sync) запущен.</b>")
     else:
         await update.message.reply_text("ℹ️ Бот уже запущен.")
 
@@ -439,22 +447,28 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
 async def post_init(app: Application):
-    log.info("Explicitly loading markets...")
-    await exchange.load_markets(True)
-    log.info("Markets loaded.")
-    if state.get("bot_on"):
-        asyncio.create_task(scanner(app))
-        asyncio.create_task(monitor(app))
-    asyncio.create_task(daily_pnl_report(app))
+    # This function is now simplified, tasks are managed by the main loop
+    log.info("Bot fully initialized.")
+    pass
 
 if __name__ == "__main__":
     load_state()
     setup_sheets()
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.chat_ids = set(CHAT_IDS)
+    
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     
-    log.info("Bot v3.3 (Fully Adaptive) started.")
+    loop = asyncio.get_event_loop()
+    loop.create_task(app.initialize())
+    
+    # Start main background tasks
+    loop.create_task(scanner(app))
+    loop.create_task(monitor(app))
+    loop.create_task(daily_pnl_report(app))
+    
+    log.info("Bot v3.4.1 (MEXC Sync) started.")
     app.run_polling()
