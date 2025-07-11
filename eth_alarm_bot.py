@@ -254,6 +254,7 @@ async def monitor(app: Application):
             except Exception as e: log.error("Monitor %s: %s", s.get("signal_id"), e)
         await asyncio.sleep(60)
 async def daily_pnl_report(app: Application):
+    # Цикл теперь с правильным отступом, он находится "внутри" функции
     while True:
         now = datetime.now(timezone.utc)
         tomorrow = now + timedelta(days=1)
@@ -277,12 +278,15 @@ async def daily_pnl_report(app: Application):
                         elif pnl < 0: losses += 1
                 except (ValueError, TypeError): continue
             if wins > 0 or losses > 0:
-                msg = (f"📈 <b>Ежедневный отчет по P&L</b>\n\n" f"<b>Результат за 24ч:</b> ${total_pnl:+.2f}\n" f"<b>Прибыльных сделок:</b> {wins}\n<b>Убыточных сделок:</b> {losses}")
+                msg = (f"📈 <b>Ежедневный отчет по P&L</b>\n\n"
+                       f"<b>Результат за 24ч:</b> ${total_pnl:+.2f}\n"
+                       f"<b>Прибыльных сделок:</b> {wins}\n<b>Убыточных сделок:</b> {losses}")
                 await broadcast(app, msg)
-            else: log.info("No trades closed in the last 24 hours to report.")
+            else:
+                log.info("No trades closed in the last 24 hours to report.")
         except Exception as e:
             log.error(f"Daily P&L report failed: {e}")
-async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+            async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     cid=update.effective_chat.id; ctx.application.chat_ids.add(cid)
     if not state.get("monitoring"):
         state["monitoring"]=True; save_state()
