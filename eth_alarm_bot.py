@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v5.4 - MEXC Symbol Fix
+# v5.5 - Hybrid MEXC Spot/Swap
 # Changelog 11‑Jul‑2025 (Europe/Belgrade):
-# • FINAL FIX: Implemented symbol transformation from unified (BTC/USDT:USDT)
-#   to raw (BTC_USDT) format before fetch_ohlcv calls for MEXC SWAP market.
-#   This resolves the root "insufficient data" error.
+# • Implemented hybrid data model: Tickers/Volume from MEXC SWAP, OHLCV data from MEXC SPOT.
+#   This combines trading focus on SWAP markets with the reliability of SPOT data.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -21,7 +20,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 BOT_TOKEN               = os.getenv("BOT_TOKEN")
 CHAT_IDS                = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID                = os.getenv("SHEET_ID")
-COIN_LIST_SIZE          = int(os.getenv("COIN_LIST_SIZE", "100")) # Снизим для тестов
+COIN_LIST_SIZE          = int(os.getenv("COIN_LIST_SIZE", "300"))
 MAX_CONCURRENT_SIGNALS  = int(os.getenv("MAX_CONCURRENT_SIGNALS", "10"))
 ANOMALOUS_CANDLE_MULT = 3.0
 COOLDOWN_HOURS          = 4
@@ -42,9 +41,6 @@ def fmt(price: float | None) -> str:
     elif price > 0.1:       return f"{price:.4f}"
     elif price > 0.001:     return f"{price:.6f}"
     else:                   return f"{price:.8f}"
-    
-def to_raw_symbol(unified_symbol):
-    return unified_symbol.replace("/", "_").replace(":USDT", "")
 
 # === Google‑Sheets =========================================================
 TRADE_LOG_WS = None
@@ -71,7 +67,7 @@ def setup_sheets():
         log.error("Sheets init failed: %s", e)
 
 # === State ================================================================
-STATE_FILE = "bot_state_v5_4.json"
+STATE_FILE = "bot_state_v5_5.json"
 state = {}
 def load_state():
     global state
@@ -85,7 +81,10 @@ def save_state():
     json.dump(state, open(STATE_FILE,"w"), indent=2)
 
 # === Exchange & Strategy ==================================================
-exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
+# ИЗМЕНЕНИЕ: Используем два подключения
+exchange_swap = ccxt.mexc({'options': {'defaultType': 'swap'}}) # Для списка тикеров и мониторинга
+exchange_spot = ccxt.mexc({'options': {'defaultType': 'spot'}}) # Для анализа исторических данных
+
 TF_ENTRY  = os.getenv("TF_ENTRY", "15m")
 ATR_LEN, SL_ATR_MULT, RR_RATIO, MIN_M15_ADX, MIN_CONFIDENCE_SCORE = 14, 1.5, 1.5, 20, 6
 
@@ -113,11 +112,10 @@ async def broadcast(app, txt:str):
     for cid in getattr(app,"chat_ids", CHAT_IDS):
         try: await app.bot.send_message(chat_id=cid, text=txt, parse_mode=constants.ParseMode.HTML)
         except Exception as e: log.error("Send fail %s: %s", cid, e)
-
-# === Main loops ===========================================================
 async def get_market_snapshot():
     try:
-        ohlcv_btc = await exchange.fetch_ohlcv('BTC_USDT', '1d')
+        # Используем SPOT для снапшота
+        ohlcv_btc = await exchange_spot.fetch_ohlcv('BTC/USDT', '1d')
         if not ohlcv_btc: raise ValueError("Received empty OHLCV data for BTC")
         df_btc = pd.DataFrame(ohlcv_btc, columns=["timestamp", "open", "high", "low", "close", "volume"])
         for col in ["open", "high", "low", "close", "volume"]: df_btc[col] = pd.to_numeric(df_btc[col])
@@ -144,26 +142,35 @@ async def scanner(app):
             if len(state["monitored_signals"]) >= MAX_CONCURRENT_SIGNALS: await asyncio.sleep(300); continue
             snapshot = await get_market_snapshot()
             market_regime = snapshot['regime']
-            msg = (f"🔍 <b>Начинаю сканирование рынка (Источник: MEXC SWAP)...</b>\n"
+            msg = (f"🔍 <b>Начинаю сканирование рынка (MEXC Hybrid)...</b>\n"
                    f"<i>Режим:</i> {market_regime} | <i>Волатильность:</i> {snapshot['volatility']} (ATR {snapshot['volatility_percent']})")
             await broadcast(app, msg)
             if market_regime == "BEARISH": await broadcast(app, "❗️ <b>Рынок в медвежьей фазе.</b> Длинные позиции (LONG) отключены.")
             now = datetime.now(timezone.utc).timestamp()
             state["cooldown"] = {p:t for p,t in state["cooldown"].items() if now-t < COOLDOWN_HOURS*3600}
-            tickers = await exchange.fetch_tickers()
+            
+            # 1. Получаем тикеры с SWAP рынка
+            tickers = await exchange_swap.fetch_tickers()
             pairs = sorted(((s,t) for s,t in tickers.items() if s.endswith(':USDT') and t.get('quoteVolume')), key=lambda x:x[1]['quoteVolume'], reverse=True)[:COIN_LIST_SIZE]
+            
             rejection_stats = { "ERRORS": 0, "INSUFFICIENT_DATA": 0, "LOW_ADX": 0, "NO_CROSS": 0, "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0 }
+            
             pre = []
-            for i, (sym, _) in enumerate(pairs):
+            for i, (sym_swap, _) in enumerate(pairs):
                 if len(pre)>=10: break
-                if sym in state["cooldown"]: continue
+                if sym_swap in state["cooldown"]: continue
+                
+                # Конвертируем SWAP символ в SPOT символ (убираем :USDT)
+                sym_spot = sym_swap.replace(':USDT', '')
+
                 try:
-                    log.info(f"Scanning ({i+1}/{len(pairs)}): {sym}")
-                    # ИЗМЕНЕНИЕ: Трансформируем символ в формат, понятный для fetch_ohlcv на MEXC SWAP
-                    raw_symbol = to_raw_symbol(sym)
-                    df15 = pd.DataFrame (await exchange.fetch_ohlcv(raw_symbol, TF_ENTRY, limit=40), columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    log.info(f"Scanning ({i+1}/{len(pairs)}): {sym_swap} (analyzing {sym_spot})")
+                    
+                    # 2. Получаем данные со SPOT рынка
+                    df15 = pd.DataFrame (await exchange_spot.fetch_ohlcv(sym_spot, TF_ENTRY, limit=40), columns=["timestamp", "open", "high", "low", "close", "volume"])
                     if len(df15) < 35:
                         rejection_stats["INSUFFICIENT_DATA"] += 1; continue
+                    
                     numeric_cols = ["open", "high", "low", "close", "volume"]
                     for col in numeric_cols: df15[col] = pd.to_numeric(df15[col])
                     df15.ta.ema(length=9, append=True); df15.ta.ema(length=21, append=True)
@@ -185,7 +192,7 @@ async def scanner(app):
                         rejection_stats["MARKET_REGIME"] += 1; continue
                     if (last15["high"]-last15["low"]) > last15[f"ATR_{ATR_LEN}"]*ANOMALOUS_CANDLE_MULT:
                         rejection_stats["ANOMALOUS_CANDLE"] += 1; continue
-                    df1h = pd.DataFrame(await exchange.fetch_ohlcv(raw_symbol, "1h"), columns=["timestamp", "open", "high", "low", "close", "volume"])
+                    df1h = pd.DataFrame(await exchange_spot.fetch_ohlcv(sym_spot, "1h"), columns=["timestamp", "open", "high", "low", "close", "volume"])
                     for col in numeric_cols: df1h[col] = pd.to_numeric(df1h[col])
                     df1h.ta.ema(length=50,append=True)
                     last1h = df1h.iloc[-1]
@@ -193,11 +200,13 @@ async def scanner(app):
                         rejection_stats["INSUFFICIENT_DATA"] += 1; continue
                     if (side == "LONG" and last1h['close'] < last1h['EMA_50']) or (side == "SHORT" and last1h['close'] > last1h['EMA_50']):
                         rejection_stats["H1_TAILWIND"] += 1; continue
-                    pre.append({"pair":sym, "side":side}) # Сохраняем оригинальный унифицированный символ
+                    
+                    # Сохраняем оригинальный SWAP символ для торговли
+                    pre.append({"pair":sym_swap, "side":side})
                 except Exception as e:
                     rejection_stats["ERRORS"] += 1
-                    log.warning(f"Scan ERROR on {sym}: {e}")
-                await asyncio.sleep(1.0)
+                    log.warning(f"Scan ERROR on {sym_swap}: {e}")
+                await asyncio.sleep(0.5)
             if not pre:
                 duration = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
                 report_msg = (f"✅ <b>Поиск завершен за {duration:.0f} сек.</b> Кандидатов нет.\n\n"
@@ -209,17 +218,71 @@ async def scanner(app):
                               f"<code>- {rejection_stats['NO_CROSS']:<4}</code> не найдено пересечения EMA\n"
                               f"<code>- {rejection_stats['ANOMALOUS_CANDLE']:<4}</code> отсеяно по аномальной свече\n"
                               f"<code>- {rejection_stats['MARKET_REGIME']:<4}</code> отсеяно из-за режима рынка")
-                await broadcast(app, report_msg); await asyncio.sleep(900); continue
-            # ... (остальная логика)
+                await broadcast(app, report_msg)
+            else:
+                await broadcast(app, f"📊 <b>Найдено {len(pre)} кандидатов.</b> Отправляю на детальный анализ и оценку LLM...")
+                setups_for_llm=[]
+                for c in pre:
+                    try:
+                        # Используем SPOT для данных
+                        sym_spot = c["pair"].replace(':USDT', '')
+                        df = pd.DataFrame(await exchange_spot.fetch_ohlcv(sym_spot, TF_ENTRY, limit=100), columns=["timestamp", "open", "high", "low", "close", "volume"])
+                        for col in ["open", "high", "low", "close", "volume"]: df[col] = pd.to_numeric(df[col])
+                        df.ta.bbands(length=20, std=2, append=True); df.ta.atr(length=ATR_LEN, append=True)
+                        df.ta.rsi(length=14, append=True); df.ta.adx(length=14, append=True)
+                        last = df.iloc[-1]
+                        if f"ATR_{ATR_LEN}" not in df.columns or pd.isna(last[f"ATR_{ATR_LEN}"]): continue
+                        entry = last["close"]; bb_pos="Внутри канала"
+                        if entry>last["BBU_20_2.0"]: bb_pos="Выше верхней границы"
+                        elif entry<last["BBL_20_2.0"]: bb_pos="Ниже нижней границы"
+                        setups_for_llm.append({"pair":c["pair"], "side":c["side"], "entry_price":entry, "adx":round(float(last["ADX_14"]),2), "rsi":round(float(last["RSI_14"]),2), "bb_pos":bb_pos, "atr_val": last[f"ATR_{ATR_LEN}"]})
+                    except Exception as e: log.warning("Enrich %s: %s", c["pair"], e)
+                if not setups_for_llm:
+                    await broadcast(app, f"✅ <b>Анализ завершен...</b> Ни один кандидат не прошел углубленную проверку."); await asyncio.sleep(900); continue
+                scored_candidates = await ask_llm(PROMPT + "\n\n" + json.dumps({"candidates":setups_for_llm}))
+                if not scored_candidates: await broadcast(app, "❗️ <b>LLM не вернул оценки.</b>"); await asyncio.sleep(900); continue
+                final_candidates = []
+                for i, scored in enumerate(scored_candidates):
+                    if i < len(setups_for_llm):
+                        original_setup = setups_for_llm[i]
+                        if scored.get('confidence_score', 0) >= MIN_CONFIDENCE_SCORE:
+                            original_setup.update(scored); final_candidates.append(original_setup)
+                if not final_candidates:
+                    await broadcast(app, f"✅ <b>Анализ завершен...</b> Ни один сетап не получил достаточной оценки (>{MIN_CONFIDENCE_SCORE})."); await asyncio.sleep(900); continue
+                final_candidates.sort(key=lambda x: (x.get('confidence_score', 0), x.get('adx', 0)), reverse=True)
+                best_setup = final_candidates[0]
+                score = best_setup.get('confidence_score', 0)
+                if score >= 9: position_size_usd = 25
+                elif score >= 7: position_size_usd = 15
+                else: position_size_usd = 10
+                entry = best_setup["entry_price"]; risk = best_setup["atr_val"] * SL_ATR_MULT
+                sl,tp = (entry-risk, entry+risk*RR_RATIO) if best_setup["side"]=="LONG" else (entry+risk, entry-risk*RR_RATIO)
+                sig_id = str(uuid.uuid4())[:8]
+                signal_to_monitor = { "signal_id": sig_id, "entry_time_utc": datetime.now(timezone.utc).isoformat(), "pair": best_setup["pair"], "side": best_setup["side"], "entry_price": entry, "sl": sl, "tp": tp, "mfe_price": entry, "mae_price": entry, "confidence_score": score, "position_size_usd": position_size_usd, "leverage": 100, "reason": best_setup.get("reason"), "adx": best_setup.get("adx"), "rsi": best_setup.get("rsi"), "bb_pos": best_setup.get("bb_pos") }
+                state["monitored_signals"].append(signal_to_monitor)
+                state["cooldown"][best_setup["pair"]] = now
+                save_state()
+                msg = (f"🚀 <b>НОВЫЙ СИГНАЛ</b> 🚀\n\n" f"<b>Инструмент:</b> <code>{best_setup['pair']}</code>\n<b>Направление:</b> {best_setup['side']}\n\n" f"⭐ <b>Оценка LLM: {score}/10</b>\n💵 <b>Рекомендуемый размер: ${position_size_usd}</b> (плечо 100x)\n\n" f"<i>Обоснование: {best_setup.get('reason', 'N/A')}</i>\n\n" f"<b>Вход:</b> <code>{fmt(entry)}</code>\n<b>Stop Loss:</b> <code>{fmt(sl)}</code>\n<b>Take Profit:</b> <code>{fmt(tp)}</code>")
+                await broadcast(app, msg)
+            
+            # Закрываем соединения в конце цикла
+            log.info("Closing exchange connections to ensure a fresh start for the next cycle.")
+            await exchange_swap.close()
+            await exchange_spot.close()
+            await asyncio.sleep(900)
         except Exception as e:
-            log.error("Scanner critical: %s", e, exc_info=True); await asyncio.sleep(300)
+            log.error("Scanner critical: %s", e, exc_info=True)
+            await exchange_swap.close()
+            await exchange_spot.close()
+            await asyncio.sleep(300)
 
 async def monitor(app):
     while state["bot_on"]:
         if not state["monitored_signals"]: await asyncio.sleep(30); continue
         for s in list(state["monitored_signals"]):
             try:
-                price = (await exchange.fetch_ticker(s["pair"]))["last"]
+                # Для мониторинга используем SWAP, т.к. там наша сделка
+                price = (await exchange_swap.fetch_ticker(s["pair"]))["last"]
                 if not price: continue
                 if s["side"]=="LONG":
                     if price>s["mfe_price"]: s["mfe_price"]=price
@@ -284,7 +347,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(cid)
     if not state["bot_on"]:
         state["bot_on"]=True; save_state()
-        await update.message.reply_text("✅ <b>Бот v5.4 (MEXC Symbol Fix) запущен.</b>"); 
+        await update.message.reply_text("✅ <b>Бот v5.5 (Hybrid MEXC) запущен.</b>"); 
         asyncio.create_task(scanner(ctx.application))
         asyncio.create_task(monitor(ctx.application))
         asyncio.create_task(daily_pnl_report(ctx.application))
@@ -311,5 +374,5 @@ if __name__=="__main__":
         asyncio.create_task(scanner(app))
         asyncio.create_task(monitor(app))
         asyncio.create_task(daily_pnl_report(app))
-    log.info("Bot v5.4 (MEXC Symbol Fix) started.")
+    log.info("Bot v5.5 (Hybrid MEXC) started.")
     app.run_polling()
