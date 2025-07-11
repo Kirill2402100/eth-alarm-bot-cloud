@@ -95,7 +95,7 @@ def save_state():
         json.dump(state, f, indent=2)
 
 # === Exchange & Strategy ==================================================
-exchange = ccxt.bybit({'options': {'defaultType': 'spot'}})
+exchange = ccxt.mexc({'options': {'defaultType': 'spot'}})
 
 TF_ENTRY  = os.getenv("TF_ENTRY", "15m")
 ATR_LEN, SL_ATR_MULT, MIN_CONFIDENCE_SCORE = 14, 1.5, 6
