@@ -14,8 +14,8 @@ import pandas as pd
 import pandas_ta as ta
 import aiohttp, gspread, ccxt.async_support as ccxt
 from oauth2client.service_account import ServiceAccountCredentials
-from telegram import Update, constants, Application
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, constants
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
 # === ENV / Logging =========================================================
 BOT_TOKEN               = os.getenv("BOT_TOKEN")
