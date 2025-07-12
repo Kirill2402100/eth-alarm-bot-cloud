@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.5.2 - OHLCV Monitoring Fix
+# v3.5.3 - Dual-Layer Monitoring
 # Changelog 12‑Jul‑2025 (Europe/Belgrade):
-# • Re-wrote the monitor function to use 1-minute OHLCV data (candles).
-# • This ensures SL/TP detection is robust and catches all wicks.
+# • Implemented a dual-layer monitor that checks both the live ticker
+#   and the last closed 1m candle to ensure no wicks are missed.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -358,6 +358,10 @@ async def monitor(app: Application):
         
         for s in list(state["monitored_signals"]):
             try:
+                ticker = await exchange_spot.fetch_ticker(s["pair"])
+                current_price = ticker.get('last')
+                if not current_price: continue
+                
                 ohlcv = await exchange_spot.fetch_ohlcv(s["pair"], '1m', limit=2)
                 if not ohlcv or len(ohlcv) < 2: continue
                 
@@ -365,20 +369,23 @@ async def monitor(app: Application):
                 candle_high = last_closed_candle[2]
                 candle_low = last_closed_candle[3]
 
+                high_price = max(current_price, candle_high)
+                low_price = min(current_price, candle_low)
+
                 if s["side"] == "LONG":
-                    if candle_high > s["mfe_price"]: s["mfe_price"] = candle_high
-                    if candle_low < s["mae_price"]: s["mae_price"] = candle_low
+                    if high_price > s["mfe_price"]: s["mfe_price"] = high_price
+                    if low_price < s["mae_price"]: s["mae_price"] = low_price
                 else:
-                    if candle_low < s["mfe_price"]: s["mfe_price"] = candle_low
-                    if candle_high > s["mae_price"]: s["mae_price"] = candle_high
+                    if low_price < s["mfe_price"]: s["mfe_price"] = low_price
+                    if high_price > s["mae_price"]: s["mae_price"] = high_price
 
                 hit, exit_price = None, None
                 if s["side"] == "LONG":
-                    if candle_low <= s["sl"]: hit, exit_price = "SL_HIT", s["sl"]
-                    elif candle_high >= s["tp"]: hit, exit_price = "TP_HIT", s["tp"]
+                    if low_price <= s["sl"] or current_price <= s["sl"]: hit, exit_price = "SL_HIT", s["sl"]
+                    elif high_price >= s["tp"] or current_price >= s["tp"]: hit, exit_price = "TP_HIT", s["tp"]
                 elif s["side"] == "SHORT":
-                    if candle_high >= s["sl"]: hit, exit_price = "SL_HIT", s["sl"]
-                    elif candle_low <= s["tp"]: hit, exit_price = "TP_HIT", s["tp"]
+                    if high_price >= s["sl"] or current_price >= s["sl"]: hit, exit_price = "SL_HIT", s["sl"]
+                    elif low_price <= s["tp"] or current_price <= s["tp"]: hit, exit_price = "TP_HIT", s["tp"]
 
                 if hit:
                     risk = abs(s["entry_price"] - s["sl"])
@@ -459,7 +466,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not state.get("bot_on"):
         state["bot_on"] = True
         save_state()
-        await update.message.reply_text("✅ <b>Бот v3.5.1 (Advanced Filters) запущен.</b>")
+        await update.message.reply_text("✅ <b>Бот v3.5.3 (Dual Monitor) запущен.</b>")
         if not hasattr(ctx.application, '_scanner_task') or ctx.application._scanner_task.done():
              log.info("Starting scanner task from /start command...")
              ctx.application._scanner_task = asyncio.create_task(scanner(ctx.application))
@@ -503,5 +510,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     
-    log.info("Bot v3.5.1 (Advanced Filters) started polling.")
+    log.info("Bot v3.5.3 (Dual Monitor) started polling.")
     app.run_polling()
