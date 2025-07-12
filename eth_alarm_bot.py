@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.4.5 - Robust Market Sync Fix
-# Changelog 11‑Jul‑2025 (Europe/Belgrade):
-# • Moved market loading inside the main loop with forced reload
-#   to prevent stale cache issues and ensure accurate spot/futures sync.
+# v3.5.1 - Advanced Filtering Implementation
+# Changelog 12‑Jul‑2025 (Europe/Belgrade):
+# • Implemented robust 'fetch_ticker' check for futures market existence.
+# • Re-implemented and improved the multi-EMA H1 trend filter from v2.2.
+# • Implemented Bollinger Band filter to avoid overextended entries.
+# • Fixed saving of H1 trend status to the trade log.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -24,13 +26,14 @@ COIN_LIST_SIZE          = int(os.getenv("COIN_LIST_SIZE", "300"))
 MAX_CONCURRENT_SIGNALS  = int(os.getenv("MAX_CONCURRENT_SIGNALS", "10"))
 ANOMALOUS_CANDLE_MULT   = 3.0
 COOLDOWN_HOURS          = 4
-# --- Параметры для динамического RR ---
+# --- Стратегические параметры ---
 TREND_ADX_THRESHOLD     = 25
 TREND_RR_RATIO          = 1.5
 FLAT_RR_RATIO           = 1.0
-
-# --- Черный список стейблкоинов ---
-STABLECOIN_BLACKLIST = {'FDUSD', 'USDC', 'DAI', 'USDE', 'TUSD', 'BUSD', 'USDP', 'GUSD', 'USD1'}
+H1_ADX_THRESHOLD        = 20  # Порог ADX для H1 фильтра
+BBP_LONG_MAX            = 0.8 # Макс. позиция в BB для лонга
+BBP_SHORT_MIN           = 0.2 # Мин. позиция в BB для шорта
+STABLECOIN_BLACKLIST    = {'FDUSD', 'USDC', 'DAI', 'USDE', 'TUSD', 'BUSD', 'USDP', 'GUSD', 'USD1', 'FUSD', 'XUSD'}
 
 LLM_API_KEY  = os.getenv("LLM_API_KEY")
 LLM_API_URL  = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
@@ -85,7 +88,7 @@ def load_state():
             with open(STATE_FILE, 'r') as f:
                 state = json.load(f)
         except json.JSONDecodeError:
-            state = {} # Start with a fresh state if file is corrupted
+            state = {}
     state.setdefault("bot_on", False)
     state.setdefault("monitored_signals", [])
     state.setdefault("cooldown", {})
@@ -117,7 +120,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # === LLM prompt ===========================================================
 PROMPT = """Ты — главный трейдер-аналитик в инвестиционном фонде.
 
-**КОНТЕКСТ:** Моя система уже провела первичный отбор. Все кандидаты ниже имеют подтвержденный тренд на старшем таймфрейме и являются лучшими по силе тренда (ADX) из доступных на рынке. Твоя задача — провести финальный, самый важный анализ.
+**КОНТЕКСТ:** Моя система уже провела первичный отбор. Все кандидаты ниже имеют подтвержденный тренд на старшем таймфрейме и являются лучшими по силе тренда (ADX) из доступных на рынке. Твоя задача — провести финальный, самый важный анализ для определения качества точки входа.
 
 **ЗАДАЧА:** Проанализируй КАЖДОГО кандидата. Для каждого верни JSON-объект с двумя полями:
 1.  `confidence_score`: Твоя уверенность в сделке от 1 до 10. Учитывай комбинацию RSI, ADX и положение цены относительно Полос Боллинджера.
@@ -178,13 +181,6 @@ async def get_market_snapshot():
 async def scanner(app):
     while state.get("bot_on", False):
         try:
-            # Загрузка рынков перенесена внутрь цикла с принудительным обновлением
-            log.info("Force-reloading markets for spot/futures sync...")
-            await exchange_spot.load_markets(True)
-            await exchange_futures.load_markets(True)
-            futures_symbols = set(exchange_futures.markets.keys())
-            log.info(f"Loaded {len(futures_symbols)} futures symbols for validation.")
-
             scan_start_time = datetime.now(timezone.utc)
             if len(state["monitored_signals"]) >= MAX_CONCURRENT_SIGNALS:
                 await asyncio.sleep(300); continue
@@ -201,15 +197,13 @@ async def scanner(app):
             state["cooldown"] = {p:t for p,t in state["cooldown"].items() if now-t < COOLDOWN_HOURS*3600}
             
             spot_tickers = await exchange_spot.fetch_tickers()
-            valid_spot_tickers = {s: t for s, t in spot_tickers.items() if s in futures_symbols}
             pairs = sorted(
-                ((s,t) for s,t in valid_spot_tickers.items() if s.endswith('/USDT') and t.get('quoteVolume')), 
+                ((s,t) for s,t in spot_tickers.items() if s.endswith('/USDT') and t.get('quoteVolume')), 
                 key=lambda x:x[1]['quoteVolume'], 
                 reverse=True
             )[:COIN_LIST_SIZE]
             
-            log.info(f"Found {len(pairs)} USDT pairs present on both Spot and Futures markets.")
-            rejection_stats = { "ERRORS": 0, "INSUFFICIENT_DATA": 0, "NO_CROSS": 0, "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0, "BLACKLISTED": 0 }
+            rejection_stats = { "ERRORS": 0, "INSUFFICIENT_DATA": 0, "NO_CROSS": 0, "NOT_ON_FUTURES": 0, "OVEREXTENDED_ENTRY": 0, "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0, "BLACKLISTED": 0 }
             pre_candidates = []
 
             for i, (sym, _) in enumerate(pairs):
@@ -235,6 +229,16 @@ async def scanner(app):
                     elif prev15["EMA_9"] >= prev15["EMA_21"] and last15["EMA_9"] < last15["EMA_21"]: side = "SHORT"
                     
                     if not side: rejection_stats["NO_CROSS"] += 1; continue
+                    
+                    bbp_value = last15["BBP_20_2.0"]
+                    if (side == "LONG" and bbp_value > BBP_LONG_MAX) or (side == "SHORT" and bbp_value < BBP_SHORT_MIN):
+                        rejection_stats["OVEREXTENDED_ENTRY"] += 1; continue
+                        
+                    try:
+                        await exchange_futures.fetch_ticker(sym)
+                    except ccxt.BadSymbol:
+                        rejection_stats["NOT_ON_FUTURES"] += 1; continue
+                        
                     if market_regime == "BEARISH" and side == "LONG": rejection_stats["MARKET_REGIME"] += 1; continue
                     if (last15["high"]-last15["low"]) > last15[f"ATR_{ATR_LEN}"] * ANOMALOUS_CANDLE_MULT: rejection_stats["ANOMALOUS_CANDLE"] += 1; continue
                     
@@ -247,28 +251,38 @@ async def scanner(app):
                     if df1h.empty: rejection_stats["INSUFFICIENT_DATA"] += 1; continue
 
                     last1h = df1h.iloc[-1]
-                    if (side == "LONG" and last1h['close'] < last1h['EMA_50']) or (side == "SHORT" and last1h['close'] > last1h['EMA_50']):
+                    h1_trend_status = "Neutral"
+                    is_h1_uptrend = last1h["ADX_14"] > H1_ADX_THRESHOLD and last1h["DMP_14"] > last1h["DMN_14"]
+                    is_h1_downtrend = last1h["ADX_14"] > H1_ADX_THRESHOLD and last1h["DMP_14"] < last1h["DMN_14"]
+                    
+                    if is_h1_uptrend: h1_trend_status = "Uptrend"
+                    if is_h1_downtrend: h1_trend_status = "Downtrend"
+
+                    if (side == "LONG" and not is_h1_uptrend) or (side == "SHORT" and not is_h1_downtrend):
                         rejection_stats["H1_TAILWIND"] += 1; continue
                         
                     pre_candidates.append({
                         "pair": sym, "side": side, "adx": last15["ADX_14"], "rsi": last15["RSI_14"],
-                        "bb_pos": last15["BBP_20_2.0"], "atr": last15[f"ATR_{ATR_LEN}"], "entry_price": last15["close"]
+                        "bb_pos": bbp_value, "atr": last15[f"ATR_{ATR_LEN}"], "entry_price": last15["close"],
+                        "h1_trend_at_entry": h1_trend_status
                     })
                 except Exception as e:
                     rejection_stats["ERRORS"] += 1; log.warning(f"Scan ERROR on {sym}: {e}")
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.1)
 
             if not pre_candidates:
                 duration = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
                 report_msg = (f"✅ <b>Поиск завершен за {duration:.0f} сек.</b> Кандидатов нет.\n\n"
                               f"📊 <b>Диагностика фильтров (из {len(pairs)} монет):</b>\n"
                               f"<code>- {rejection_stats['BLACKLISTED']:<4}</code> отсеяно по черному списку\n"
-                              f"<code>- {rejection_stats['ERRORS']:<4}</code> отсеяно из-за ошибок\n"
-                              f"<code>- {rejection_stats['INSUFFICIENT_DATA']:<4}</code> отсеяно по недостатку данных\n"
-                              f"<code>- {rejection_stats['H1_TAILWIND']:<4}</code> отсеяно по H1 фильтру\n"
+                              f"<code>- {rejection_stats['NOT_ON_FUTURES']:<4}</code> отсеяно (нет на фьючерсах)\n"
                               f"<code>- {rejection_stats['NO_CROSS']:<4}</code> не найдено пересечения EMA\n"
+                              f"<code>- {rejection_stats['OVEREXTENDED_ENTRY']:<4}</code> отсеяно по положению в BB\n"
+                              f"<code>- {rejection_stats['H1_TAILWIND']:<4}</code> отсеяно по H1 тренду\n"
                               f"<code>- {rejection_stats['ANOMALOUS_CANDLE']:<4}</code> отсеяно по аномальной свече\n"
-                              f"<code>- {rejection_stats['MARKET_REGIME']:<4}</code> отсеяно из-за режима рынка")
+                              f"<code>- {rejection_stats['MARKET_REGIME']:<4}</code> отсеяно из-за режима рынка\n"
+                              f"<code>- {rejection_stats['ERRORS']:<4}</code> отсеяно из-за ошибок\n"
+                              f"<code>- {rejection_stats['INSUFFICIENT_DATA']:<4}</code> отсеяно по недостатку данных")
                 await broadcast(app, report_msg)
             
             else:
@@ -311,7 +325,8 @@ async def scanner(app):
                             "mfe_price": entry_price, "mae_price": entry_price,
                             "reason": best_candidate.get('reason', 'N/A'), "confidence_score": score, 
                             "position_size_usd": pos_size, "leverage": 100, 
-                            "adx": best_candidate['adx'], "rsi": best_candidate['rsi'], "bb_pos": best_candidate['bb_pos']
+                            "adx": best_candidate['adx'], "rsi": best_candidate['rsi'], 
+                            "bb_pos": best_candidate['bb_pos'], "h1_trend_at_entry": best_candidate.get("h1_trend_at_entry")
                         }
                         state['monitored_signals'].append(signal)
                         state['cooldown'][signal['pair']] = datetime.now(timezone.utc).timestamp()
@@ -377,7 +392,7 @@ async def monitor(app: Application):
                         row = [
                             s["signal_id"], s["pair"], s["side"], hit, s["entry_time_utc"], datetime.now(timezone.utc).isoformat(),
                             s["entry_price"], exit_price, s["sl"], s["tp"], s["mfe_price"], s["mae_price"], mfe_r, mae_r,
-                            s.get("rsi"), s.get("adx"), "N/A", s.get("bb_pos"), s.get("reason"),
+                            s.get("rsi"), s.get("adx"), s.get("h1_trend_at_entry", "N/A"), s.get("bb_pos"), s.get("reason"),
                             s.get("confidence_score"), s.get("position_size_usd"), s.get("leverage"), pnl_usd, pnl_percent
                         ]
                         await asyncio.to_thread(TRADE_LOG_WS.append_row, row, value_input_option='USER_ENTERED')
@@ -437,7 +452,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not state.get("bot_on"):
         state["bot_on"] = True
         save_state()
-        await update.message.reply_text("✅ <b>Бот v3.4.5 (Robust Sync) запущен.</b>")
+        await update.message.reply_text("✅ <b>Бот v3.5.1 (Advanced Filters) запущен.</b>")
         if not hasattr(ctx.application, '_scanner_task') or ctx.application._scanner_task.done():
              log.info("Starting scanner task from /start command...")
              ctx.application._scanner_task = asyncio.create_task(scanner(ctx.application))
@@ -462,13 +477,6 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app: Application):
     log.info("Bot application initialized. Checking prior state...")
-    # Загрузка рынков один раз при старте приложения для начальной готовности
-    try:
-        await exchange_spot.load_markets()
-        await exchange_futures.load_markets()
-    except Exception as e:
-        log.error(f"Initial market load failed: {e}")
-
     if state.get("bot_on"):
         log.info("Bot was ON before restart. Auto-starting tasks...")
         app._scanner_task = asyncio.create_task(scanner(app))
@@ -488,5 +496,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     
-    log.info("Bot v3.4.5 (Robust Sync) started polling.")
+    log.info("Bot v3.5.1 (Advanced Filters) started polling.")
     app.run_polling()
