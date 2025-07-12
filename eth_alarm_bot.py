@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.5.1 - Advanced Filtering Implementation
+# v3.5.2 - OHLCV Monitoring Fix
 # Changelog 12‑Jul‑2025 (Europe/Belgrade):
-# • Implemented robust 'fetch_ticker' check for futures market existence.
-# • Re-implemented and improved the multi-EMA H1 trend filter from v2.2.
-# • Implemented Bollinger Band filter to avoid overextended entries.
-# • Fixed saving of H1 trend status to the trade log.
+# • Re-wrote the monitor function to use 1-minute OHLCV data (candles).
+# • This ensures SL/TP detection is robust and catches all wicks.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -30,9 +28,9 @@ COOLDOWN_HOURS          = 4
 TREND_ADX_THRESHOLD     = 25
 TREND_RR_RATIO          = 1.5
 FLAT_RR_RATIO           = 1.0
-H1_ADX_THRESHOLD        = 20  # Порог ADX для H1 фильтра
-BBP_LONG_MAX            = 0.8 # Макс. позиция в BB для лонга
-BBP_SHORT_MIN           = 0.2 # Мин. позиция в BB для шорта
+H1_ADX_THRESHOLD        = 20
+BBP_LONG_MAX            = 0.8
+BBP_SHORT_MIN           = 0.2
 STABLECOIN_BLACKLIST    = {'FDUSD', 'USDC', 'DAI', 'USDE', 'TUSD', 'BUSD', 'USDP', 'GUSD', 'USD1', 'FUSD', 'XUSD'}
 
 LLM_API_KEY  = os.getenv("LLM_API_KEY")
@@ -181,6 +179,9 @@ async def get_market_snapshot():
 async def scanner(app):
     while state.get("bot_on", False):
         try:
+            log.info("Force-reloading markets for spot/futures sync...")
+            await exchange_spot.load_markets(True)
+            
             scan_start_time = datetime.now(timezone.utc)
             if len(state["monitored_signals"]) >= MAX_CONCURRENT_SIGNALS:
                 await asyncio.sleep(300); continue
@@ -231,7 +232,8 @@ async def scanner(app):
                     if not side: rejection_stats["NO_CROSS"] += 1; continue
                     
                     bbp_value = last15["BBP_20_2.0"]
-                    if (side == "LONG" and bbp_value > BBP_LONG_MAX) or (side == "SHORT" and bbp_value < BBP_SHORT_MIN):
+                    if (side == "LONG" and bbp_value > BBP_LONG_MAX) or \
+                       (side == "SHORT" and bbp_value < BBP_SHORT_MIN):
                         rejection_stats["OVEREXTENDED_ENTRY"] += 1; continue
                         
                     try:
@@ -284,7 +286,6 @@ async def scanner(app):
                               f"<code>- {rejection_stats['ERRORS']:<4}</code> отсеяно из-за ошибок\n"
                               f"<code>- {rejection_stats['INSUFFICIENT_DATA']:<4}</code> отсеяно по недостатку данных")
                 await broadcast(app, report_msg)
-            
             else:
                 sorted_pre = sorted(pre_candidates, key=lambda x: x['adx'], reverse=True)
                 top_candidates = sorted_pre[:10]
@@ -357,21 +358,27 @@ async def monitor(app: Application):
         
         for s in list(state["monitored_signals"]):
             try:
-                price = (await exchange_spot.fetch_ticker(s["pair"]))["last"]
-                if not price: continue
+                ohlcv = await exchange_spot.fetch_ohlcv(s["pair"], '1m', limit=2)
+                if not ohlcv or len(ohlcv) < 2: continue
+                
+                last_closed_candle = ohlcv[-2]
+                candle_high = last_closed_candle[2]
+                candle_low = last_closed_candle[3]
 
                 if s["side"] == "LONG":
-                    if price > s["mfe_price"]: s["mfe_price"] = price
-                    if price < s["mae_price"]: s["mae_price"] = price
-                else: # SHORT
-                    if price < s["mfe_price"]: s["mfe_price"] = price
-                    if price > s["mae_price"]: s["mae_price"] = price
+                    if candle_high > s["mfe_price"]: s["mfe_price"] = candle_high
+                    if candle_low < s["mae_price"]: s["mae_price"] = candle_low
+                else:
+                    if candle_low < s["mfe_price"]: s["mfe_price"] = candle_low
+                    if candle_high > s["mae_price"]: s["mae_price"] = candle_high
 
                 hit, exit_price = None, None
-                if (s["side"] == "LONG" and price >= s["tp"]): hit, exit_price = "TP_HIT", s["tp"]
-                elif (s["side"] == "SHORT" and price <= s["tp"]): hit, exit_price = "TP_HIT", s["tp"]
-                elif (s["side"] == "LONG" and price <= s["sl"]): hit, exit_price = "SL_HIT", s["sl"]
-                elif (s["side"] == "SHORT" and price >= s["sl"]): hit, exit_price = "SL_HIT", s["sl"]
+                if s["side"] == "LONG":
+                    if candle_low <= s["sl"]: hit, exit_price = "SL_HIT", s["sl"]
+                    elif candle_high >= s["tp"]: hit, exit_price = "TP_HIT", s["tp"]
+                elif s["side"] == "SHORT":
+                    if candle_high >= s["sl"]: hit, exit_price = "SL_HIT", s["sl"]
+                    elif candle_low <= s["tp"]: hit, exit_price = "TP_HIT", s["tp"]
 
                 if hit:
                     risk = abs(s["entry_price"] - s["sl"])
