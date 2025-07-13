@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.5.4 - Contextual H1 Entry
+# v3.5.5 - Critical Bugfixes: Market & API Logic
 # Changelog 13‑Jul‑2025 (Europe/Belgrade):
-# • Added a "Buy the Dip" filter for LONG trades to ensure entry is near
-#   the H1 EMA21, improving entry quality.
-# • Automated Google Sheet naming based on BOT_VERSION.
+# • CRITICAL: Monitor now correctly uses the FUTURES exchange for tracking SL/TP.
+# • CRITICAL: Futures-existence check is now more robust, validating API response.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -18,7 +17,7 @@ from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
 # === ENV / Logging =========================================================
-BOT_VERSION             = "3.5.4"
+BOT_VERSION             = "3.5.5"
 BOT_TOKEN               = os.getenv("BOT_TOKEN")
 CHAT_IDS                = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID                = os.getenv("SHEET_ID")
@@ -33,7 +32,7 @@ FLAT_RR_RATIO           = 1.0
 H1_ADX_THRESHOLD        = 20
 BBP_LONG_MAX            = 0.8
 BBP_SHORT_MIN           = 0.2
-H1_SUPPORT_PROXIMITY    = 0.02 # 2% - близость к H1 EMA21 для лонга
+H1_SUPPORT_PROXIMITY    = 0.02
 STABLECOIN_BLACKLIST    = {'FDUSD', 'USDC', 'DAI', 'USDE', 'TUSD', 'BUSD', 'USDP', 'GUSD', 'USD1', 'FUSD', 'XUSD'}
 
 LLM_API_KEY  = os.getenv("LLM_API_KEY")
@@ -55,7 +54,7 @@ def fmt(price: float | None) -> str:
 
 # === Google‑Sheets =========================================================
 TRADE_LOG_WS = None
-SHEET_NAME   = f"Autonomous_Trade_Log_v{BOT_VERSION}" # Автоматическое имя листа
+SHEET_NAME   = f"Autonomous_Trade_Log_v{BOT_VERSION}"
 HEADERS = ["Signal_ID","Pair","Side","Status", "Entry_Time_UTC","Exit_Time_UTC", "Entry_Price","Exit_Price","SL_Price","TP_Price", "MFE_Price","MAE_Price","MFE_R","MAE_R", "Entry_RSI","Entry_ADX","H1_Trend_at_Entry", "Entry_BB_Position","LLM_Reason", "Confidence_Score", "Position_Size_USD", "Leverage", "PNL_USD", "PNL_Percent"]
 
 def setup_sheets():
@@ -236,7 +235,9 @@ async def scanner(app):
                         rejection_stats["OVEREXTENDED_ENTRY"] += 1; continue
                         
                     try:
-                        await exchange_futures.fetch_ticker(sym)
+                        futures_ticker = await exchange_futures.fetch_ticker(sym)
+                        if not futures_ticker or not futures_ticker.get('last'):
+                           raise ccxt.BadSymbol(f"Futures ticker for {sym} is empty or invalid")
                     except ccxt.BadSymbol:
                         rejection_stats["NOT_ON_FUTURES"] += 1; continue
                         
@@ -363,11 +364,12 @@ async def monitor(app: Application):
         
         for s in list(state["monitored_signals"]):
             try:
-                ticker = await exchange_spot.fetch_ticker(s["pair"])
+                exchange_to_monitor = exchange_futures
+                ticker = await exchange_to_monitor.fetch_ticker(s["pair"])
                 current_price = ticker.get('last')
                 if not current_price: continue
                 
-                ohlcv = await exchange_spot.fetch_ohlcv(s["pair"], '1m', limit=2)
+                ohlcv = await exchange_to_monitor.fetch_ohlcv(s["pair"], '1m', limit=2)
                 if not ohlcv or len(ohlcv) < 2: continue
                 
                 last_closed_candle = ohlcv[-2]
@@ -471,7 +473,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not state.get("bot_on"):
         state["bot_on"] = True
         save_state()
-        await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} (Contextual Entry) запущен.</b>")
+        await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} (Critical Fixes) запущен.</b>")
         if not hasattr(ctx.application, '_scanner_task') or ctx.application._scanner_task.done():
              log.info("Starting scanner task from /start command...")
              ctx.application._scanner_task = asyncio.create_task(scanner(ctx.application))
@@ -515,5 +517,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     
-    log.info(f"Bot v{BOT_VERSION} (Contextual Entry) started polling.")
+    log.info(f"Bot v{BOT_VERSION} (Critical Fixes) started polling.")
     app.run_polling()
