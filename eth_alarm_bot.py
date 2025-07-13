@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.5.3 - Dual-Layer Monitoring
-# Changelog 12‑Jul‑2025 (Europe/Belgrade):
-# • Implemented a dual-layer monitor that checks both the live ticker
-#   and the last closed 1m candle to ensure no wicks are missed.
+# v3.5.4 - Contextual H1 Entry
+# Changelog 13‑Jul‑2025 (Europe/Belgrade):
+# • Added a "Buy the Dip" filter for LONG trades to ensure entry is near
+#   the H1 EMA21, improving entry quality.
+# • Automated Google Sheet naming based on BOT_VERSION.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -17,6 +18,7 @@ from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
 # === ENV / Logging =========================================================
+BOT_VERSION             = "3.5.4"
 BOT_TOKEN               = os.getenv("BOT_TOKEN")
 CHAT_IDS                = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID                = os.getenv("SHEET_ID")
@@ -31,6 +33,7 @@ FLAT_RR_RATIO           = 1.0
 H1_ADX_THRESHOLD        = 20
 BBP_LONG_MAX            = 0.8
 BBP_SHORT_MIN           = 0.2
+H1_SUPPORT_PROXIMITY    = 0.02 # 2% - близость к H1 EMA21 для лонга
 STABLECOIN_BLACKLIST    = {'FDUSD', 'USDC', 'DAI', 'USDE', 'TUSD', 'BUSD', 'USDP', 'GUSD', 'USD1', 'FUSD', 'XUSD'}
 
 LLM_API_KEY  = os.getenv("LLM_API_KEY")
@@ -52,7 +55,7 @@ def fmt(price: float | None) -> str:
 
 # === Google‑Sheets =========================================================
 TRADE_LOG_WS = None
-SHEET_NAME   = "Autonomous_Trade_Log_v5"
+SHEET_NAME   = f"Autonomous_Trade_Log_v{BOT_VERSION}" # Автоматическое имя листа
 HEADERS = ["Signal_ID","Pair","Side","Status", "Entry_Time_UTC","Exit_Time_UTC", "Entry_Price","Exit_Price","SL_Price","TP_Price", "MFE_Price","MAE_Price","MFE_R","MAE_R", "Entry_RSI","Entry_ADX","H1_Trend_at_Entry", "Entry_BB_Position","LLM_Reason", "Confidence_Score", "Position_Size_USD", "Leverage", "PNL_USD", "PNL_Percent"]
 
 def setup_sheets():
@@ -179,9 +182,7 @@ async def get_market_snapshot():
 async def scanner(app):
     while state.get("bot_on", False):
         try:
-            log.info("Force-reloading markets for spot/futures sync...")
             await exchange_spot.load_markets(True)
-            
             scan_start_time = datetime.now(timezone.utc)
             if len(state["monitored_signals"]) >= MAX_CONCURRENT_SIGNALS:
                 await asyncio.sleep(300); continue
@@ -204,14 +205,13 @@ async def scanner(app):
                 reverse=True
             )[:COIN_LIST_SIZE]
             
-            rejection_stats = { "ERRORS": 0, "INSUFFICIENT_DATA": 0, "NO_CROSS": 0, "NOT_ON_FUTURES": 0, "OVEREXTENDED_ENTRY": 0, "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0, "BLACKLISTED": 0 }
+            rejection_stats = { "ERRORS": 0, "INSUFFICIENT_DATA": 0, "NO_CROSS": 0, "NOT_ON_FUTURES": 0, "OVEREXTENDED_ENTRY": 0, "H1_SUPPORT": 0, "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0, "BLACKLISTED": 0 }
             pre_candidates = []
 
             for i, (sym, _) in enumerate(pairs):
                 base_currency = sym.split('/')[0]
                 if base_currency in STABLECOIN_BLACKLIST:
-                    rejection_stats["BLACKLISTED"] += 1
-                    continue
+                    rejection_stats["BLACKLISTED"] += 1; continue
 
                 if sym in state["cooldown"]: continue
                 try:
@@ -232,8 +232,7 @@ async def scanner(app):
                     if not side: rejection_stats["NO_CROSS"] += 1; continue
                     
                     bbp_value = last15["BBP_20_2.0"]
-                    if (side == "LONG" and bbp_value > BBP_LONG_MAX) or \
-                       (side == "SHORT" and bbp_value < BBP_SHORT_MIN):
+                    if (side == "LONG" and bbp_value > BBP_LONG_MAX) or (side == "SHORT" and bbp_value < BBP_SHORT_MIN):
                         rejection_stats["OVEREXTENDED_ENTRY"] += 1; continue
                         
                     try:
@@ -262,6 +261,11 @@ async def scanner(app):
 
                     if (side == "LONG" and not is_h1_uptrend) or (side == "SHORT" and not is_h1_downtrend):
                         rejection_stats["H1_TAILWIND"] += 1; continue
+                    
+                    if side == "LONG":
+                        h1_ema21 = last1h["EMA_21"]
+                        if not (h1_ema21 * (1 - H1_SUPPORT_PROXIMITY) <= last15["close"] <= h1_ema21 * (1 + H1_SUPPORT_PROXIMITY)):
+                            rejection_stats["H1_SUPPORT"] += 1; continue
                         
                     pre_candidates.append({
                         "pair": sym, "side": side, "adx": last15["ADX_14"], "rsi": last15["RSI_14"],
@@ -280,6 +284,7 @@ async def scanner(app):
                               f"<code>- {rejection_stats['NOT_ON_FUTURES']:<4}</code> отсеяно (нет на фьючерсах)\n"
                               f"<code>- {rejection_stats['NO_CROSS']:<4}</code> не найдено пересечения EMA\n"
                               f"<code>- {rejection_stats['OVEREXTENDED_ENTRY']:<4}</code> отсеяно по положению в BB\n"
+                              f"<code>- {rejection_stats['H1_SUPPORT']:<4}</code> отсеяно по H1 поддержке (лонг)\n"
                               f"<code>- {rejection_stats['H1_TAILWIND']:<4}</code> отсеяно по H1 тренду\n"
                               f"<code>- {rejection_stats['ANOMALOUS_CANDLE']:<4}</code> отсеяно по аномальной свече\n"
                               f"<code>- {rejection_stats['MARKET_REGIME']:<4}</code> отсеяно из-за режима рынка\n"
@@ -466,7 +471,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not state.get("bot_on"):
         state["bot_on"] = True
         save_state()
-        await update.message.reply_text("✅ <b>Бот v3.5.3 (Dual Monitor) запущен.</b>")
+        await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} (Contextual Entry) запущен.</b>")
         if not hasattr(ctx.application, '_scanner_task') or ctx.application._scanner_task.done():
              log.info("Starting scanner task from /start command...")
              ctx.application._scanner_task = asyncio.create_task(scanner(ctx.application))
@@ -510,5 +515,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     
-    log.info("Bot v3.5.3 (Dual Monitor) started polling.")
+    log.info(f"Bot v{BOT_VERSION} (Contextual Entry) started polling.")
     app.run_polling()
