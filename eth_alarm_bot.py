@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.5.5 - Critical Bugfixes: Market & API Logic
-# Changelog 13‑Jul‑2025 (Europe/Belgrade):
-# • CRITICAL: Monitor now correctly uses the FUTURES exchange for tracking SL/TP.
-# • CRITICAL: Futures-existence check is now more robust, validating API response.
+# v3.6.0 - Leading Entry Trigger & Final Fixes
+# Changelog 14‑Jul‑2025 (Europe/Belgrade):
+# • Replaced entry trigger from EMA cross to Bollinger Band midline cross.
+# • Implemented robust daily report scheduler.
+# • Re-implemented robust futures market sync via forced market list reload.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -17,7 +18,7 @@ from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
 # === ENV / Logging =========================================================
-BOT_VERSION             = "3.5.5"
+BOT_VERSION             = "3.6.0"
 BOT_TOKEN               = os.getenv("BOT_TOKEN")
 CHAT_IDS                = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID                = os.getenv("SHEET_ID")
@@ -33,7 +34,7 @@ H1_ADX_THRESHOLD        = 20
 BBP_LONG_MAX            = 0.8
 BBP_SHORT_MIN           = 0.2
 H1_SUPPORT_PROXIMITY    = 0.02
-STABLECOIN_BLACKLIST    = {'FDUSD', 'USDC', 'DAI', 'USDE', 'TUSD', 'BUSD', 'USDP', 'GUSD', 'USD1', 'FUSD', 'XUSD'}
+STABLECOIN_BLACKLIST    = {'FDUSD', 'USDC', 'DAI', 'USDE', 'TUSD', 'BUSD', 'USDP', 'GUSD', 'USD1', 'FUSD', 'XUSD', 'H1'}
 
 LLM_API_KEY  = os.getenv("LLM_API_KEY")
 LLM_API_URL  = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
@@ -182,6 +183,9 @@ async def scanner(app):
     while state.get("bot_on", False):
         try:
             await exchange_spot.load_markets(True)
+            await exchange_futures.load_markets(True)
+            futures_symbols = set(exchange_futures.markets.keys())
+
             scan_start_time = datetime.now(timezone.utc)
             if len(state["monitored_signals"]) >= MAX_CONCURRENT_SIGNALS:
                 await asyncio.sleep(300); continue
@@ -198,13 +202,14 @@ async def scanner(app):
             state["cooldown"] = {p:t for p,t in state["cooldown"].items() if now-t < COOLDOWN_HOURS*3600}
             
             spot_tickers = await exchange_spot.fetch_tickers()
+            valid_spot_tickers = {s: t for s, t in spot_tickers.items() if s in futures_symbols}
             pairs = sorted(
-                ((s,t) for s,t in spot_tickers.items() if s.endswith('/USDT') and t.get('quoteVolume')), 
+                ((s,t) for s,t in valid_spot_tickers.items() if s.endswith('/USDT') and t.get('quoteVolume')), 
                 key=lambda x:x[1]['quoteVolume'], 
                 reverse=True
             )[:COIN_LIST_SIZE]
             
-            rejection_stats = { "ERRORS": 0, "INSUFFICIENT_DATA": 0, "NO_CROSS": 0, "NOT_ON_FUTURES": 0, "OVEREXTENDED_ENTRY": 0, "H1_SUPPORT": 0, "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0, "BLACKLISTED": 0 }
+            rejection_stats = { "ERRORS": 0, "INSUFFICIENT_DATA": 0, "NO_CROSS": 0, "OVEREXTENDED_ENTRY": 0, "H1_SUPPORT": 0, "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0, "BLACKLISTED": 0 }
             pre_candidates = []
 
             for i, (sym, _) in enumerate(pairs):
@@ -225,21 +230,18 @@ async def scanner(app):
                     last15, prev15 = df15.iloc[-1], df15.iloc[-2]
                     
                     side = None
-                    if prev15["EMA_9"] <= prev15["EMA_21"] and last15["EMA_9"] > last15["EMA_21"]: side = "LONG"
-                    elif prev15["EMA_9"] >= prev15["EMA_21"] and last15["EMA_9"] < last15["EMA_21"]: side = "SHORT"
+                    if prev15["close"] <= prev15["BBM_20_2.0"] and last15["close"] > last15["BBM_20_2.0"]:
+                        side = "LONG"
+                    elif prev15["close"] >= prev15["BBM_20_2.0"] and last15["close"] < last15["BBM_20_2.0"]:
+                        side = "SHORT"
                     
-                    if not side: rejection_stats["NO_CROSS"] += 1; continue
+                    if not side:
+                        rejection_stats["NO_CROSS"] += 1; continue
                     
                     bbp_value = last15["BBP_20_2.0"]
-                    if (side == "LONG" and bbp_value > BBP_LONG_MAX) or (side == "SHORT" and bbp_value < BBP_SHORT_MIN):
+                    if (side == "LONG" and bbp_value > BBP_LONG_MAX) or \
+                       (side == "SHORT" and bbp_value < BBP_SHORT_MIN):
                         rejection_stats["OVEREXTENDED_ENTRY"] += 1; continue
-                        
-                    try:
-                        futures_ticker = await exchange_futures.fetch_ticker(sym)
-                        if not futures_ticker or not futures_ticker.get('last'):
-                           raise ccxt.BadSymbol(f"Futures ticker for {sym} is empty or invalid")
-                    except ccxt.BadSymbol:
-                        rejection_stats["NOT_ON_FUTURES"] += 1; continue
                         
                     if market_regime == "BEARISH" and side == "LONG": rejection_stats["MARKET_REGIME"] += 1; continue
                     if (last15["high"]-last15["low"]) > last15[f"ATR_{ATR_LEN}"] * ANOMALOUS_CANDLE_MULT: rejection_stats["ANOMALOUS_CANDLE"] += 1; continue
@@ -282,8 +284,7 @@ async def scanner(app):
                 report_msg = (f"✅ <b>Поиск завершен за {duration:.0f} сек.</b> Кандидатов нет.\n\n"
                               f"📊 <b>Диагностика фильтров (из {len(pairs)} монет):</b>\n"
                               f"<code>- {rejection_stats['BLACKLISTED']:<4}</code> отсеяно по черному списку\n"
-                              f"<code>- {rejection_stats['NOT_ON_FUTURES']:<4}</code> отсеяно (нет на фьючерсах)\n"
-                              f"<code>- {rejection_stats['NO_CROSS']:<4}</code> не найдено пересечения EMA\n"
+                              f"<code>- {rejection_stats['NO_CROSS']:<4}</code> нет пересечения средней BB\n"
                               f"<code>- {rejection_stats['OVEREXTENDED_ENTRY']:<4}</code> отсеяно по положению в BB\n"
                               f"<code>- {rejection_stats['H1_SUPPORT']:<4}</code> отсеяно по H1 поддержке (лонг)\n"
                               f"<code>- {rejection_stats['H1_TAILWIND']:<4}</code> отсеяно по H1 тренду\n"
@@ -432,9 +433,13 @@ async def monitor(app: Application):
 
 async def daily_pnl_report(app: Application):
     while True:
-        await asyncio.sleep(3600) 
         now = datetime.now(timezone.utc)
-        if now.hour != 0 or now.minute > 5: continue
+        tomorrow = now + timedelta(days=1)
+        next_run = tomorrow.replace(hour=0, minute=5, second=0, microsecond=0)
+        sleep_seconds = (next_run - now).total_seconds()
+        
+        log.info(f"Daily report scheduler: sleeping for {sleep_seconds:.0f} seconds until next run.")
+        await asyncio.sleep(sleep_seconds)
 
         if not TRADE_LOG_WS: continue
         log.info("Running daily P&L report...")
@@ -473,7 +478,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not state.get("bot_on"):
         state["bot_on"] = True
         save_state()
-        await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} (Critical Fixes) запущен.</b>")
+        await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} (Leading Entry) запущен.</b>")
         if not hasattr(ctx.application, '_scanner_task') or ctx.application._scanner_task.done():
              log.info("Starting scanner task from /start command...")
              ctx.application._scanner_task = asyncio.create_task(scanner(ctx.application))
@@ -517,5 +522,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     
-    log.info(f"Bot v{BOT_VERSION} (Critical Fixes) started polling.")
+    log.info(f"Bot v{BOT_VERSION} (Leading Entry) started polling.")
     app.run_polling()
