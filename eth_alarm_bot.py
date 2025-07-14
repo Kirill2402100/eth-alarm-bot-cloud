@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v4.4.0 - Trade Monitor & Simulation
+# v4.5.0 - P&L Simulation and Portfolio Logic
 # Changelog 15-Jul-2025 (Europe/Belgrade):
-# • Added trade_monitor.py to track active simulated trades.
-# • Integrated portfolio management into the state.
-# • Trade Executor now updates closed trades in Google Sheets.
+# • Added P&L calculation for simulated trades ($50 size, 100x lev).
+# • Scanner now prevents opening trades on pairs already in the portfolio.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -24,7 +23,7 @@ from scanner_engine import scanner_main_loop
 from trade_monitor import monitor_main_loop, init_monitor
 
 # === ENV / Logging =========================================================
-BOT_VERSION               = "4.4.0"
+BOT_VERSION               = "4.5.0"
 BOT_TOKEN                 = os.getenv("BOT_TOKEN")
 CHAT_IDS                  = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID                  = os.getenv("SHEET_ID")
@@ -39,21 +38,13 @@ log = logging.getLogger("bot")
 for n in ("httpx", "httpcore", "gspread"):
     logging.getLogger(n).setLevel(logging.WARNING)
 
-# === Helper ================================================================
-def fmt(price: float | None) -> str:
-    if price is None:       return "N/A"
-    if price > 10:          return f"{price:,.2f}"
-    elif price > 0.1:       return f"{price:.4f}"
-    elif price > 0.001:     return f"{price:.6f}"
-    else:                   return f"{price:.8f}"
-
 # === Google‑Sheets =========================================================
 TRADE_LOG_WS = None
-SHEET_NAME   = "Microstructure_Log_v1"
+SHEET_NAME   = "Microstructure_Log_v2" # Обновили имя для новой структуры
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Confidence_Score", "Algorithm_Type", 
     "Strategy_Idea", "LLM_Reason", "Entry_Price", "SL_Price", "TP_Price",
-    "Status", "Exit_Time_UTC", "Exit_Price"
+    "Status", "Exit_Time_UTC", "Exit_Price", "Entry_ATR", "PNL_USD", "PNL_Percent"
 ]
 
 def setup_sheets():
@@ -124,10 +115,9 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     if cid not in ctx.application.chat_ids:
         ctx.application.chat_ids.add(cid)
-    
     state["bot_on"] = True
     save_state()
-    await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} (Simulator) запущен.</b>\n"
+    await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} (P&L Simulator) запущен.</b>\n"
                                     "Используйте /feed для запуска всех модулей.")
 
 async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -139,12 +129,10 @@ async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if hasattr(ctx.application, '_scanner_task'): ctx.application._scanner_task.cancel()
     if hasattr(ctx.application, '_monitor_task'): ctx.application._monitor_task.cancel()
 
-
 async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     is_feed_running = hasattr(update.application, '_feed_task') and not update.application._feed_task.done()
     is_scanner_running = hasattr(update.application, '_scanner_task') and not update.application._scanner_task.done()
     is_monitor_running = hasattr(update.application, '_monitor_task') and not update.application._monitor_task.done()
-    
     msg = (f"<b>Состояние бота:</b> {'✅ ON' if state.get('bot_on') else '🛑 OFF'}\n"
            f"<b>Поток данных:</b> {'🛰️ ACTIVE' if is_feed_running else '🔌 OFF'}\n"
            f"<b>Сканер:</b> {'🧠 ACTIVE' if is_scanner_running else '🔌 OFF'}\n"
@@ -152,11 +140,9 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
            f"<b>Активных сделок:</b> {len(state.get('monitored_signals', []))}/{MAX_PORTFOLIO_SIZE}")
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
-
 async def cmd_feed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     app = ctx.application
     is_running = hasattr(app, '_feed_task') and not app._feed_task.done()
-
     if is_running:
         data_feeder.stop_data_feed()
         await update.message.reply_text("🛑 Команда на остановку всех задач...")
@@ -167,23 +153,18 @@ async def cmd_feed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Все фоновые задачи остановлены.")
     else:
         await update.message.reply_text("🛰️ Запускаю все модули: Поток данных, Сканер и Монитор...")
-        
         app._feed_task = asyncio.create_task(data_feeder.data_feed_main_loop(app, app.chat_ids))
-        app._scanner_task = asyncio.create_task(scanner_main_loop(app, ask_llm, broadcast, TRADE_LOG_WS))
+        app._scanner_task = asyncio.create_task(scanner_main_loop(app, ask_llm, broadcast, TRADE_LOG_WS, state))
         app._monitor_task = asyncio.create_task(monitor_main_loop(app))
-        
         await update.message.reply_text("✅ Все модули запущены.")
-
 
 async def post_init(app: Application):
     log.info("Bot application initialized.")
-
 
 if __name__ == "__main__":
     load_state()
     setup_sheets()
 
-    # --- Инициализация модулей ---
     trade_executor.set_state_object(state)
     trade_executor.save_state_func = save_state
     init_monitor(state, save_state, broadcast, TRADE_LOG_WS)
@@ -191,11 +172,10 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.chat_ids = set(CHAT_IDS)
     
-    # --- РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ ---
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("feed", cmd_feed))
     
-    log.info(f"Bot v{BOT_VERSION} (Simulator) started polling.")
+    log.info(f"Bot v{BOT_VERSION} (P&L Simulator) started polling.")
     app.run_polling()
