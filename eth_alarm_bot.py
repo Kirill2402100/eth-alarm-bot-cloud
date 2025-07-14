@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v4.2.0 - Final Microstructure Integration
-# Changelog 14‑Jul‑2025 (Europe/Belgrade):
-# • Decoupled scanner_engine by passing functions as arguments.
-# • Full integration of Phase 2 logic into the main application.
+# v4.3.0 - Trade Simulation Integration
+# Changelog 15‑Jul‑2025 (Europe/Belgrade):
+# • Integrated trade_executor to log simulated trades to Google Sheets.
+# • Updated HEADERS and SHEET_NAME for the new microstructure strategy.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -21,23 +21,10 @@ import data_feeder
 from scanner_engine import scanner_main_loop
 
 # === ENV / Logging =========================================================
-BOT_VERSION               = "4.2.0"
+BOT_VERSION               = "4.3.0"
 BOT_TOKEN                 = os.getenv("BOT_TOKEN")
 CHAT_IDS                  = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID                  = os.getenv("SHEET_ID")
-# Старые переменные для индикаторного сканера, пока оставляем
-COIN_LIST_SIZE            = int(os.getenv("COIN_LIST_SIZE", "300"))
-MAX_CONCURRENT_SIGNALS    = int(os.getenv("MAX_CONCURRENT_SIGNALS", "10"))
-ANOMALOUS_CANDLE_MULT   = 3.0
-COOLDOWN_HOURS            = 4
-TREND_ADX_THRESHOLD     = 25
-TREND_RR_RATIO          = 1.5
-FLAT_RR_RATIO           = 1.0
-H1_ADX_THRESHOLD        = 20
-BBP_LONG_MAX            = 0.8
-BBP_SHORT_MIN           = 0.2
-H1_SUPPORT_PROXIMITY    = 0.02
-STABLECOIN_BLACKLIST    = {'FDUSD', 'USDC', 'DAI', 'USDE', 'TUSD', 'BUSD', 'USDP', 'GUSD', 'USD1', 'FUSD', 'XUSD', 'H1', 'EURI', 'OFT', 'WBT'}
 
 LLM_API_KEY  = os.getenv("LLM_API_KEY")
 LLM_API_URL  = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
@@ -58,8 +45,12 @@ def fmt(price: float | None) -> str:
 
 # === Google‑Sheets =========================================================
 TRADE_LOG_WS = None
-SHEET_NAME   = f"Autonomous_Trade_Log_v{BOT_VERSION}"
-HEADERS = ["Signal_ID","Pair","Side","Status", "Entry_Time_UTC","Exit_Time_UTC", "Entry_Price","Exit_Price","SL_Price","TP_Price", "MFE_Price","MAE_Price","MFE_R","MAE_R", "Entry_RSI","Entry_ADX","H1_Trend_at_Entry", "Entry_BB_Position","LLM_Reason", "Confidence_Score", "Position_Size_USD", "Leverage", "PNL_USD", "PNL_Percent"]
+# НОВАЯ СТРУКТУРА ДЛЯ ЛОГИРОВАНИЯ СДЕЛОК
+SHEET_NAME   = "Microstructure_Log_v1"
+HEADERS = [
+    "Signal_ID", "Timestamp_UTC", "Pair", "Confidence_Score", "Algorithm_Type", 
+    "Strategy_Idea", "LLM_Reason", "Entry_Price", "SL_Price", "TP_Price"
+]
 
 def setup_sheets():
     global TRADE_LOG_WS
@@ -94,17 +85,13 @@ def load_state():
         except json.JSONDecodeError:
             state = {}
     state.setdefault("bot_on", False)
-    state.setdefault("monitored_signals", []) # Для старой логики
-    state.setdefault("cooldown", {})
-    log.info("State loaded (%d signals).", len(state["monitored_signals"]))
+    log.info("State loaded.")
 
 def save_state():
     with open(STATE_FILE,"w") as f:
         json.dump(state, f, indent=2)
 
 # === LLM & Broadcast Functions ============================================
-# Эти функции теперь будут передаваться в другие модули напрямую
-
 async def broadcast(app, txt:str):
     for cid in getattr(app,"chat_ids", CHAT_IDS):
         try:
@@ -123,10 +110,9 @@ async def ask_llm(prompt: str):
                 data = await r.json()
                 return data["choices"][0]["message"]["content"]
     except Exception as e:
-        # ДОБАВЛЕНО ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ ОШИБКИ
         log.error("LLM API request failed: %s", e, exc_info=True)
         return None
-        
+
 # === КОМАНДЫ TELEGRAM ===
 
 async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -141,10 +127,9 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     state["bot_on"] = False
-    data_feeder.stop_data_feed() # Также останавливаем фид при полной остановке
+    data_feeder.stop_data_feed()
     save_state()
     await update.message.reply_text("🛑 <b>Бот остановлен.</b> Все задачи остановлены.")
-    # Принудительно отменяем задачи, чтобы освободить ресурсы
     if hasattr(ctx.application, '_feed_task'): ctx.application._feed_task.cancel()
     if hasattr(ctx.application, '_scanner_task'): ctx.application._scanner_task.cancel()
 
@@ -176,19 +161,19 @@ async def cmd_feed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🛰️ Запускаю поток данных и сканер...")
         
         app._feed_task = asyncio.create_task(data_feeder.data_feed_main_loop(app, app.chat_ids))
-        # ИЗМЕНЕНИЕ ЗДЕСЬ: Передаем функции ask_llm и broadcast в сканер
-        app._scanner_task = asyncio.create_task(scanner_main_loop(app, ask_llm, broadcast))
+        # Передаем объект таблицы TRADE_LOG_WS напрямую в сканер
+        app._scanner_task = asyncio.create_task(scanner_main_loop(app, ask_llm, broadcast, TRADE_LOG_WS))
         
         await update.message.reply_text("✅ Поток данных и сканер запущены.")
 
+
 async def post_init(app: Application):
-    """Запускает фоновые задачи после инициализации бота."""
     log.info("Bot application initialized.")
 
 
 if __name__ == "__main__":
     load_state()
-    setup_sheets()
+    setup_sheets() # Инициализируем Google-таблицы при старте
     
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.chat_ids = set(CHAT_IDS)
