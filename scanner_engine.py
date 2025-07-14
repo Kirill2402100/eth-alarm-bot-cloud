@@ -1,13 +1,13 @@
-# File: scanner_engine.py (v5 - Aggregation & LLM Integration)
+# File: scanner_engine.py (v6 - Final Corrected Version)
 
 import asyncio
 import json
 from data_feeder import last_data
 
 # --- КОНФИГУРАЦИЯ СКАНЕРА ---
-LARGE_ORDER_USD = 50000 
+LARGE_ORDER_USD = 50000
 
-# --- НОВЫЙ ПРОМПТ ДЛЯ АНАЛИЗА МИКРОСТРУКТУРЫ ---
+# --- ПРОМПТ ДЛЯ АНАЛИЗА МИКРОСТРУКТУРЫ ---
 LLM_PROMPT_MICROSTRUCTURE = """
 Ты — ведущий аналитик-квант в HFT-фонде, специализирующийся на анализе микроструктуры рынка (Order Flow, Market Making).
 
@@ -38,14 +38,14 @@ LLM_PROMPT_MICROSTRUCTURE = """
 async def scanner_main_loop(app, ask_llm_func, broadcast_func):
     """
     Главный цикл сканера с агрегацией и интеграцией LLM.
-    Принимает функции ask_llm и broadcast для избежания циклического импорта.
+    Включает надежную обработку данных стакана.
     """
     print("Scanner Engine loop started.")
     last_llm_call_time = 0
 
     while True:
         try:
-            await asyncio.sleep(5) 
+            await asyncio.sleep(5)
 
             market_anomalies = {}
             current_data_snapshot = dict(last_data)
@@ -56,13 +56,18 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func):
 
                 market_anomalies[symbol] = {'bids': [], 'asks': []}
 
-                for price, amount in data.get('bids', []):
+                # --- НАДЕЖНАЯ ОБРАБОТКА СТАКАНА ---
+                for order in data.get('bids', []):
+                    if not (isinstance(order, (list, tuple)) and len(order) >= 2): continue
+                    price, amount = order[0], order[1]
                     if price is None or amount is None: continue
                     order_value_usd = price * amount
                     if order_value_usd > LARGE_ORDER_USD:
                         market_anomalies[symbol]['bids'].append({'price': price, 'value_usd': round(order_value_usd)})
 
-                for price, amount in data.get('asks', []):
+                for order in data.get('asks', []):
+                    if not (isinstance(order, (list, tuple)) and len(order) >= 2): continue
+                    price, amount = order[0], order[1]
                     if price is None or amount is None: continue
                     order_value_usd = price * amount
                     if order_value_usd > LARGE_ORDER_USD:
@@ -81,7 +86,6 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func):
                 
                 if llm_response_content:
                     try:
-                        # LLM может вернуть JSON в тройных кавычках, чистим это
                         cleaned_response = llm_response_content.strip().strip('```json').strip('```').strip()
                         decision = json.loads(cleaned_response)
 
