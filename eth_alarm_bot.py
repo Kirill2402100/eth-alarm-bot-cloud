@@ -114,7 +114,6 @@ async def broadcast(app, txt:str):
 
 async def ask_llm(prompt: str):
     if not LLM_API_KEY: return None
-    # Заголовки и тело запроса к LLM
     payload = { "model": LLM_MODEL_ID, "messages":[{"role":"user","content":prompt}], "temperature":0.4, "response_format":{"type":"json_object"} }
     hdrs = {"Authorization":f"Bearer {LLM_API_KEY}","Content-Type":"application/json"}
     try:
@@ -124,9 +123,10 @@ async def ask_llm(prompt: str):
                 data = await r.json()
                 return data["choices"][0]["message"]["content"]
     except Exception as e:
-        log.error("LLM error: %s", e)
+        # ДОБАВЛЕНО ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ ОШИБКИ
+        log.error("LLM API request failed: %s", e, exc_info=True)
         return None
-
+        
 # === КОМАНДЫ TELEGRAM ===
 
 async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
