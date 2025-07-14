@@ -1,4 +1,4 @@
-# File: data_feeder.py (v3 - Final)
+# File: data_feeder.py (v4 - With Order Book Depth)
 
 import asyncio
 import ccxt.pro as ccxtpro
@@ -30,20 +30,20 @@ async def single_trade_loop(exchange, symbol):
             await asyncio.sleep(10)
 
 async def single_orderbook_loop(exchange, symbol):
-    """Следит за стаканом для одного конкретного символа."""
+    """Следит за стаканом для одного конкретного символа с глубиной."""
     while is_running:
         try:
-            orderbook = await exchange.watch_order_book(symbol)
-            last_data[symbol]['best_bid'] = orderbook['bids'][0][0] if orderbook['bids'] else 'N/A'
-            last_data[symbol]['best_ask'] = orderbook['asks'][0][0] if orderbook['asks'] else 'N/A'
-            if 'error' in last_data[symbol]: # Очищаем ошибку, если канал восстановился
+            orderbook = await exchange.watch_order_book(symbol, limit=20) # Получаем 20 уровней
+            last_data[symbol]['bids'] = orderbook['bids']
+            last_data[symbol]['asks'] = orderbook['asks']
+            if 'error' in last_data[symbol]:
                 del last_data[symbol]['error']
         except Exception as e:
             print(f"Error in order book loop for {symbol}: {e}")
             last_data[symbol]['error'] = 'BookFeed Down'
             await asyncio.sleep(10)
 
-# --- Задача-репортер (без изменений) ---
+# --- Задача-репортер ---
 
 async def telegram_reporter_loop(app, chat_ids):
     """Каждые 30 секунд отправляет отчет в Telegram."""
@@ -58,8 +58,11 @@ async def telegram_reporter_loop(app, chat_ids):
             if 'error' in data:
                  report_lines.append(f"<code>{symbol.split(':')[0]:<10}</code> ⚠️ {data['error']}")
             else:
+                # Извлекаем лучший bid/ask из полного списка
+                best_bid = data.get('bids', [[None]])[0][0] if data.get('bids') else 'N/A'
+                best_ask = data.get('asks', [[None]])[0][0] if data.get('asks') else 'N/A'
                 report_lines.append(
-                    f"<code>{symbol.split(':')[0]:<10}</code> {side_emoji} Bid: {data.get('best_bid', 'N/A')} | Ask: {data.get('best_ask', 'N/A')}"
+                    f"<code>{symbol.split(':')[0]:<10}</code> {side_emoji} Bid: {best_bid} | Ask: {best_ask}"
                 )
         
         message = "\n".join(report_lines)
@@ -68,7 +71,6 @@ async def telegram_reporter_loop(app, chat_ids):
                 await app.bot.send_message(chat_id=cid, text=message, parse_mode=constants.ParseMode.HTML)
             except Exception as e:
                 print(f"Failed to send message to {cid}: {e}")
-
 
 # --- Управляющие функции ---
 
