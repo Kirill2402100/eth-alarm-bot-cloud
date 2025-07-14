@@ -1,11 +1,11 @@
-# File: scanner_engine.py (v9 - IndentationError Fix)
+# File: scanner_engine.py (ФИНАЛЬНАЯ ВЕРСИЯ)
 
 import asyncio
 import json
 from data_feeder import last_data
 from trade_executor import log_trade_to_sheet
 
-# --- КОНФИГУРАЦИЯ И ПРОМПТ (без изменений) ---
+# --- КОНФИГУРАЦИЯ И ПРОМПТ ---
 LARGE_ORDER_USD = 50000 
 TOP_N_ORDERS_TO_SEND = 5
 LLM_PROMPT_MICROSTRUCTURE = """
@@ -37,9 +37,9 @@ LLM_PROMPT_MICROSTRUCTURE = """
 
 async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws):
     """
-    Главный цикл сканера. Теперь он вызывает trade_executor для записи сделок.
+    Главный цикл сканера с надежной обработкой данных и интеграцией с LLM.
     """
-    print("Scanner Engine loop started.")
+    print("Scanner Engine loop started (v_final_unpack_fix).")
     last_llm_call_time = 0
 
     while True:
@@ -51,22 +51,32 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws):
             for symbol, data in current_data_snapshot.items():
                 if not data or not data.get('bids') or not data.get('asks'):
                     continue
-                
-                large_bids = [
-                    {'price': p, 'value_usd': round(p*a)} 
-                    for p, a in data.get('bids', []) 
-                    if p is not None and a is not None and (p*a > LARGE_ORDER_USD)
-                ]
-                large_asks = [
-                    {'price': p, 'value_usd': round(p*a)} 
-                    for p, a in data.get('asks', []) 
-                    if p is not None and a is not None and (p*a > LARGE_ORDER_USD)
-                ]
-                
+
+                large_bids = []
+                large_asks = []
+
+                # --- Надежная обработка данных стакана ---
+                for order in data.get('bids', []):
+                    if not (isinstance(order, (list, tuple)) and len(order) >= 2): continue
+                    price, amount = order[0], order[1]
+                    if price is None or amount is None: continue
+                    order_value_usd = price * amount
+                    if order_value_usd > LARGE_ORDER_USD:
+                        large_bids.append({'price': price, 'value_usd': round(order_value_usd)})
+
+                for order in data.get('asks', []):
+                    if not (isinstance(order, (list, tuple)) and len(order) >= 2): continue
+                    price, amount = order[0], order[1]
+                    if price is None or amount is None: continue
+                    order_value_usd = price * amount
+                    if order_value_usd > LARGE_ORDER_USD:
+                        large_asks.append({'price': price, 'value_usd': round(order_value_usd)})
+
                 if large_bids or large_asks:
                     top_bids = sorted(large_bids, key=lambda x: x['value_usd'], reverse=True)[:TOP_N_ORDERS_TO_SEND]
                     top_asks = sorted(large_asks, key=lambda x: x['value_usd'], reverse=True)[:TOP_N_ORDERS_TO_SEND]
-                    market_anomalies[symbol] = {'bids': top_bids, 'asks': top_asks}
+                    if top_bids or top_asks:
+                      market_anomalies[symbol] = {'bids': top_bids, 'asks': top_asks}
 
             current_time = asyncio.get_event_loop().time()
             if (current_time - last_llm_call_time) > 45 and market_anomalies:
@@ -75,7 +85,7 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws):
                 prompt_data = json.dumps(market_anomalies, indent=2)
                 full_prompt = LLM_PROMPT_MICROSTRUCTURE + "\n\nАНАЛИЗИРУЕМЫЕ ДАННЫЕ:\n" + prompt_data
                 
-                await broadcast_func(app, "🧠 Сканер агрегировал данные. Отправляю топ-5 аномалий по каждому активу на анализ LLM...")
+                await broadcast_func(app, "🧠 Сканер агрегировал данные. Отправляю топ-5 аномалий на анализ LLM...")
                 
                 llm_response_content = await ask_llm_func(full_prompt)
                 
@@ -100,15 +110,14 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws):
                             if success:
                                 await broadcast_func(app, "✅ Виртуальная сделка успешно залогирована в Google-таблицу.")
                             else:
-                                await broadcast_func(app, "⚠️ Не удалось залогировать сделку в Google-таблицу.")
+                                await broadcast_func(app, "⚠️ Не удалось залогировать сделку.")
                         else:
                             await broadcast_func(app, "🧐 LLM проанализировал данные, но не нашел уверенного сетапа.")
                     except Exception as e:
-                        # ЭТОТ БЛОК БЫЛ ПУСТЫМ, ТЕПЕРЬ ОН ИСПРАВЛЕН
                         print(f"Error parsing LLM decision: {e} | Response: {llm_response_content}")
-                        await broadcast_func(app, f"⚠️ Ошибка обработки ответа LLM.")
+                        await broadcast_func(app, "⚠️ Ошибка обработки ответа LLM.")
                 else:
-                    await broadcast_func(app, "⚠️ LLM не ответил на запрос. Проверьте логи на предмет детальной ошибки.")
+                    await broadcast_func(app, "⚠️ LLM не ответил на запрос. Проверьте логи.")
 
         except asyncio.CancelledError:
             print("Scanner Engine loop cancelled.")
