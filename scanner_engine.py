@@ -1,4 +1,4 @@
-# File: scanner_engine.py (ФИНАЛЬНАЯ ИСПРАВЛЕННАЯ ВЕРСИЯ)
+# File: scanner_engine.py
 
 import asyncio
 import json
@@ -12,6 +12,9 @@ from trade_executor import log_trade_to_sheet
 LARGE_ORDER_USD = 50000 
 TOP_N_ORDERS_TO_SEND = 5
 MAX_PORTFOLIO_SIZE = 10
+MIN_RR_RATIO = 1.5 # Минимально допустимое соотношение Risk/Reward
+
+# --- ПРОМПТ ДЛЯ LLM ---
 LLM_PROMPT_MICROSTRUCTURE = """
 Ты — ведущий аналитик-квант в HFT-фонде, специализирующийся на анализе микроструктуры рынка (Order Flow, Market Making).
 
@@ -20,10 +23,10 @@ LLM_PROMPT_MICROSTRUCTURE = """
 
 1.  **Выбери ОДНУ САМУЮ лучшую пару** с наиболее явным и надежным сетапом для торговли. Ищи четкие "коридоры", сильные уровни поддержки/сопротивления, созданные плитами.
 2.  **Определи тип алгоритма,** который, скорее всего, создает эти плиты (например, "Market-Maker", "Absorption Algorithm").
-3.  **Предложи конкретный торговый план,** если сетап достаточно надежен.
+3.  **Предложи конкретный торговый план** (entry, sl, tp).
 
 **ФОРМАТ ОТВЕТА:**
-Верни ОДИН JSON-объект (не массив) для лучшего кандидата.
+Верни ОДИН JSON-объект для лучшего кандидата.
 
 {
   "pair": "BTC/USDT",
@@ -33,7 +36,7 @@ LLM_PROMPT_MICROSTRUCTURE = """
   "reason": "Очень плотный кластер бидов выступает сильной поддержкой. Аски разрежены. Высокая вероятность отскока.",
   "entry_price": 119200.0,
   "sl_price": 119050.0,
-  "tp_price": 119800.0
+  "tp_price": 119425.0
 }
 
 Если уверенных сетапов нет, верни: {"confidence_score": 0}
@@ -53,7 +56,7 @@ async def get_entry_atr(pair):
         return 0
 
 async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, state):
-    print("Scanner Engine loop started (v_final_unpack_fix).")
+    print("Scanner Engine loop started (v_final_rr_check).")
     last_llm_call_time = 0
 
     while True:
@@ -74,25 +77,8 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, sta
                 if not data or not data.get('bids') or not data.get('asks') or pair_name in active_pairs:
                     continue
 
-                large_bids = []
-                large_asks = []
-
-                # --- ПРАВИЛЬНАЯ, НАДЕЖНАЯ ОБРАБОТКА СТАКАНА ---
-                for order in data.get('bids', []):
-                    if not (isinstance(order, (list, tuple)) and len(order) >= 2): continue
-                    price, amount = order[0], order[1]
-                    if price is None or amount is None: continue
-                    order_value_usd = price * amount
-                    if order_value_usd > LARGE_ORDER_USD:
-                        large_bids.append({'price': price, 'value_usd': round(order_value_usd)})
-
-                for order in data.get('asks', []):
-                    if not (isinstance(order, (list, tuple)) and len(order) >= 2): continue
-                    price, amount = order[0], order[1]
-                    if price is None or amount is None: continue
-                    order_value_usd = price * amount
-                    if order_value_usd > LARGE_ORDER_USD:
-                        large_asks.append({'price': price, 'value_usd': round(order_value_usd)})
+                large_bids = [{'price': p, 'value_usd': round(p*a)} for p, a in data.get('bids', []) if p and a and (p*a > LARGE_ORDER_USD)]
+                large_asks = [{'price': p, 'value_usd': round(p*a)} for p, a in data.get('asks', []) if p and a and (p*a > LARGE_ORDER_USD)]
 
                 if large_bids or large_asks:
                     top_bids = sorted(large_bids, key=lambda x: x['value_usd'], reverse=True)[:TOP_N_ORDERS_TO_SEND]
@@ -114,19 +100,41 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, sta
                         decision = json.loads(cleaned_response)
 
                         if decision and decision.get("confidence_score", 0) >= 7:
+                            # --- ПРОВЕРКА RISK/REWARD В КОДЕ ---
+                            entry = decision.get("entry_price")
+                            sl = decision.get("sl_price")
+                            tp = decision.get("tp_price")
+                            side = "LONG" if "Long" in decision.get("strategy_idea", "") else "SHORT"
+                            
+                            if not all([entry, sl, tp]):
+                                await broadcast_func(app, f"⚠️ LLM вернул неполные данные для {decision.get('pair')}. Пропускаю.")
+                                continue
+
+                            risk = abs(entry - sl)
+                            reward = abs(tp - entry)
+
+                            if risk == 0: continue # Избегаем деления на ноль
+
+                            rr_ratio = reward / risk
+
+                            if rr_ratio < MIN_RR_RATIO:
+                                await broadcast_func(app, f"⚠️ LLM предложил сделку по {decision.get('pair')} с низким RR ({rr_ratio:.2f}:1). Отклонено.")
+                                continue
+                            # --- КОНЕЦ ПРОВЕРКИ ---
+
                             pair_to_trade = decision.get("pair")
                             if pair_to_trade in active_pairs:
                                 await broadcast_func(app, f"⚠️ LLM предложил сделку по {pair_to_trade}, но он уже в портфеле. Пропускаю.")
                                 continue
 
-                            msg = (f"<b>🔥 LLM РЕКОМЕНДАЦИЯ (Оценка: {decision['confidence_score']}/10)</b>\n\n"
+                            msg = (f"<b>🔥 LLM РЕКОМЕНДАЦИЯ (RR {rr_ratio:.2f}:1, Оценка: {decision['confidence_score']}/10)</b>\n\n"
                                    f"<b>Инструмент:</b> <code>{decision['pair']}</code>\n"
                                    f"<b>Стратегия:</b> {decision['strategy_idea']}\n"
                                    f"<b>Алгоритм:</b> <i>{decision['algorithm_type']}</i>\n"
                                    f"<b>План:</b>\n"
-                                   f"  - Вход: <code>{decision.get('entry_price', 'N/A')}</code>\n"
-                                   f"  - SL: <code>{decision.get('sl_price', 'N/A')}</code>\n"
-                                   f"  - TP: <code>{decision.get('tp_price', 'N/A')}</code>\n\n"
+                                   f"  - Вход: <code>{entry}</code>\n"
+                                   f"  - SL: <code>{sl}</code>\n"
+                                   f"  - TP: <code>{tp}</code>\n\n"
                                    f"<b>Обоснование:</b> <i>\"{decision['reason']}\"</i>")
                             await broadcast_func(app, msg)
                             
