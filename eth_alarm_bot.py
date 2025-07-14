@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.6.0 - Leading Entry Trigger & Final Fixes
+# v3.6.1 - Final Critical Fix: Order Book Validation
 # Changelog 14‑Jul‑2025 (Europe/Belgrade):
-# • Replaced entry trigger from EMA cross to Bollinger Band midline cross.
-# • Implemented robust daily report scheduler.
-# • Re-implemented robust futures market sync via forced market list reload.
+# • Replaced futures check with a definitive order book fetch to prevent
+#   any possibility of false positives from the exchange API.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -18,7 +17,7 @@ from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
 # === ENV / Logging =========================================================
-BOT_VERSION             = "3.6.0"
+BOT_VERSION             = "3.6.1"
 BOT_TOKEN               = os.getenv("BOT_TOKEN")
 CHAT_IDS                = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID                = os.getenv("SHEET_ID")
@@ -34,7 +33,7 @@ H1_ADX_THRESHOLD        = 20
 BBP_LONG_MAX            = 0.8
 BBP_SHORT_MIN           = 0.2
 H1_SUPPORT_PROXIMITY    = 0.02
-STABLECOIN_BLACKLIST    = {'FDUSD', 'USDC', 'DAI', 'USDE', 'TUSD', 'BUSD', 'USDP', 'GUSD', 'USD1', 'FUSD', 'XUSD', 'H1'}
+STABLECOIN_BLACKLIST    = {'FDUSD', 'USDC', 'DAI', 'USDE', 'TUSD', 'BUSD', 'USDP', 'GUSD', 'USD1', 'FUSD', 'XUSD', 'H1', 'EURI', 'OFT'}
 
 LLM_API_KEY  = os.getenv("LLM_API_KEY")
 LLM_API_URL  = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
@@ -182,10 +181,8 @@ async def get_market_snapshot():
 async def scanner(app):
     while state.get("bot_on", False):
         try:
-            await exchange_spot.load_markets(True)
-            await exchange_futures.load_markets(True)
-            futures_symbols = set(exchange_futures.markets.keys())
-
+            await exchange_spot.load_markets(True) # Обновляем спотовые рынки
+            
             scan_start_time = datetime.now(timezone.utc)
             if len(state["monitored_signals"]) >= MAX_CONCURRENT_SIGNALS:
                 await asyncio.sleep(300); continue
@@ -202,14 +199,13 @@ async def scanner(app):
             state["cooldown"] = {p:t for p,t in state["cooldown"].items() if now-t < COOLDOWN_HOURS*3600}
             
             spot_tickers = await exchange_spot.fetch_tickers()
-            valid_spot_tickers = {s: t for s, t in spot_tickers.items() if s in futures_symbols}
             pairs = sorted(
-                ((s,t) for s,t in valid_spot_tickers.items() if s.endswith('/USDT') and t.get('quoteVolume')), 
+                ((s,t) for s,t in spot_tickers.items() if s.endswith('/USDT') and t.get('quoteVolume')), 
                 key=lambda x:x[1]['quoteVolume'], 
                 reverse=True
             )[:COIN_LIST_SIZE]
             
-            rejection_stats = { "ERRORS": 0, "INSUFFICIENT_DATA": 0, "NO_CROSS": 0, "OVEREXTENDED_ENTRY": 0, "H1_SUPPORT": 0, "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0, "BLACKLISTED": 0 }
+            rejection_stats = { "ERRORS": 0, "INSUFFICIENT_DATA": 0, "NO_CROSS": 0, "NOT_ON_FUTURES": 0, "OVEREXTENDED_ENTRY": 0, "H1_SUPPORT": 0, "H1_TAILWIND": 0, "ANOMALOUS_CANDLE": 0, "MARKET_REGIME": 0, "BLACKLISTED": 0 }
             pre_candidates = []
 
             for i, (sym, _) in enumerate(pairs):
@@ -235,13 +231,18 @@ async def scanner(app):
                     elif prev15["close"] >= prev15["BBM_20_2.0"] and last15["close"] < last15["BBM_20_2.0"]:
                         side = "SHORT"
                     
-                    if not side:
-                        rejection_stats["NO_CROSS"] += 1; continue
+                    if not side: rejection_stats["NO_CROSS"] += 1; continue
                     
                     bbp_value = last15["BBP_20_2.0"]
-                    if (side == "LONG" and bbp_value > BBP_LONG_MAX) or \
-                       (side == "SHORT" and bbp_value < BBP_SHORT_MIN):
+                    if (side == "LONG" and bbp_value > BBP_LONG_MAX) or (side == "SHORT" and bbp_value < BBP_SHORT_MIN):
                         rejection_stats["OVEREXTENDED_ENTRY"] += 1; continue
+                        
+                    try:
+                        order_book = await exchange_futures.fetch_order_book(sym, limit=1)
+                        if not order_book or not order_book['bids'] or not order_book['asks']:
+                           raise ccxt.BadSymbol(f"Futures order book for {sym} is empty.")
+                    except (ccxt.BadSymbol, ccxt.ExchangeError):
+                        rejection_stats["NOT_ON_FUTURES"] += 1; continue
                         
                     if market_regime == "BEARISH" and side == "LONG": rejection_stats["MARKET_REGIME"] += 1; continue
                     if (last15["high"]-last15["low"]) > last15[f"ATR_{ATR_LEN}"] * ANOMALOUS_CANDLE_MULT: rejection_stats["ANOMALOUS_CANDLE"] += 1; continue
@@ -284,6 +285,7 @@ async def scanner(app):
                 report_msg = (f"✅ <b>Поиск завершен за {duration:.0f} сек.</b> Кандидатов нет.\n\n"
                               f"📊 <b>Диагностика фильтров (из {len(pairs)} монет):</b>\n"
                               f"<code>- {rejection_stats['BLACKLISTED']:<4}</code> отсеяно по черному списку\n"
+                              f"<code>- {rejection_stats['NOT_ON_FUTURES']:<4}</code> отсеяно (нет на фьючерсах)\n"
                               f"<code>- {rejection_stats['NO_CROSS']:<4}</code> нет пересечения средней BB\n"
                               f"<code>- {rejection_stats['OVEREXTENDED_ENTRY']:<4}</code> отсеяно по положению в BB\n"
                               f"<code>- {rejection_stats['H1_SUPPORT']:<4}</code> отсеяно по H1 поддержке (лонг)\n"
