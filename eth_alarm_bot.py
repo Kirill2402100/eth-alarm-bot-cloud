@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v4.0.0 - WebSocket Microstructure Integration
+# v4.1.0 - Scanner Engine Integration
 # Changelog 14‑Jul‑2025 (Europe/Belgrade):
-# • Integrated real-time data feeder using ccxt.pro and WebSockets.
-# • Added /feed command to control and monitor the data stream.
+# • Added scanner_engine.py to analyze market data in real-time.
+# • Integrated scanner start/stop into the /feed command.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -16,11 +16,12 @@ from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
-# --- ИМПОРТИРУЕМ НОВЫЙ МОДУЛЬ ---
+# --- ИМПОРТИРУЕМ НОВЫЕ МОДУЛИ ---
 import data_feeder
+from scanner_engine import scanner_main_loop
 
 # === ENV / Logging =========================================================
-BOT_VERSION               = "4.0.0"
+BOT_VERSION               = "4.1.0"
 BOT_TOKEN                 = os.getenv("BOT_TOKEN")
 CHAT_IDS                  = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID                  = os.getenv("SHEET_ID")
@@ -494,19 +495,26 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     state["bot_on"] = True
     save_state()
     await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} (Microstructure) запущен.</b>\n"
-                                    "Используйте /feed для запуска потока данных.")
+                                    "Используйте /feed для запуска потока данных и сканера.")
 
 async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     state["bot_on"] = False
     data_feeder.stop_data_feed() # Также останавливаем фид при полной остановке
     save_state()
     await update.message.reply_text("🛑 <b>Бот остановлен.</b> Все задачи остановлены.")
+    # Принудительно отменяем задачи, чтобы освободить ресурсы
+    if hasattr(ctx.application, '_feed_task'): ctx.application._feed_task.cancel()
+    if hasattr(ctx.application, '_scanner_task'): ctx.application._scanner_task.cancel()
+
 
 async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     snapshot = await get_market_snapshot()
     is_feed_running = hasattr(update.application, '_feed_task') and not update.application._feed_task.done()
+    is_scanner_running = hasattr(update.application, '_scanner_task') and not update.application._scanner_task.done()
+    
     msg = (f"<b>Состояние бота:</b> {'✅ ON' if state.get('bot_on') else '🛑 OFF'}\n"
            f"<b>Поток данных:</b> {'🛰️ ACTIVE' if is_feed_running else '🔌 OFF'}\n"
+           f"<b>Сканер:</b> {'🧠 ACTIVE' if is_scanner_running else '🔌 OFF'}\n"
            f"<b>Активных сигналов (старая логика):</b> {len(state['monitored_signals'])}/{MAX_CONCURRENT_SIGNALS}\n"
            f"<b>Режим рынка:</b> {snapshot['regime']}\n"
            f"<b>Волатильность:</b> {snapshot['volatility']} (ATR {snapshot['volatility_percent']})")
@@ -514,21 +522,24 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_feed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Управляет потоком данных WebSocket."""
+    """Управляет потоком данных WebSocket и сканером."""
     app = ctx.application
-    is_task_running = hasattr(app, '_feed_task') and not app._feed_task.done()
+    is_feed_task_running = hasattr(app, '_feed_task') and not app._feed_task.done()
 
-    if is_task_running:
+    if is_feed_task_running:
         data_feeder.stop_data_feed()
-        await update.message.reply_text("🛑 Команда на остановку потока данных отправлена. Соединение закроется в течение минуты.")
-        await asyncio.sleep(5) # Даем время на graceful shutdown
-        if hasattr(app, '_feed_task'):
-             app._feed_task.cancel()
+        await update.message.reply_text("🛑 Команда на остановку потока данных и сканера отправлена. Соединение закроется в течение минуты.")
+        
+        # Даем время на graceful shutdown перед принудительной отменой
+        await asyncio.sleep(5) 
+        if hasattr(app, '_feed_task'): app._feed_task.cancel()
+        if hasattr(app, '_scanner_task'): app._scanner_task.cancel()
     else:
-        await update.message.reply_text("🛰️ Запускаю поток данных WebSocket...")
-        # Сохраняем задачу в контекст приложения, чтобы иметь к ней доступ
+        await update.message.reply_text("🛰️ Запускаю поток данных и сканер...")
+        # Сохраняем задачи в контекст приложения, чтобы иметь к ним доступ
         app._feed_task = asyncio.create_task(data_feeder.data_feed_main_loop(app, app.chat_ids))
-        await update.message.reply_text("✅ Поток данных запущен. Ожидайте отчеты в чате.")
+        app._scanner_task = asyncio.create_task(scanner_main_loop())
+        await update.message.reply_text("✅ Поток данных и сканер запущены.")
 
 
 async def post_init(app: Application):
