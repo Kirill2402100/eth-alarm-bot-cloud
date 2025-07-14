@@ -1,4 +1,4 @@
-# File: scanner_engine.py (v2 - Independent Loop)
+# File: scanner_engine.py (v3 - Robust Unpacking)
 
 import asyncio
 # Импортируем только общий словарь с данными
@@ -11,16 +11,13 @@ LARGE_ORDER_USD = 50000
 async def scanner_main_loop():
     """
     Главный цикл сканера, который анализирует данные,
-    полученные data_feeder'ом. Теперь работает в бесконечном цикле.
+    полученные data_feeder'ом.
     """
     print("Scanner Engine loop started.")
-    # Используем 'while True', так как жизненный цикл теперь
-    # управляется созданием/отменой задачи в основном боте.
     while True:
         try:
             await asyncio.sleep(5) # Анализируем данные каждые 5 секунд
 
-            # Копируем данные, чтобы избежать проблем с одновременным доступом
             current_data_snapshot = dict(last_data)
 
             print("\n--- Running Scan Cycle ---")
@@ -29,18 +26,31 @@ async def scanner_main_loop():
                     continue
 
                 # Ищем крупные заявки на покупку (биды)
-                for price, amount in data['bids']:
+                for order in data.get('bids', []):
+                    # ПРОВЕРКА ПЕРЕД РАСПАКОВКОЙ
+                    if not (isinstance(order, (list, tuple)) and len(order) >= 2):
+                        continue # Пропускаем некорректно сформированную запись
+                    
+                    price, amount = order[0], order[1]
                     if price is None or amount is None: continue
+
                     order_value_usd = price * amount
                     if order_value_usd > LARGE_ORDER_USD:
                         print(f"✅ FOUND LARGE BID on {symbol}: {amount:.2f} @ ${price:.4f} (Value: ${order_value_usd:,.0f})")
 
                 # Ищем крупные заявки на продажу (аски)
-                for price, amount in data['asks']:
+                for order in data.get('asks', []):
+                    # ПРОВЕРКА ПЕРЕД РАСПАКОВКОЙ
+                    if not (isinstance(order, (list, tuple)) and len(order) >= 2):
+                        continue # Пропускаем некорректно сформированную запись
+
+                    price, amount = order[0], order[1]
                     if price is None or amount is None: continue
+                    
                     order_value_usd = price * amount
                     if order_value_usd > LARGE_ORDER_USD:
                         print(f"🛑 FOUND LARGE ASK on {symbol}: {amount:.2f} @ ${price:.4f} (Value: ${order_value_usd:,.0f})")
+
         except asyncio.CancelledError:
             print("Scanner Engine loop cancelled.")
             break # Выходим из цикла при отмене
