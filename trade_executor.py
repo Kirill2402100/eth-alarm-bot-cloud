@@ -1,75 +1,62 @@
-# File: trade_executor.py (v3 - With State Management)
+# File: trade_executor.py
 
 import uuid
 import asyncio
 from datetime import datetime, timezone
 
-# Эта функция будет вызываться из основного файла, чтобы передать нам доступ к состоянию
 state = {}
 def set_state_object(main_state):
     global state
     state = main_state
 
 def save_state_func():
-    # Эта функция будет установлена из основного файла
     pass
 
-async def log_trade_to_sheet(worksheet, decision: dict):
+async def log_trade_to_sheet(worksheet, decision: dict, entry_atr: float):
     if not worksheet:
-        print("Trade Executor: Worksheet not available. Skipping log.")
+        print("Trade Executor: Worksheet not available.")
         return False
-
     try:
         signal_id = str(uuid.uuid4())[:8]
         entry_time = datetime.now(timezone.utc)
-        
-        # Создаем объект сигнала для мониторинга
+        pair = decision.get("pair")
+        strategy = decision.get("strategy_idea", "")
+
         active_signal = {
-            "signal_id": signal_id,
-            "pair": decision.get("pair"),
-            "status": "ACTIVE",
+            "signal_id": signal_id, "pair": pair, "status": "ACTIVE",
             "entry_time_utc": entry_time.isoformat(),
-            "side": "LONG" if "Long" in decision.get("strategy_idea", "") else "SHORT",
+            "side": "LONG" if "Long" in strategy else "SHORT" if "Short" in strategy else "N/A",
             "entry_price": decision.get("entry_price"),
-            "sl_price": decision.get("sl_price"),
-            "tp_price": decision.get("tp_price"),
+            "sl_price": decision.get("sl_price"), "tp_price": decision.get("tp_price"),
+            "entry_atr": entry_atr,
         }
         
-        # Добавляем сигнал в портфель и сохраняем состояние
         state['monitored_signals'].append(active_signal)
         save_state_func()
-        print(f"Added {active_signal['pair']} to active monitoring portfolio.")
+        print(f"Added {pair} to active monitoring portfolio.")
 
         row_data = [
-            signal_id, entry_time.isoformat(), decision.get("pair"), decision.get("confidence_score"),
-            decision.get("algorithm_type"), decision.get("strategy_idea"), decision.get("reason"),
+            signal_id, entry_time.isoformat(), pair, decision.get("confidence_score"),
+            decision.get("algorithm_type"), strategy, decision.get("reason"),
             active_signal["entry_price"], active_signal["sl_price"], active_signal["tp_price"],
-            # Добавляем пустые поля для будущего обновления
-            "ACTIVE", "", "" # Status, Exit_Time, Exit_Price
+            "ACTIVE", "", "", entry_atr, "", ""
         ]
-        
         await asyncio.to_thread(worksheet.append_row, row_data, value_input_option='USER_ENTERED')
-        print(f"✅ Trade logged to Google Sheets for pair {decision.get('pair')}")
+        print(f"✅ Trade logged to Google Sheets for pair {pair}")
         return True
-
     except Exception as e:
         print(f"❌ Error logging trade to Google Sheets: {e}")
         return False
 
-async def update_trade_in_sheet(worksheet, signal: dict, exit_status: str, exit_price: float):
+async def update_trade_in_sheet(worksheet, signal: dict, exit_status: str, exit_price: float, pnl_usd: float, pnl_percent: float):
     if not worksheet: return
     try:
         cell = await asyncio.to_thread(worksheet.find, signal['signal_id'])
         if not cell: return
-
         exit_time = datetime.now(timezone.utc).isoformat()
-        
-        # Обновляем ячейки в найденной строке
-        update_range = f"K{cell.row}:M{cell.row}"
-        update_values = [[exit_status, exit_time, exit_price]]
-        
+        update_range = f"K{cell.row}:P{cell.row}"
+        update_values = [[exit_status, exit_time, exit_price, signal.get('entry_atr', ''), pnl_usd, pnl_percent]]
         await asyncio.to_thread(worksheet.update, update_range, update_values, value_input_option='USER_ENTERED')
         print(f"✅ Updated trade {signal['signal_id']} in Google Sheets with status {exit_status}.")
-
     except Exception as e:
         print(f"❌ Error updating trade in Google Sheets: {e}")
