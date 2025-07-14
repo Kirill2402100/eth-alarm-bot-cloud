@@ -168,18 +168,18 @@ async def cmd_feed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         data_feeder.stop_data_feed()
         await update.message.reply_text("🛑 Команда на остановку потока данных и сканера отправлена...")
         
-        await asyncio.sleep(2) # Даем время на graceful shutdown
+        await asyncio.sleep(2) 
         if hasattr(app, '_feed_task'): app._feed_task.cancel()
         if hasattr(app, '_scanner_task'): app._scanner_task.cancel()
         await update.message.reply_text("Все фоновые задачи остановлены.")
     else:
         await update.message.reply_text("🛰️ Запускаю поток данных и сканер...")
-        # Сохраняем задачи в контекст приложения, чтобы иметь к ним доступ
+        
         app._feed_task = asyncio.create_task(data_feeder.data_feed_main_loop(app, app.chat_ids))
-        # Передаем нужные функции напрямую в сканер
+        # ИЗМЕНЕНИЕ ЗДЕСЬ: Передаем функции ask_llm и broadcast в сканер
         app._scanner_task = asyncio.create_task(scanner_main_loop(app, ask_llm, broadcast))
+        
         await update.message.reply_text("✅ Поток данных и сканер запущены.")
-
 
 async def post_init(app: Application):
     """Запускает фоновые задачи после инициализации бота."""
