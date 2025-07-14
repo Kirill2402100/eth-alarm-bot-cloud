@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.7.0 - Definitive Futures Sync Fix
+# v4.0.0 - WebSocket Microstructure Integration
 # Changelog 14‑Jul‑2025 (Europe/Belgrade):
-# • Implemented a definitive futures sync logic by pre-filtering the spot
-#   list against a force-reloaded list of all futures markets.
+# • Integrated real-time data feeder using ccxt.pro and WebSockets.
+# • Added /feed command to control and monitor the data stream.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -16,15 +16,18 @@ from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
+# --- ИМПОРТИРУЕМ НОВЫЙ МОДУЛЬ ---
+import data_feeder
+
 # === ENV / Logging =========================================================
-BOT_VERSION             = "3.6.2"
-BOT_TOKEN               = os.getenv("BOT_TOKEN")
-CHAT_IDS                = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
-SHEET_ID                = os.getenv("SHEET_ID")
-COIN_LIST_SIZE          = int(os.getenv("COIN_LIST_SIZE", "300"))
-MAX_CONCURRENT_SIGNALS  = int(os.getenv("MAX_CONCURRENT_SIGNALS", "10"))
+BOT_VERSION               = "4.0.0"
+BOT_TOKEN                 = os.getenv("BOT_TOKEN")
+CHAT_IDS                  = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
+SHEET_ID                  = os.getenv("SHEET_ID")
+COIN_LIST_SIZE            = int(os.getenv("COIN_LIST_SIZE", "300"))
+MAX_CONCURRENT_SIGNALS    = int(os.getenv("MAX_CONCURRENT_SIGNALS", "10"))
 ANOMALOUS_CANDLE_MULT   = 3.0
-COOLDOWN_HOURS          = 4
+COOLDOWN_HOURS            = 4
 # --- Стратегические параметры ---
 TREND_ADX_THRESHOLD     = 25
 TREND_RR_RATIO          = 1.5
@@ -481,46 +484,61 @@ async def daily_pnl_report(app: Application):
         except Exception as e:
             log.error(f"Daily P&L report failed: {e}")
 
+# === КОМАНДЫ TELEGRAM ===
+
 async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     if cid not in ctx.application.chat_ids:
         ctx.application.chat_ids.add(cid)
     
-    if not state.get("bot_on"):
-        state["bot_on"] = True
-        save_state()
-        await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} (Contrarian) запущен.</b>")
-        if not hasattr(ctx.application, '_scanner_task') or ctx.application._scanner_task.done():
-             log.info("Starting scanner task from /start command...")
-             ctx.application._scanner_task = asyncio.create_task(scanner(ctx.application))
-        if not hasattr(ctx.application, '_monitor_task') or ctx.application._monitor_task.done():
-             log.info("Starting monitor task from /start command...")
-             ctx.application._monitor_task = asyncio.create_task(monitor(ctx.application))
-    else:
-        await update.message.reply_text("ℹ️ Бот уже запущен.")
+    state["bot_on"] = True
+    save_state()
+    await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} (Microstructure) запущен.</b>\n"
+                                    "Используйте /feed для запуска потока данных.")
 
 async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     state["bot_on"] = False
+    data_feeder.stop_data_feed() # Также останавливаем фид при полной остановке
     save_state()
-    await update.message.reply_text("🛑 <b>Бот остановлен.</b>")
+    await update.message.reply_text("🛑 <b>Бот остановлен.</b> Все задачи остановлены.")
 
 async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     snapshot = await get_market_snapshot()
+    is_feed_running = hasattr(update.application, '_feed_task') and not update.application._feed_task.done()
     msg = (f"<b>Состояние бота:</b> {'✅ ON' if state.get('bot_on') else '🛑 OFF'}\n"
-           f"<b>Активных сигналов:</b> {len(state['monitored_signals'])}/{MAX_CONCURRENT_SIGNALS}\n"
+           f"<b>Поток данных:</b> {'🛰️ ACTIVE' if is_feed_running else '🔌 OFF'}\n"
+           f"<b>Активных сигналов (старая логика):</b> {len(state['monitored_signals'])}/{MAX_CONCURRENT_SIGNALS}\n"
            f"<b>Режим рынка:</b> {snapshot['regime']}\n"
            f"<b>Волатильность:</b> {snapshot['volatility']} (ATR {snapshot['volatility_percent']})")
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
+
+async def cmd_feed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Управляет потоком данных WebSocket."""
+    app = ctx.application
+    is_task_running = hasattr(app, '_feed_task') and not app._feed_task.done()
+
+    if is_task_running:
+        data_feeder.stop_data_feed()
+        await update.message.reply_text("🛑 Команда на остановку потока данных отправлена. Соединение закроется в течение минуты.")
+        await asyncio.sleep(5) # Даем время на graceful shutdown
+        if hasattr(app, '_feed_task'):
+             app._feed_task.cancel()
+    else:
+        await update.message.reply_text("🛰️ Запускаю поток данных WebSocket...")
+        # Сохраняем задачу в контекст приложения, чтобы иметь к ней доступ
+        app._feed_task = asyncio.create_task(data_feeder.data_feed_main_loop(app, app.chat_ids))
+        await update.message.reply_text("✅ Поток данных запущен. Ожидайте отчеты в чате.")
+
+
 async def post_init(app: Application):
-    log.info("Bot application initialized. Checking prior state...")
-    if state.get("bot_on"):
-        log.info("Bot was ON before restart. Auto-starting tasks...")
-        app._scanner_task = asyncio.create_task(scanner(app))
-        app._monitor_task = asyncio.create_task(monitor(app))
-    
+    """Запускает фоновые задачи после инициализации бота."""
+    log.info("Bot application initialized.")
+    # НЕ запускаем сканеры или фиды автоматически. Управление через команды.
+    # Запускаем только неинтерактивные задачи, как отчет P&L.
     app._pnl_task = asyncio.create_task(daily_pnl_report(app))
-    log.info("Background task scheduler is configured.")
+    log.info("Background P&L task scheduler is configured.")
+
 
 if __name__ == "__main__":
     load_state()
@@ -529,9 +547,11 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.chat_ids = set(CHAT_IDS)
     
+    # --- РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ ---
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("feed", cmd_feed))
     
-    log.info(f"Bot v{BOT_VERSION} (Contrarian) started polling.")
+    log.info(f"Bot v{BOT_VERSION} (Microstructure) started polling.")
     app.run_polling()
