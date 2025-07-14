@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v3.6.1 - Final Critical Fix: Order Book Validation
+# v3.7.0 - Contrarian Entry Strategy
 # Changelog 14‑Jul‑2025 (Europe/Belgrade):
-# • Replaced futures check with a definitive order book fetch to prevent
-#   any possibility of false positives from the exchange API.
+# • Implemented a contrarian strategy: signal logic is now inverted.
+#   A setup that previously triggered a LONG now triggers a SHORT, and vice-versa.
 # ============================================================================
 
 import os, asyncio, json, logging, uuid
@@ -17,7 +17,7 @@ from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 
 # === ENV / Logging =========================================================
-BOT_VERSION             = "3.6.1"
+BOT_VERSION             = "3.7.0"
 BOT_TOKEN               = os.getenv("BOT_TOKEN")
 CHAT_IDS                = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID                = os.getenv("SHEET_ID")
@@ -181,8 +181,7 @@ async def get_market_snapshot():
 async def scanner(app):
     while state.get("bot_on", False):
         try:
-            await exchange_spot.load_markets(True) # Обновляем спотовые рынки
-            
+            await exchange_spot.load_markets(True)
             scan_start_time = datetime.now(timezone.utc)
             if len(state["monitored_signals"]) >= MAX_CONCURRENT_SIGNALS:
                 await asyncio.sleep(300); continue
@@ -225,16 +224,23 @@ async def scanner(app):
                     
                     last15, prev15 = df15.iloc[-1], df15.iloc[-2]
                     
-                    side = None
+                    # Определяем изначальное направление сетапа
+                    original_side = None
                     if prev15["close"] <= prev15["BBM_20_2.0"] and last15["close"] > last15["BBM_20_2.0"]:
-                        side = "LONG"
+                        original_side = "LONG"
                     elif prev15["close"] >= prev15["BBM_20_2.0"] and last15["close"] < last15["BBM_20_2.0"]:
-                        side = "SHORT"
+                        original_side = "SHORT"
                     
-                    if not side: rejection_stats["NO_CROSS"] += 1; continue
+                    if not original_side:
+                        rejection_stats["NO_CROSS"] += 1; continue
+                    
+                    # --- ИЗМЕНЕНИЕ v3.7.0: Инверсия сигнала ---
+                    final_side = "SHORT" if original_side == "LONG" else "LONG"
                     
                     bbp_value = last15["BBP_20_2.0"]
-                    if (side == "LONG" and bbp_value > BBP_LONG_MAX) or (side == "SHORT" and bbp_value < BBP_SHORT_MIN):
+                    # Фильтры BB и H1 Support применяются к ИЗНАЧАЛЬНОМУ направлению
+                    if (original_side == "LONG" and bbp_value > BBP_LONG_MAX) or \
+                       (original_side == "SHORT" and bbp_value < BBP_SHORT_MIN):
                         rejection_stats["OVEREXTENDED_ENTRY"] += 1; continue
                         
                     try:
@@ -244,8 +250,12 @@ async def scanner(app):
                     except (ccxt.BadSymbol, ccxt.ExchangeError):
                         rejection_stats["NOT_ON_FUTURES"] += 1; continue
                         
-                    if market_regime == "BEARISH" and side == "LONG": rejection_stats["MARKET_REGIME"] += 1; continue
-                    if (last15["high"]-last15["low"]) > last15[f"ATR_{ATR_LEN}"] * ANOMALOUS_CANDLE_MULT: rejection_stats["ANOMALOUS_CANDLE"] += 1; continue
+                    # Фильтр рыночного режима BTC применяется к КОНЕЧНОМУ направлению сделки
+                    if market_regime == "BEARISH" and final_side == "LONG":
+                        rejection_stats["MARKET_REGIME"] += 1; continue
+                    
+                    if (last15["high"]-last15["low"]) > last15[f"ATR_{ATR_LEN}"] * ANOMALOUS_CANDLE_MULT:
+                        rejection_stats["ANOMALOUS_CANDLE"] += 1; continue
                     
                     ohlcv_h1 = await exchange_spot.fetch_ohlcv(sym, "1h", limit=100)
                     if len(ohlcv_h1) < 51: rejection_stats["INSUFFICIENT_DATA"] += 1; continue
@@ -262,100 +272,27 @@ async def scanner(app):
                     
                     if is_h1_uptrend: h1_trend_status = "Uptrend"
                     if is_h1_downtrend: h1_trend_status = "Downtrend"
-
-                    if (side == "LONG" and not is_h1_uptrend) or (side == "SHORT" and not is_h1_downtrend):
+                    
+                    # Фильтр H1 тренда применяется к ИЗНАЧАЛЬНОМУ направлению
+                    if (original_side == "LONG" and not is_h1_uptrend) or \
+                       (original_side == "SHORT" and not is_h1_downtrend):
                         rejection_stats["H1_TAILWIND"] += 1; continue
                     
-                    if side == "LONG":
+                    # Фильтр H1 поддержки применяется к ИЗНАЧАЛЬНОМУ направлению
+                    if original_side == "LONG":
                         h1_ema21 = last1h["EMA_21"]
                         if not (h1_ema21 * (1 - H1_SUPPORT_PROXIMITY) <= last15["close"] <= h1_ema21 * (1 + H1_SUPPORT_PROXIMITY)):
                             rejection_stats["H1_SUPPORT"] += 1; continue
                         
                     pre_candidates.append({
-                        "pair": sym, "side": side, "adx": last15["ADX_14"], "rsi": last15["RSI_14"],
+                        "pair": sym, "side": final_side, "adx": last15["ADX_14"], "rsi": last15["RSI_14"],
                         "bb_pos": bbp_value, "atr": last15[f"ATR_{ATR_LEN}"], "entry_price": last15["close"],
                         "h1_trend_at_entry": h1_trend_status
                     })
                 except Exception as e:
                     rejection_stats["ERRORS"] += 1; log.warning(f"Scan ERROR on {sym}: {e}")
                 await asyncio.sleep(0.1)
-
-            if not pre_candidates:
-                duration = (datetime.now(timezone.utc) - scan_start_time).total_seconds()
-                report_msg = (f"✅ <b>Поиск завершен за {duration:.0f} сек.</b> Кандидатов нет.\n\n"
-                              f"📊 <b>Диагностика фильтров (из {len(pairs)} монет):</b>\n"
-                              f"<code>- {rejection_stats['BLACKLISTED']:<4}</code> отсеяно по черному списку\n"
-                              f"<code>- {rejection_stats['NOT_ON_FUTURES']:<4}</code> отсеяно (нет на фьючерсах)\n"
-                              f"<code>- {rejection_stats['NO_CROSS']:<4}</code> нет пересечения средней BB\n"
-                              f"<code>- {rejection_stats['OVEREXTENDED_ENTRY']:<4}</code> отсеяно по положению в BB\n"
-                              f"<code>- {rejection_stats['H1_SUPPORT']:<4}</code> отсеяно по H1 поддержке (лонг)\n"
-                              f"<code>- {rejection_stats['H1_TAILWIND']:<4}</code> отсеяно по H1 тренду\n"
-                              f"<code>- {rejection_stats['ANOMALOUS_CANDLE']:<4}</code> отсеяно по аномальной свече\n"
-                              f"<code>- {rejection_stats['MARKET_REGIME']:<4}</code> отсеяно из-за режима рынка\n"
-                              f"<code>- {rejection_stats['ERRORS']:<4}</code> отсеяно из-за ошибок\n"
-                              f"<code>- {rejection_stats['INSUFFICIENT_DATA']:<4}</code> отсеяно по недостатку данных")
-                await broadcast(app, report_msg)
-            else:
-                sorted_pre = sorted(pre_candidates, key=lambda x: x['adx'], reverse=True)
-                top_candidates = sorted_pre[:10]
                 
-                llm_prompt_data = [f"- Pair: {c['pair']}, Side: {c['side']}, ADX: {c['adx']:.2f}, RSI: {c['rsi']:.2f}, BB_Pos: {c['bb_pos']:.2f}" for c in top_candidates]
-                full_prompt = PROMPT + "\n\n" + "КАНДИДАТЫ ДЛЯ АНАЛИЗА:\n" + "\n".join(llm_prompt_data)
-                await broadcast(app, f"📊 <b>Найдено {len(pre_candidates)} кандидатов.</b> Отправляю топ-{len(top_candidates)} с лучшим ADX на анализ LLM...")
-
-                llm_results = await ask_llm(full_prompt)
-
-                if llm_results and len(llm_results) == len(top_candidates):
-                    for i, cand in enumerate(top_candidates): cand.update(llm_results[i])
-                    
-                    valid_candidates = [c for c in top_candidates if c.get('confidence_score', 0) >= MIN_CONFIDENCE_SCORE]
-                    if not valid_candidates:
-                        await broadcast(app, "🧐 LLM не нашел достаточно уверенных сетапов. Пропускаю цикл.")
-                    else:
-                        best_candidate = max(valid_candidates, key=lambda x: (x['confidence_score'], x['adx']))
-
-                        rr_ratio = TREND_RR_RATIO if best_candidate['adx'] >= TREND_ADX_THRESHOLD else FLAT_RR_RATIO
-                        score = best_candidate['confidence_score']
-                        pos_size = 50 if score >= 9 else 30 if score >= 7 else 20
-                        
-                        entry_price, atr_val = best_candidate['entry_price'], best_candidate['atr']
-                        sl_distance = atr_val * SL_ATR_MULT
-                        tp_distance = sl_distance * rr_ratio
-
-                        if best_candidate['side'] == 'LONG':
-                            sl_price, tp_price = entry_price - sl_distance, entry_price + tp_distance
-                        else:
-                            sl_price, tp_price = entry_price + sl_distance, entry_price - tp_distance
-
-                        signal_id = str(uuid.uuid4())[:8]
-                        signal = {
-                            "signal_id": signal_id, "pair": best_candidate['pair'], "side": best_candidate['side'],
-                            "entry_price": entry_price, "sl": sl_price, "tp": tp_price,
-                            "entry_time_utc": datetime.now(timezone.utc).isoformat(), "status": "ACTIVE", 
-                            "mfe_price": entry_price, "mae_price": entry_price,
-                            "reason": best_candidate.get('reason', 'N/A'), "confidence_score": score, 
-                            "position_size_usd": pos_size, "leverage": 100, 
-                            "adx": best_candidate['adx'], "rsi": best_candidate['rsi'], 
-                            "bb_pos": best_candidate['bb_pos'], "h1_trend_at_entry": best_candidate.get("h1_trend_at_entry")
-                        }
-                        state['monitored_signals'].append(signal)
-                        state['cooldown'][signal['pair']] = datetime.now(timezone.utc).timestamp()
-                        save_state()
-
-                        emoji = "⬆️ LONG" if signal['side'] == 'LONG' else "⬇️ SHORT"
-                        msg = (f"<b>🔥 НОВЫЙ СИГНАЛ</b> ({signal_id})\n\n"
-                               f"<b>{emoji} {signal['pair']}</b>\n"
-                               f"<b>Вход:</b> <code>{fmt(signal['entry_price'])}</code>\n"
-                               f"<b>TP:</b> <code>{fmt(signal['tp'])}</code> (RR {rr_ratio:.1f}:1)\n"
-                               f"<b>SL:</b> <code>{fmt(signal['sl'])}</code>\n\n"
-                               f"<b>LLM Оценка: {signal['confidence_score']}/10</b> | <b>Размер: ${signal['position_size_usd']}</b>\n"
-                               f"<i>LLM: \"{signal['reason']}\"</i>")
-                        await broadcast(app, msg)
-                else:
-                    await broadcast(app, "⚠️ Не удалось получить корректный ответ от LLM.")
-            
-            await asyncio.sleep(900)
-
         except Exception as e:
             log.error("Scanner critical: %s", e, exc_info=True)
             await asyncio.sleep(300)
