@@ -1,4 +1,4 @@
-# File: scanner_engine.py (v5 - Decoupled)
+# File: scanner_engine.py (v5 - Aggregation & LLM Integration)
 
 import asyncio
 import json
@@ -12,7 +12,7 @@ LLM_PROMPT_MICROSTRUCTURE = """
 Ты — ведущий аналитик-квант в HFT-фонде, специализирующийся на анализе микроструктуры рынка (Order Flow, Market Making).
 
 **ТВОЯ ЗАДАЧА:**
-Проанализируй предоставленные JSON-данные о состоянии биржевого стакана для нескольких криптовалютных пар. Данные включают кластеры крупных лимитных заявок (плит) на покупку (bids) и продажу (asks).
+Проанализируй предоставленные JSON-данные о состоянии биржевого стакана для нескольких криптовалютных пар. Данные включают кластеры крупных лимитных заявок ("плит") на покупку (bids) и продажу (asks).
 
 1.  **Выбери ОДНУ САМУЮ лучшую пару** с наиболее явным и надежным сетапом для торговли. Ищи четкие "коридоры", сильные уровни поддержки/сопротивления, созданные плитами.
 2.  **Определи тип алгоритма,** который, скорее всего, создает эти плиты (например, "Market-Maker", "Absorption Algorithm", "Spoofing Wall").
@@ -26,7 +26,7 @@ LLM_PROMPT_MICROSTRUCTURE = """
   "confidence_score": 9,
   "algorithm_type": "Classic Market-Maker",
   "strategy_idea": "Range Trading (Long)",
-  "reason": "Очень плотный кластер бидов на $119150, выступающий сильной поддержкой. Аски разрежены. Высокая вероятность отскока к $119800.",
+  "reason": "Очень плотный кластер бидов выступает сильной поддержкой. Аски разрежены. Высокая вероятность отскока к верхней границе.",
   "entry_price": 119200.0,
   "sl_price": 119050.0,
   "tp_price": 119800.0
@@ -45,7 +45,7 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func):
 
     while True:
         try:
-            await asyncio.sleep(2)
+            await asyncio.sleep(5) 
 
             market_anomalies = {}
             current_data_snapshot = dict(last_data)
@@ -69,7 +69,7 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func):
                         market_anomalies[symbol]['asks'].append({'price': price, 'value_usd': round(order_value_usd)})
 
             current_time = asyncio.get_event_loop().time()
-            if (current_time - last_llm_call_time) > 30 and market_anomalies:
+            if (current_time - last_llm_call_time) > 45 and any(d['bids'] or d['asks'] for d in market_anomalies.values()):
                 last_llm_call_time = current_time
                 
                 prompt_data = json.dumps(market_anomalies, indent=2)
@@ -81,7 +81,10 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func):
                 
                 if llm_response_content:
                     try:
-                        decision = json.loads(llm_response_content)
+                        # LLM может вернуть JSON в тройных кавычках, чистим это
+                        cleaned_response = llm_response_content.strip().strip('```json').strip('```').strip()
+                        decision = json.loads(cleaned_response)
+
                         if decision.get("confidence_score", 0) >= 7:
                             msg = (f"<b>🔥 LLM РЕКОМЕНДАЦИЯ (Оценка: {decision['confidence_score']}/10)</b>\n\n"
                                    f"<b>Инструмент:</b> <code>{decision['pair']}</code>\n"
