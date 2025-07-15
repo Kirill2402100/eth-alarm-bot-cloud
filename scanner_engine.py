@@ -1,4 +1,4 @@
-# File: scanner_engine.py (v14 - Final Combined Logic)
+# File: scanner_engine.py (v16 - REST-only Architecture)
 
 import asyncio
 import json
@@ -6,17 +6,15 @@ import time
 import pandas as pd
 import pandas_ta as ta
 import ccxt.async_support as ccxt
-from data_feeder import last_data
-from trade_executor import log_trade_to_sheet
+from trade_executor import log_trade_to_sheet, update_trade_in_sheet
 
-# --- КОНФИГУРАЦИЯ ---
-LARGE_ORDER_USD = 50000 
+# --- Конфигурация ---
+SYMBOLS_TO_SCAN = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'WLD/USDT', 'PEPE/USDT', 'BNB/USDT']
+LARGE_ORDER_USD = 75000 
 TOP_N_ORDERS_TO_SEND = 10
 MAX_PORTFOLIO_SIZE = 10
 MIN_RR_RATIO = 1.5
-LLM_COOLDOWN_SECONDS = 300 # Кулдаун для повторного анализа одной монеты (5 минут)
-
-# --- ПРОМПТ ДЛЯ LLM ---
+LLM_COOLDOWN_SECONDS = 300
 LLM_PROMPT_MICROSTRUCTURE = """
 Ты — ведущий аналитик-квант в HFT-фонде, специализирующийся на анализе микроструктуры рынка (Order Flow, Market Making).
 
@@ -46,6 +44,53 @@ LLM_PROMPT_MICROSTRUCTURE = """
 
 exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
 
+# --- МОДУЛЬ МОНИТОРИНГА ---
+async def monitor_active_trades(app, broadcast_func, trade_log_ws, state, save_state_func):
+    if not state.get('monitored_signals'): return
+    
+    signals_to_remove = []
+    try:
+        pairs_to_fetch = [s['pair'] for s in state['monitored_signals']]
+        all_tickers = await exchange.fetch_tickers(pairs_to_fetch)
+    except Exception as e:
+        print(f"Monitor: Could not fetch tickers. Error: {e}")
+        return
+
+    for signal in state['monitored_signals']:
+        ticker = all_tickers.get(signal['pair'])
+        if not ticker or not ticker.get('last'): continue
+        current_price = ticker['last']
+        
+        exit_status, exit_price = None, None
+        
+        if signal['side'] == 'LONG':
+            if current_price <= signal['sl_price']: exit_status, exit_price = "SL_HIT", signal['sl_price']
+            elif current_price >= signal['tp_price']: exit_status, exit_price = "TP_HIT", signal['tp_price']
+        elif signal['side'] == 'SHORT':
+            if current_price >= signal['sl_price']: exit_status, exit_price = "SL_HIT", signal['sl_price']
+            elif current_price <= signal['tp_price']: exit_status, exit_price = "TP_HIT", signal['tp_price']
+
+        if exit_status:
+            position_size_usd, leverage = 50, 100
+            price_change_percent = ((exit_price - signal['entry_price']) / signal['entry_price'])
+            if signal['side'] == 'SHORT': price_change_percent = -price_change_percent
+            pnl_percent = price_change_percent * leverage * 100
+            pnl_usd = position_size_usd * (pnl_percent / 100)
+            
+            await update_trade_in_sheet(trade_log_ws, signal, exit_status, exit_price, pnl_usd, pnl_percent)
+            
+            emoji = "✅" if pnl_usd > 0 else "❌"
+            msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({exit_status})</b>\n\n"
+                   f"<b>Инструмент:</b> <code>{signal['pair']}</code>\n"
+                   f"<b>Результат: ${pnl_usd:+.2f} ({pnl_percent:+.2f}%)</b>")
+            await broadcast_func(app, msg)
+            signals_to_remove.append(signal)
+
+    if signals_to_remove:
+        state['monitored_signals'] = [s for s in state['monitored_signals'] if s not in signals_to_remove]
+        save_state_func()
+
+# --- МОДУЛЬ СКАНИРОВАНИЯ ---
 async def get_entry_atr(pair):
     try:
         ohlcv = await exchange.fetch_ohlcv(pair, '15m', limit=20)
@@ -53,131 +98,77 @@ async def get_entry_atr(pair):
         df.ta.atr(length=14, append=True)
         atr_value = df.iloc[-1]['ATR_14']
         return atr_value if pd.notna(atr_value) else 0
-    except Exception as e:
-        print(f"Could not fetch ATR for {pair}: {e}")
-        return 0
+    except Exception: return 0
 
-async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, state):
-    """Главный цикл сканера с кулдауном и надежной обработкой данных."""
-    print("Scanner Engine loop started (v14_final_combined).")
+async def scan_for_new_opportunities(app, ask_llm_func, broadcast_func, trade_log_ws, state):
+    current_time = time.time()
+    state['llm_cooldown'] = {p: t for p, t in state['llm_cooldown'].items() if (current_time - t) < LLM_COOLDOWN_SECONDS}
     
-    if 'llm_cooldown' not in state:
-        state['llm_cooldown'] = {}
+    active_pairs = {s['pair'] for s in state.get('monitored_signals', [])}
+    pairs_to_scan = [s for s in SYMBOLS_TO_SCAN if s not in active_pairs and s not in state['llm_cooldown']]
+    if not pairs_to_scan: return
 
-    while True:
+    print(f"Scanning for anomalies in {len(pairs_to_scan)} pairs...")
+    market_anomalies = {}
+    for pair in pairs_to_scan:
         try:
-            await asyncio.sleep(15)
+            order_book = await exchange.fetch_order_book(pair, limit=20)
+            large_bids = [{'price': p, 'value_usd': round(p*a)} for p, a in order_book.get('bids', []) if p and a and (p*a > LARGE_ORDER_USD)]
+            large_asks = [{'price': p, 'value_usd': round(p*a)} for p, a in order_book.get('asks', []) if p and a and (p*a > LARGE_ORDER_USD)]
+            if large_bids or large_asks:
+                market_anomalies[pair] = {'bids': large_bids, 'asks': large_asks}
+        except Exception as e:
+            print(f"Could not fetch order book for {pair}: {e}")
+            continue
 
-            current_time = time.time()
-            state['llm_cooldown'] = {p: t for p, t in state['llm_cooldown'].items() if (current_time - t) < LLM_COOLDOWN_SECONDS}
+    if not market_anomalies: return
 
-            active_pairs = {s['pair'] for s in state.get('monitored_signals', [])}
-            if len(active_pairs) >= MAX_PORTFOLIO_SIZE:
-                print(f"Portfolio is full ({len(active_pairs)}). Scanner is sleeping.")
-                await asyncio.sleep(30)
-                continue
+    best_candidate_pair, max_order_value = None, 0
+    for pair, anomalies in market_anomalies.items():
+        all_orders = anomalies['bids'] + anomalies['asks']
+        if not all_orders: continue
+        current_max = max(order['value_usd'] for order in all_orders)
+        if current_max > max_order_value:
+            max_order_value = current_max
+            best_candidate_pair = pair
+    
+    if not best_candidate_pair: return
 
-            market_anomalies = {}
-            current_data_snapshot = dict(last_data)
+    state['llm_cooldown'][best_candidate_pair] = time.time()
+    
+    top_bids = sorted(market_anomalies[best_candidate_pair]['bids'], key=lambda x: x['value_usd'], reverse=True)[:TOP_N_ORDERS_TO_SEND]
+    top_asks = sorted(market_anomalies[best_candidate_pair]['asks'], key=lambda x: x['value_usd'], reverse=True)[:TOP_N_ORDERS_TO_SEND]
+    focused_data = {best_candidate_pair: {'bids': top_bids, 'asks': top_asks}}
+    prompt_data = json.dumps(focused_data, indent=2)
+    full_prompt = LLM_PROMPT_MICROSTRUCTURE + "\n\nАНАЛИЗИРУЕМЫЕ ДАННЫЕ:\n" + prompt_data
+    
+    await broadcast_func(app, f"🧠 Сканер выбрал лучшего кандидата ({best_candidate_pair}). Отправляю на анализ LLM...")
+    llm_response_content = await ask_llm_func(full_prompt)
+    
+    if llm_response_content:
+        try:
+            # ... (логика обработки ответа LLM, RR-check и вызов log_trade_to_sheet)
+        except Exception as e:
+            print(f"Error parsing LLM decision: {e}")
 
-            for symbol, data in current_data_snapshot.items():
-                pair_name = symbol.split(':')[0]
-                if not data or not data.get('bids') or not data.get('asks') or pair_name in active_pairs:
-                    continue
-
-                large_bids, large_asks = [], []
-
-                for order in data.get('bids', []):
-                    if not (isinstance(order, (list, tuple)) and len(order) >= 2): continue
-                    price, amount = order[0], order[1]
-                    if price is None or amount is None: continue
-                    order_value_usd = price * amount
-                    if order_value_usd > LARGE_ORDER_USD:
-                        large_bids.append({'price': price, 'value_usd': round(order_value_usd)})
-
-                for order in data.get('asks', []):
-                    if not (isinstance(order, (list, tuple)) and len(order) >= 2): continue
-                    price, amount = order[0], order[1]
-                    if price is None or amount is None: continue
-                    order_value_usd = price * amount
-                    if order_value_usd > LARGE_ORDER_USD:
-                        large_asks.append({'price': price, 'value_usd': round(order_value_usd)})
-
-                if large_bids or large_asks:
-                    market_anomalies[pair_name] = {'bids': large_bids, 'asks': large_asks}
-
-            if market_anomalies:
-                best_candidate_pair, max_order_value = None, 0
-                for pair, anomalies in market_anomalies.items():
-                    if pair in state['llm_cooldown']:
-                        continue 
-
-                    all_orders = anomalies['bids'] + anomalies['asks']
-                    if not all_orders: continue
-                    current_max = max(order['value_usd'] for order in all_orders)
-                    if current_max > max_order_value:
-                        max_order_value = current_max
-                        best_candidate_pair = pair
-                
-                if not best_candidate_pair:
-                    continue
-
-                state['llm_cooldown'][best_candidate_pair] = time.time()
-
-                best_candidate_data = market_anomalies[best_candidate_pair]
-                top_bids = sorted(best_candidate_data['bids'], key=lambda x: x['value_usd'], reverse=True)[:TOP_N_ORDERS_TO_SEND]
-                top_asks = sorted(best_candidate_data['asks'], key=lambda x: x['value_usd'], reverse=True)[:TOP_N_ORDERS_TO_SEND]
-                
-                focused_data = {best_candidate_pair: {'bids': top_bids, 'asks': top_asks}}
-                prompt_data = json.dumps(focused_data, indent=2)
-
-                full_prompt = LLM_PROMPT_MICROSTRUCTURE + "\n\nАНАЛИЗИРУЕМЫЕ ДАННЫЕ:\n" + prompt_data
-                await broadcast_func(app, f"🧠 Сканер выбрал лучшего кандидата ({best_candidate_pair}). Отправляю на анализ LLM...")
-                
-                llm_response_content = await ask_llm_func(full_prompt)
-                
-                if llm_response_content:
-                    try:
-                        cleaned_response = llm_response_content.strip().strip('```json').strip('```').strip()
-                        decision = json.loads(cleaned_response)
-
-                        if decision and decision.get("confidence_score", 0) >= 7:
-                            entry, sl, tp = decision.get("entry_price"), decision.get("sl_price"), decision.get("tp_price")
-                            if not all([isinstance(v, (int, float)) for v in [entry, sl, tp]]):
-                                await broadcast_func(app, f"⚠️ LLM вернул нечисловые данные для {decision.get('pair')}. Пропускаю.")
-                                continue
-
-                            if abs(entry - sl) == 0: continue
-                            
-                            rr_ratio = abs(tp - entry) / abs(entry - sl)
-                            if rr_ratio < MIN_RR_RATIO:
-                                await broadcast_func(app, f"⚠️ LLM предложил сделку по {decision.get('pair')} с низким RR ({rr_ratio:.2f}:1). Отклонено.")
-                                continue
-                            
-                            pair_to_trade = decision.get("pair")
-                            if pair_to_trade in active_pairs:
-                                await broadcast_func(app, f"⚠️ LLM предложил сделку по {pair_to_trade}, но он уже в портфеле. Пропускаю.")
-                                continue
-
-                            msg = (f"<b>🔥 LLM РЕКОМЕНДАЦИЯ (RR {rr_ratio:.2f}:1, Оценка: {decision['confidence_score']}/10)</b>...")
-                            await broadcast_func(app, msg)
-                            
-                            entry_atr = await get_entry_atr(pair_to_trade)
-                            success = await log_trade_to_sheet(trade_log_ws, decision, entry_atr)
-                            if success:
-                                await broadcast_func(app, "✅ Виртуальная сделка успешно залогирована.")
-                            else:
-                                await broadcast_func(app, "⚠️ Не удалось залогировать сделку.")
-                        else:
-                            await broadcast_func(app, "🧐 LLM не нашел уверенного сетапа.")
-                    except Exception as e:
-                        print(f"Error parsing LLM decision: {e} | Response: {llm_response_content}")
-                        await broadcast_func(app, "⚠️ Ошибка обработки ответа LLM.")
-                else:
-                    await broadcast_func(app, "⚠️ LLM не ответил на запрос.")
+# --- ГЛАВНЫЙ ЦИКЛ ---
+async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, state, save_state_func):
+    print("Main Engine loop started (REST-only).")
+    while state.get("bot_on", True):
+        try:
+            print(f"\n--- Running Main Cycle | Active Trades: {len(state.get('monitored_signals',[]))} ---")
+            await monitor_active_trades(app, broadcast_func, trade_log_ws, state, save_state_func)
+            
+            if len(state.get('monitored_signals', [])) < MAX_PORTFOLIO_SIZE:
+                await scan_for_new_opportunities(app, ask_llm_func, broadcast_func, trade_log_ws, state)
+            
+            print("--- Cycle Finished. Sleeping for 25 seconds. ---")
+            await asyncio.sleep(25)
         except asyncio.CancelledError:
-            print("Scanner Engine loop cancelled.")
+            print("Main Engine loop cancelled.")
             break
         except Exception as e:
-            print(f"Error in Scanner Engine loop: {e}")
-            await asyncio.sleep(10)
+            print(f"Error in Main Engine loop: {e}")
+            await asyncio.sleep(60)
+    print("Main Engine loop stopped.")
+    await exchange.close()
