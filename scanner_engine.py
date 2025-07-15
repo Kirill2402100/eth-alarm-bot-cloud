@@ -1,4 +1,4 @@
-# File: scanner_engine.py (v19 - Initialization Fix)
+# File: scanner_engine.py (v20 - Separation of Duties)
 
 import asyncio
 import json
@@ -15,40 +15,38 @@ TOP_N_ORDERS_TO_SEND = 15
 MAX_PORTFOLIO_SIZE = 1
 MIN_RR_RATIO = 1.5
 LLM_COOLDOWN_SECONDS = 180
+ENTRY_OFFSET_PERCENT = 0.05 / 100 
+SL_OFFSET_PERCENT = 0.1 / 100    
 
-# --- ПРОМПТ ДЛЯ LLM ---
+# --- НОВЫЙ, УПРОЩЕННЫЙ ПРОМПТ ---
 LLM_PROMPT_MICROSTRUCTURE = """
 Ты — ведущий аналитик-квант в HFT-фонде, специализирующийся на анализе микроструктуры рынка BTC/USDT.
 
 **ТВОЯ ЗАДАЧА:**
 Проанализируй предоставленные JSON-данные о состоянии биржевого стакана для BTC/USDT. Данные включают топ-15 крупнейших лимитных заявок ("плит").
 
-1.  **Оцени текущий сетап:** Является ли он надежным для входа в сделку прямо сейчас?
-2.  **Определи тип алгоритма,** который создает эти плиты. Вот основные типы:
-    * **Classic Market-Maker:** Две четкие "стены" на покупку и продажу, формирующие коридор. Стратегия: Range Trading.
-    * **Absorption Algorithm:** Одна аномально крупная стена (на покупку или продажу), которая "впитывает" все рыночные ордера. Стратегия: Trade from Support/Resistance.
-    * **Spoofing:** Крупная заявка, которая исчезает при подходе цены. Стратегия: No Trade или Fade (торговля в противоположную сторону).
-3.  **Предложи конкретный торговый план** (entry, sl, tp) с учетом требуемой стратегии.
+1.  **Найди самый сильный уровень поддержки** (кластер крупных бидов) и **самый сильный уровень сопротивления** (кластер крупных асков).
+2.  **Оцени общую ситуацию:** Является ли она сейчас подходящей для торговли в диапазоне (Range Trading)?
+3.  **Определи тип преобладающего алгоритма** (например, "Market-Maker", "Absorption Algorithm").
 
 **ФОРМАТ ОТВЕТА:**
-Верни JSON-объект.
+Верни JSON-объект со СТРОГО определенными полями.
 
 {
-  "pair": "BTC/USDT",
   "confidence_score": 9,
   "algorithm_type": "Classic Market-Maker",
-  "strategy_idea": "Range Trading (Long)",
-  "reason": "Очень плотный кластер бидов выступает сильной поддержкой. Аски разрежены. Высокая вероятность отскока.",
-  "entry_price": 119200.0,
-  "sl_price": 119050.0,
-  "tp_price": 119425.0
+  "key_support_level": 119150.0,
+  "key_resistance_level": 119800.0,
+  "reason": "Обнаружены плотные кластеры на покупку и продажу, формирующие четкий торговый коридор."
 }
 
-Если сетап не подходит для торговли, верни: {"confidence_score": 0}
+Если сильных уровней нет или ситуация не торговая, верни: {"confidence_score": 0}
 """
 
+exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
+
 # --- МОДУЛЬ МОНИТОРИНГА ---
-async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
+async def monitor_active_trades(app, broadcast_func, trade_log_ws, state, save_state_func):
     active_signals = state.get('monitored_signals')
     if not active_signals: return
     
@@ -90,7 +88,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
         save_state_func()
 
 # --- МОДУЛЬ СКАНИРОВАНИЯ ---
-async def get_entry_atr(exchange, pair):
+async def get_entry_atr(pair):
     try:
         ohlcv = await exchange.fetch_ohlcv(pair, '15m', limit=20)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -99,7 +97,7 @@ async def get_entry_atr(exchange, pair):
         return atr_value if pd.notna(atr_value) else 0
     except Exception: return 0
 
-async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func, trade_log_ws, state):
+async def scan_for_new_opportunities(app, ask_llm_func, broadcast_func, trade_log_ws, state):
     current_time = time.time()
     last_call_time = state.get('llm_cooldown', {}).get(PAIR_TO_SCAN, 0)
     if (current_time - last_call_time) < LLM_COOLDOWN_SECONDS:
@@ -134,41 +132,70 @@ async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func
             decision = json.loads(cleaned_response)
 
             if decision and decision.get("confidence_score", 0) >= 7:
-                entry, sl, tp = decision.get("entry_price"), decision.get("sl_price"), decision.get("tp_price")
-                if not all(isinstance(v, (int, float)) for v in [entry, sl, tp]) or abs(entry - sl) == 0:
+                support_level = decision.get("key_support_level")
+                resistance_level = decision.get("key_resistance_level")
+                
+                if not all(isinstance(v, (int, float)) for v in [support_level, resistance_level]):
+                    await broadcast_func(app, "⚠️ LLM не вернул ключевые уровни. Пропускаю.")
                     return
                 
-                rr_ratio = abs(tp - entry) / abs(entry - sl)
-                if rr_ratio < MIN_RR_RATIO:
-                    await broadcast_func(app, f"⚠️ LLM предложил сделку с низким RR ({rr_ratio:.2f}:1). Отклонено.")
-                    return
+                ticker = await exchange.fetch_ticker(PAIR_TO_SCAN)
+                current_price = ticker.get('last')
+                if not current_price: return
+
+                dist_to_support = abs(current_price - support_level)
+                dist_to_resistance = abs(current_price - resistance_level)
                 
-                msg = (f"<b>🔥 LLM РЕКОМЕНДАЦИЯ (RR {rr_ratio:.2f}:1, Оценка: {decision['confidence_score']}/10)</b>...")
+                trade_plan = {}
+                if dist_to_support < dist_to_resistance:
+                    trade_plan['side'] = "LONG"
+                    trade_plan['entry_price'] = support_level * (1 + ENTRY_OFFSET_PERCENT)
+                    trade_plan['sl_price'] = support_level * (1 - SL_OFFSET_PERCENT)
+                    trade_plan['tp_price'] = trade_plan['entry_price'] + (trade_plan['entry_price'] - trade_plan['sl_price']) * MIN_RR_RATIO
+                    trade_plan['strategy_idea'] = "Range Trading (Long from support)"
+                else:
+                    trade_plan['side'] = "SHORT"
+                    trade_plan['entry_price'] = resistance_level * (1 - ENTRY_OFFSET_PERCENT)
+                    trade_plan['sl_price'] = resistance_level * (1 + SL_OFFSET_PERCENT)
+                    trade_plan['tp_price'] = trade_plan['entry_price'] - (trade_plan['sl_price'] - trade_plan['entry_price']) * MIN_RR_RATIO
+                    trade_plan['strategy_idea'] = "Range Trading (Short from resistance)"
+                
+                decision.update(trade_plan)
+                decision['pair'] = PAIR_TO_SCAN # Убедимся, что пара всегда правильная
+                
+                msg = (f"<b>🔥 LLM АНАЛИЗ (Оценка: {decision['confidence_score']}/10)</b>\n\n"
+                       f"<b>Инструмент:</b> <code>{PAIR_TO_SCAN}</code>\n"
+                       f"<b>Стратегия:</b> {decision['strategy_idea']}\n"
+                       f"<b>Алгоритм:</b> <i>{decision['algorithm_type']}</i>\n"
+                       f"<b>Рассчитанный план (RR ~{MIN_RR_RATIO:.1f}:1):</b>\n"
+                       f"  - Вход: <code>{decision['entry_price']:.2f}</code>\n"
+                       f"  - SL: <code>{decision['sl_price']:.2f}</code>\n"
+                       f"  - TP: <code>{decision['tp_price']:.2f}</code>\n\n"
+                       f"<b>Обоснование:</b> <i>\"{decision['reason']}\"</i>")
                 await broadcast_func(app, msg)
                 
-                entry_atr = await get_entry_atr(exchange, decision.get("pair"))
+                entry_atr = await get_entry_atr(PAIR_TO_SCAN)
                 success = await log_trade_to_sheet(trade_log_ws, decision, entry_atr)
                 if success:
                     await broadcast_func(app, "✅ Виртуальная сделка успешно залогирована.")
+            else:
+                await broadcast_func(app, "🧐 LLM проанализировал данные, но не нашел уверенного сетапа.")
         except Exception as e:
             print(f"Error parsing LLM decision: {e}")
 
 # --- ГЛАВНЫЙ ЦИКЛ ---
 async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, state, save_state_func):
-    print("Main Engine loop started (REST-only, v_init_fix).")
-    
-    # --- ИНИЦИАЛИЗАЦИЯ ПЕРЕНЕСЕНА ВНУТРЬ ЦИКЛА ---
-    exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
+    print("Main Engine loop started (v_final_btc_only).")
     
     if 'llm_cooldown' not in state: state['llm_cooldown'] = {}
 
     while state.get("bot_on", True):
         try:
             print(f"\n--- Running Main Cycle | Active Trades: {len(state.get('monitored_signals',[]))} ---")
-            await monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func)
+            await monitor_active_trades(app, broadcast_func, trade_log_ws, state, save_state_func)
             
             if len(state.get('monitored_signals', [])) < MAX_PORTFOLIO_SIZE:
-                await scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func, trade_log_ws, state)
+                await scan_for_new_opportunities(app, ask_llm_func, broadcast_func, trade_log_ws, state)
             
             print("--- Cycle Finished. Sleeping for 30 seconds. ---")
             await asyncio.sleep(30)
