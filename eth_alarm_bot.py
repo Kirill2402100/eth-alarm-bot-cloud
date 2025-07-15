@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v6.0.0 - Focused BTC Strategy (REST-only)
+# v6.0.0 - Focused BTC Strategy  (REST-only)
 # Changelog 15-Jul-2025 (Europe/Belgrade):
 # • Финальная архитектура: работа только через REST API.
 # • Вся логика вынесена в единый цикл в scanner_engine.
