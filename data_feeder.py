@@ -6,10 +6,8 @@ import ccxt.pro as ccxtpro
 # --- РАСШИРЕННЫЙ СПИСОК АКТИВОВ ---
 SYMBOLS = [
     'BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'XRP/USDT:USDT',
-    'DOGE/USDT:USDT', 'ADA/USDT:USDT', 'AVAX/USDT:USDT', 'LINK/USDT:USDT',
-    'WLD/USDT:USDT', 'ORDI/USDT:USDT', 'PEPE/USDT:USDT', 'BNB/USDT:USDT'
+    'DOGE/USDT:USDT', 'WLD/USDT:USDT', 'PEPE/USDT:USDT'
 ]
-
 # --- Глобальные переменные ---
 is_running = False
 last_data = {symbol: {} for symbol in SYMBOLS}
