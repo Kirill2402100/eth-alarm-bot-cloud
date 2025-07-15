@@ -1,46 +1,36 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v4.5.0 - P&L Simulation and Portfolio Logic
+# v5.0.0 - Production Architecture (REST-only)
 # Changelog 15-Jul-2025 (Europe/Belgrade):
-# • Added P&L calculation for simulated trades ($50 size, 100x lev).
-# • Scanner now prevents opening trades on pairs already in the portfolio.
+# • Полный отказ от WebSocket в пользу надежного REST API.
+# • Логика сканера и монитора объединена в один эффективный цикл.
 # ============================================================================
 
-import os, asyncio, json, logging, uuid
-from datetime import datetime, timezone, timedelta
-
-import pandas as pd
-import pandas_ta as ta
-import aiohttp, gspread, ccxt.async_support as ccxt
-from oauth2client.service_account import ServiceAccountCredentials
+import os, asyncio, json, logging
 from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
+import gspread, aiohttp
+from oauth2client.service_account import ServiceAccountCredentials
 
 # --- Импортируем наши модули ---
-import data_feeder
 import trade_executor
 from scanner_engine import scanner_main_loop
-from trade_monitor import monitor_main_loop, init_monitor
 
-# === ENV / Logging =========================================================
-BOT_VERSION               = "4.5.0"
-BOT_TOKEN                 = os.getenv("BOT_TOKEN")
-CHAT_IDS                  = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
-SHEET_ID                  = os.getenv("SHEET_ID")
-MAX_PORTFOLIO_SIZE        = 10 # Максимальное количество одновременных сделок
-
-LLM_API_KEY  = os.getenv("LLM_API_KEY")
-LLM_API_URL  = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
-LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "gpt-4o-mini")
+# === Конфигурация =========================================================
+BOT_VERSION        = "5.0.0"
+BOT_TOKEN          = os.getenv("BOT_TOKEN")
+CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
+SHEET_ID           = os.getenv("SHEET_ID")
+LLM_API_KEY        = os.getenv("LLM_API_KEY")
+LLM_API_URL        = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
+LLM_MODEL_ID       = os.getenv("LLM_MODEL_ID", "gpt-4o-mini")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
-for n in ("httpx", "httpcore", "gspread"):
-    logging.getLogger(n).setLevel(logging.WARNING)
 
 # === Google‑Sheets =========================================================
 TRADE_LOG_WS = None
-SHEET_NAME   = "Microstructure_Log_v2" # Обновили имя для новой структуры
+SHEET_NAME   = "Microstructure_Log_v3_REST"
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Confidence_Score", "Algorithm_Type", 
     "Strategy_Idea", "LLM_Reason", "Entry_Price", "SL_Price", "TP_Price",
@@ -68,8 +58,8 @@ def setup_sheets():
     except Exception as e:
         log.error("Sheets init failed: %s", e)
 
-# === State ================================================================
-STATE_FILE = "bot_state_v6_2.json"
+# === Состояние ================================================================
+STATE_FILE = "bot_state.json"
 state = {}
 def load_state():
     global state
@@ -77,17 +67,17 @@ def load_state():
         try:
             with open(STATE_FILE, 'r') as f:
                 state = json.load(f)
-        except json.JSONDecodeError:
-            state = {}
+        except json.JSONDecodeError: state = {}
     state.setdefault("bot_on", False)
     state.setdefault("monitored_signals", [])
+    state.setdefault("llm_cooldown", {})
     log.info("State loaded. Active signals: %d", len(state["monitored_signals"]))
 
 def save_state():
     with open(STATE_FILE,"w") as f:
         json.dump(state, f, indent=2)
 
-# === LLM & Broadcast Functions ============================================
+# === Вспомогательные функции ============================================
 async def broadcast(app, txt:str):
     for cid in getattr(app,"chat_ids", CHAT_IDS):
         try:
@@ -107,75 +97,57 @@ async def ask_llm(prompt: str):
                 return data["choices"][0]["message"]["content"]
     except Exception as e:
         log.error("LLM API request failed: %s", e, exc_info=True)
+        log.error(f"LLM PROMPT THAT CAUSED ERROR:\n{prompt}")
         return None
 
-# === КОМАНДЫ TELEGRAM ===
-
+# === Команды Telegram ============================================
 async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     if cid not in ctx.application.chat_ids:
         ctx.application.chat_ids.add(cid)
     state["bot_on"] = True
     save_state()
-    await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} (P&L Simulator) запущен.</b>\n"
-                                    "Используйте /feed для запуска всех модулей.")
+    await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} (REST-only) запущен.</b>\n"
+                                    "Используйте /run для запуска основного цикла.")
 
 async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     state["bot_on"] = False
-    data_feeder.stop_data_feed()
     save_state()
-    await update.message.reply_text("🛑 <b>Бот остановлен.</b> Все задачи остановлены.")
-    if hasattr(ctx.application, '_feed_task'): ctx.application._feed_task.cancel()
-    if hasattr(ctx.application, '_scanner_task'): ctx.application._scanner_task.cancel()
-    if hasattr(ctx.application, '_monitor_task'): ctx.application._monitor_task.cancel()
+    await update.message.reply_text("🛑 <b>Бот остановлен.</b> Основной цикл будет остановлен.")
+    if hasattr(ctx.application, '_main_loop_task'):
+        ctx.application._main_loop_task.cancel()
 
 async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    is_feed_running = hasattr(update.application, '_feed_task') and not update.application._feed_task.done()
-    is_scanner_running = hasattr(update.application, '_scanner_task') and not update.application._scanner_task.done()
-    is_monitor_running = hasattr(update.application, '_monitor_task') and not update.application._monitor_task.done()
+    is_running = hasattr(update.application, '_main_loop_task') and not update.application._main_loop_task.done()
     msg = (f"<b>Состояние бота:</b> {'✅ ON' if state.get('bot_on') else '🛑 OFF'}\n"
-           f"<b>Поток данных:</b> {'🛰️ ACTIVE' if is_feed_running else '🔌 OFF'}\n"
-           f"<b>Сканер:</b> {'🧠 ACTIVE' if is_scanner_running else '🔌 OFF'}\n"
-           f"<b>Монитор:</b> {'📈 ACTIVE' if is_monitor_running else '🔌 OFF'}\n"
-           f"<b>Активных сделок:</b> {len(state.get('monitored_signals', []))}/{MAX_PORTFOLIO_SIZE}")
+           f"<b>Основной цикл:</b> {'🚀 RUNNING' if is_running else '🔌 STOPPED'}\n"
+           f"<b>Активных сделок:</b> {len(state.get('monitored_signals', []))}")
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
-async def cmd_feed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     app = ctx.application
-    is_running = hasattr(app, '_feed_task') and not app._feed_task.done()
-    if is_running:
-        data_feeder.stop_data_feed()
-        await update.message.reply_text("🛑 Команда на остановку всех задач...")
-        await asyncio.sleep(2) 
-        if hasattr(app, '_feed_task'): app._feed_task.cancel()
-        if hasattr(app, '_scanner_task'): app._scanner_task.cancel()
-        if hasattr(app, '_monitor_task'): app._monitor_task.cancel()
-        await update.message.reply_text("Все фоновые задачи остановлены.")
-    else:
-        await update.message.reply_text("🛰️ Запускаю все модули: Поток данных, Сканер и Монитор...")
-        app._feed_task = asyncio.create_task(data_feeder.data_feed_main_loop(app, app.chat_ids))
-        app._scanner_task = asyncio.create_task(scanner_main_loop(app, ask_llm, broadcast, TRADE_LOG_WS, state))
-        app._monitor_task = asyncio.create_task(monitor_main_loop(app))
-        await update.message.reply_text("✅ Все модули запущены.")
+    is_running = hasattr(app, '_main_loop_task') and not app._main_loop_task.done()
 
-async def post_init(app: Application):
-    log.info("Bot application initialized.")
+    if is_running:
+        await update.message.reply_text("ℹ️ Основной цикл уже запущен.")
+    else:
+        if not state.get("bot_on", False):
+            state["bot_on"] = True
+        await update.message.reply_text("🚀 Запускаю основной цикл (сканер + монитор)...")
+        app._main_loop_task = asyncio.create_task(scanner_main_loop(app, ask_llm, broadcast, TRADE_LOG_WS, state, save_state))
 
 if __name__ == "__main__":
     load_state()
     setup_sheets()
-
-    trade_executor.set_state_object(state)
-    trade_executor.save_state_func = save_state
-    init_monitor(state, save_state, broadcast, TRADE_LOG_WS)
+    trade_executor.init_executor(state, save_state)
     
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.chat_ids = set(CHAT_IDS)
     
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("feed", cmd_feed))
+    app.add_handler(CommandHandler("run", cmd_run))
     
-    log.info(f"Bot v{BOT_VERSION} (P&L Simulator) started polling.")
+    log.info(f"Bot v{BOT_VERSION} (REST-only Simulator) started polling.")
     app.run_polling()
