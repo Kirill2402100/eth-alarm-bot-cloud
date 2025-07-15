@@ -1,7 +1,8 @@
-# File: scanner_engine.py (ФИНАЛЬНАЯ ВЕРСИЯ V12)
+# File: scanner_engine.py (v14 - Final Combined Logic)
 
 import asyncio
 import json
+import time
 import pandas as pd
 import pandas_ta as ta
 import ccxt.async_support as ccxt
@@ -13,6 +14,7 @@ LARGE_ORDER_USD = 50000
 TOP_N_ORDERS_TO_SEND = 10
 MAX_PORTFOLIO_SIZE = 10
 MIN_RR_RATIO = 1.5
+LLM_COOLDOWN_SECONDS = 300 # Кулдаун для повторного анализа одной монеты (5 минут)
 
 # --- ПРОМПТ ДЛЯ LLM ---
 LLM_PROMPT_MICROSTRUCTURE = """
@@ -56,12 +58,18 @@ async def get_entry_atr(pair):
         return 0
 
 async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, state):
-    print("Scanner Engine loop started (v12_definitive_fix).")
-    last_llm_call_time = 0
+    """Главный цикл сканера с кулдауном и надежной обработкой данных."""
+    print("Scanner Engine loop started (v14_final_combined).")
+    
+    if 'llm_cooldown' not in state:
+        state['llm_cooldown'] = {}
 
     while True:
         try:
             await asyncio.sleep(15)
+
+            current_time = time.time()
+            state['llm_cooldown'] = {p: t for p, t in state['llm_cooldown'].items() if (current_time - t) < LLM_COOLDOWN_SECONDS}
 
             active_pairs = {s['pair'] for s in state.get('monitored_signals', [])}
             if len(active_pairs) >= MAX_PORTFOLIO_SIZE:
@@ -77,10 +85,8 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, sta
                 if not data or not data.get('bids') or not data.get('asks') or pair_name in active_pairs:
                     continue
 
-                large_bids = []
-                large_asks = []
-                
-                # --- ИСПРАВЛЕННАЯ, НАДЕЖНАЯ ОБРАБОТКА СТАКАНА ---
+                large_bids, large_asks = [], []
+
                 for order in data.get('bids', []):
                     if not (isinstance(order, (list, tuple)) and len(order) >= 2): continue
                     price, amount = order[0], order[1]
@@ -100,12 +106,12 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, sta
                 if large_bids or large_asks:
                     market_anomalies[pair_name] = {'bids': large_bids, 'asks': large_asks}
 
-            current_time = asyncio.get_event_loop().time()
-            if (current_time - last_llm_call_time) > 45 and market_anomalies:
-                last_llm_call_time = current_time
-                
+            if market_anomalies:
                 best_candidate_pair, max_order_value = None, 0
                 for pair, anomalies in market_anomalies.items():
+                    if pair in state['llm_cooldown']:
+                        continue 
+
                     all_orders = anomalies['bids'] + anomalies['asks']
                     if not all_orders: continue
                     current_max = max(order['value_usd'] for order in all_orders)
@@ -113,7 +119,10 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, sta
                         max_order_value = current_max
                         best_candidate_pair = pair
                 
-                if not best_candidate_pair: continue
+                if not best_candidate_pair:
+                    continue
+
+                state['llm_cooldown'][best_candidate_pair] = time.time()
 
                 best_candidate_data = market_anomalies[best_candidate_pair]
                 top_bids = sorted(best_candidate_data['bids'], key=lambda x: x['value_usd'], reverse=True)[:TOP_N_ORDERS_TO_SEND]
@@ -134,7 +143,11 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, sta
 
                         if decision and decision.get("confidence_score", 0) >= 7:
                             entry, sl, tp = decision.get("entry_price"), decision.get("sl_price"), decision.get("tp_price")
-                            if not all([entry, sl, tp]) or abs(entry - sl) == 0: continue
+                            if not all([isinstance(v, (int, float)) for v in [entry, sl, tp]]):
+                                await broadcast_func(app, f"⚠️ LLM вернул нечисловые данные для {decision.get('pair')}. Пропускаю.")
+                                continue
+
+                            if abs(entry - sl) == 0: continue
                             
                             rr_ratio = abs(tp - entry) / abs(entry - sl)
                             if rr_ratio < MIN_RR_RATIO:
