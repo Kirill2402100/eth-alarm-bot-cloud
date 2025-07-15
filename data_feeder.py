@@ -50,6 +50,8 @@ async def telegram_reporter_loop(app, chat_ids):
 
 # --- Управляющие функции ---
 
+# Замените эту функцию в файле data_feeder.py
+
 async def data_feed_main_loop(app, chat_ids):
     global is_running
     is_running = True
@@ -58,13 +60,12 @@ async def data_feed_main_loop(app, chat_ids):
     exchange = ccxtpro.mexc({'options': {'defaultType': 'swap'}})
     
     tasks = []
-    # --- НОВАЯ ЛОГИКА: СТУПЕНЧАТЫЙ ЗАПУСК ---
-    # Запускаем подключения с небольшой паузой между ними
+    # --- Увеличиваем паузу между подключениями ---
     for symbol in SYMBOLS:
         tasks.append(single_trade_loop(exchange, symbol))
         tasks.append(single_orderbook_loop(exchange, symbol))
         print(f"Initiated watchers for {symbol}")
-        await asyncio.sleep(0.5) # Пауза 0.5 секунды
+        await asyncio.sleep(2) # УВЕЛИЧЕННАЯ ПАУЗА
     
     tasks.append(telegram_reporter_loop(app, chat_ids))
     print("All watchers initiated. Running...")
@@ -76,7 +77,7 @@ async def data_feed_main_loop(app, chat_ids):
     finally:
         await exchange.close()
         print("Exchange connection closed.")
-
+        
 def stop_data_feed():
     global is_running
     is_running = False
