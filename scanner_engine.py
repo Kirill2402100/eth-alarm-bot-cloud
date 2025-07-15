@@ -1,5 +1,5 @@
 # File: scanner_engine.py (ФИНАЛЬНАЯ ВЕРСИЯ С ИСПРАВЛЕНИЕМ ИНИЦИАЛИЗАЦИИ)
-
+ 
 import asyncio
 import json
 import time
