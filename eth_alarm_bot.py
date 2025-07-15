@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v5.0.1 - Final REST-only Architecture
+# v6.0.0 - Focused BTC Strategy (REST-only)
+# Changelog 15-Jul-2025 (Europe/Belgrade):
+# • Финальная архитектура: работа только через REST API.
+# • Вся логика вынесена в единый цикл в scanner_engine.
+# • Бот сфокусирован на одном инструменте: BTC/USDT.
 # ============================================================================
 
 import os
@@ -18,7 +22,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "5.0.1"
+BOT_VERSION        = "6.0.0"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -28,10 +32,12 @@ LLM_MODEL_ID       = os.getenv("LLM_MODEL_ID", "gpt-4o-mini")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # === Google‑Sheets =========================================================
 TRADE_LOG_WS = None
-SHEET_NAME   = "Microstructure_Log_v3_REST"
+SHEET_NAME   = "BTC_Strategy_Log_v1"
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Confidence_Score", "Algorithm_Type", 
     "Strategy_Idea", "LLM_Reason", "Entry_Price", "SL_Price", "TP_Price",
@@ -108,7 +114,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
         ctx.application.chat_ids.add(cid)
     state["bot_on"] = True
     save_state()
-    await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} (REST-only) запущен.</b>\n"
+    await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} (BTC-only) запущен.</b>\n"
                                     "Используйте /run для запуска основного цикла.")
 
 async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -125,7 +131,7 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
            f"<b>Активных сделок:</b> {len(state.get('monitored_signals', []))}")
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
-async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
     app = ctx.application
     is_running = hasattr(app, '_main_loop_task') and not app._main_loop_task.done()
 
@@ -150,5 +156,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("run", cmd_run))
     
-    log.info(f"Bot v{BOT_VERSION} (REST-only Simulator) started polling.")
+    log.info(f"Bot v{BOT_VERSION} (BTC-only Simulator) started polling.")
     app.run_polling()
