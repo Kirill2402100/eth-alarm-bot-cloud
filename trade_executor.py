@@ -1,5 +1,4 @@
-# File: trade_executor.py (v5 - Robust Sheet Update)
-
+# File: trade_executor.py
 import uuid
 import asyncio
 from datetime import datetime, timezone
@@ -52,22 +51,18 @@ async def log_trade_to_sheet(worksheet, decision: dict, entry_atr: float):
 async def update_trade_in_sheet(worksheet, signal: dict, exit_status: str, exit_price: float, pnl_usd: float, pnl_percent: float):
     if not worksheet: return
     try:
-        # --- НОВАЯ, НАДЕЖНАЯ ЛОГИКА ПОИСКА СТРОКИ ---
-        all_signal_ids = await asyncio.to_thread(worksheet.col_values, 1) # Получаем все значения из первой колонки (A)
+        all_signal_ids = await asyncio.to_thread(worksheet.col_values, 1)
         try:
-            # Ищем индекс нашего signal_id. Добавляем 1, так как индексация списков с 0, а строк в таблице с 1.
             row_number = all_signal_ids.index(signal['signal_id']) + 1
         except ValueError:
             print(f"Could not find row for signal_id {signal['signal_id']}. Update failed.")
             return
-        # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
-
+        
         exit_time = datetime.now(timezone.utc).isoformat()
-        # Диапазон обновления K:P для найденной строки
         update_range = f"K{row_number}:P{row_number}"
         update_values = [[exit_status, exit_time, exit_price, signal.get('entry_atr', ''), pnl_usd, pnl_percent]]
         
-        await asyncio.to_thread(worksheet.update, update_range, update_values, value_input_option='USER_ENTERED')
+        await asyncio.to_thread(worksheet.update, update_range, value_input_option='USER_ENTERED')
         print(f"✅ Updated trade {signal['signal_id']} in Google Sheets with status {exit_status}.")
     except Exception as e:
         print(f"❌ Error updating trade in Google Sheets: {e}")
