@@ -46,33 +46,36 @@ exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
 
 # --- МОДУЛЬ МОНИТОРИНГА ---
 async def monitor_active_trades(app, broadcast_func, trade_log_ws, state, save_state_func):
-    if not state.get('monitored_signals'): return
+    active_signals = state.get('monitored_signals')
+    if not active_signals: return
     
     signals_to_remove = []
     try:
-        pairs_to_fetch = [s['pair'] for s in state['monitored_signals']]
+        pairs_to_fetch = [s['pair'] for s in active_signals]
         all_tickers = await exchange.fetch_tickers(pairs_to_fetch)
     except Exception as e:
         print(f"Monitor: Could not fetch tickers. Error: {e}")
         return
 
-    for signal in state['monitored_signals']:
+    for signal in active_signals:
         ticker = all_tickers.get(signal['pair'])
         if not ticker or not ticker.get('last'): continue
         current_price = ticker['last']
         
         exit_status, exit_price = None, None
         
+        entry_price, sl_price, tp_price = signal['entry_price'], signal['sl_price'], signal['tp_price']
+
         if signal['side'] == 'LONG':
-            if current_price <= signal['sl_price']: exit_status, exit_price = "SL_HIT", signal['sl_price']
-            elif current_price >= signal['tp_price']: exit_status, exit_price = "TP_HIT", signal['tp_price']
+            if current_price <= sl_price: exit_status, exit_price = "SL_HIT", sl_price
+            elif current_price >= tp_price: exit_status, exit_price = "TP_HIT", tp_price
         elif signal['side'] == 'SHORT':
-            if current_price >= signal['sl_price']: exit_status, exit_price = "SL_HIT", signal['sl_price']
-            elif current_price <= signal['tp_price']: exit_status, exit_price = "TP_HIT", signal['tp_price']
+            if current_price >= sl_price: exit_status, exit_price = "SL_HIT", sl_price
+            elif current_price <= tp_price: exit_status, exit_price = "TP_HIT", tp_price
 
         if exit_status:
             position_size_usd, leverage = 50, 100
-            price_change_percent = ((exit_price - signal['entry_price']) / signal['entry_price'])
+            price_change_percent = ((exit_price - entry_price) / entry_price) if entry_price != 0 else 0
             if signal['side'] == 'SHORT': price_change_percent = -price_change_percent
             pnl_percent = price_change_percent * leverage * 100
             pnl_usd = position_size_usd * (pnl_percent / 100)
@@ -147,7 +150,25 @@ async def scan_for_new_opportunities(app, ask_llm_func, broadcast_func, trade_lo
     
     if llm_response_content:
         try:
-            # ... (логика обработки ответа LLM, RR-check и вызов log_trade_to_sheet)
+            cleaned_response = llm_response_content.strip().strip('```json').strip('```').strip()
+            decision = json.loads(cleaned_response)
+
+            if decision and decision.get("confidence_score", 0) >= 7:
+                entry, sl, tp = decision.get("entry_price"), decision.get("sl_price"), decision.get("tp_price")
+                if not all(isinstance(v, (int, float)) for v in [entry, sl, tp]): return
+                if abs(entry - sl) == 0: return
+                
+                rr_ratio = abs(tp - entry) / abs(entry - sl)
+                if rr_ratio < MIN_RR_RATIO:
+                    await broadcast_func(app, f"⚠️ LLM предложил сделку с низким RR ({rr_ratio:.2f}:1). Отклонено.")
+                    return
+                
+                await broadcast_func(app, f"<b>🔥 LLM РЕКОМЕНДАЦИЯ (RR {rr_ratio:.2f}:1, Оценка: {decision['confidence_score']}/10)</b>...")
+                
+                entry_atr = await get_entry_atr(decision.get("pair"))
+                success = await log_trade_to_sheet(trade_log_ws, decision, entry_atr)
+                if success:
+                    await broadcast_func(app, "✅ Виртуальная сделка успешно залогирована.")
         except Exception as e:
             print(f"Error parsing LLM decision: {e}")
 
