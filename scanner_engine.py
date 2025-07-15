@@ -1,4 +1,4 @@
-# File: scanner_engine.py (v21 - Final Scope Fix)
+# File: scanner_engine.py (ФИНАЛЬНАЯ ВЕРСИЯ С ИСПРАВЛЕНИЕМ ИНИЦИАЛИЗАЦИИ)
 
 import asyncio
 import json
@@ -187,7 +187,7 @@ async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func
 
 # --- ГЛАВНЫЙ ЦИКЛ ---
 async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, state, save_state_func):
-    print("Main Engine loop started (v_final_btc_only).")
+    print("Main Engine loop started (v21_final_init_fix).")
     
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
     if 'llm_cooldown' not in state: state['llm_cooldown'] = {}
