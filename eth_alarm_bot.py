@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v5.0.0 - Production Architecture (REST-only)
-# Changelog 15-Jul-2025 (Europe/Belgrade):
-# • Полный отказ от WebSocket в пользу надежного REST API.
-# • Логика сканера и монитора объединена в один эффективный цикл.
+# v5.0.1 - Final REST-only Architecture
 # ============================================================================
 
-import os, asyncio, json, logging
+import os
+import asyncio
+import json
+import logging
 from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
-import gspread, aiohttp
+import gspread
+import aiohttp
 from oauth2client.service_account import ServiceAccountCredentials
 
 # --- Импортируем наши модули ---
@@ -17,7 +18,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "5.0.0"
+BOT_VERSION        = "5.0.1"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
