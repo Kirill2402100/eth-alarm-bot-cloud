@@ -1,4 +1,4 @@
-# File: scanner_engine.py (v18 - Final REST-only Architecture)
+# File: scanner_engine.py (v19 - Initialization Fix)
 
 import asyncio
 import json
@@ -47,14 +47,12 @@ LLM_PROMPT_MICROSTRUCTURE = """
 Если сетап не подходит для торговли, верни: {"confidence_score": 0}
 """
 
-exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
-
 # --- МОДУЛЬ МОНИТОРИНГА ---
-async def monitor_active_trades(app, broadcast_func, trade_log_ws, state, save_state_func):
+async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     active_signals = state.get('monitored_signals')
     if not active_signals: return
     
-    signal = active_signals[0] # Так как у нас всегда только одна сделка
+    signal = active_signals[0]
     try:
         ticker = await exchange.fetch_ticker(signal['pair'])
         current_price = ticker.get('last')
@@ -92,7 +90,7 @@ async def monitor_active_trades(app, broadcast_func, trade_log_ws, state, save_s
         save_state_func()
 
 # --- МОДУЛЬ СКАНИРОВАНИЯ ---
-async def get_entry_atr(pair):
+async def get_entry_atr(exchange, pair):
     try:
         ohlcv = await exchange.fetch_ohlcv(pair, '15m', limit=20)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -101,7 +99,7 @@ async def get_entry_atr(pair):
         return atr_value if pd.notna(atr_value) else 0
     except Exception: return 0
 
-async def scan_for_new_opportunities(app, ask_llm_func, broadcast_func, trade_log_ws, state):
+async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func, trade_log_ws, state):
     current_time = time.time()
     last_call_time = state.get('llm_cooldown', {}).get(PAIR_TO_SCAN, 0)
     if (current_time - last_call_time) < LLM_COOLDOWN_SECONDS:
@@ -145,18 +143,10 @@ async def scan_for_new_opportunities(app, ask_llm_func, broadcast_func, trade_lo
                     await broadcast_func(app, f"⚠️ LLM предложил сделку с низким RR ({rr_ratio:.2f}:1). Отклонено.")
                     return
                 
-                msg = (f"<b>🔥 LLM РЕКОМЕНДАЦИЯ (RR {rr_ratio:.2f}:1, Оценка: {decision['confidence_score']}/10)</b>\n\n"
-                       f"<b>Инструмент:</b> <code>{decision['pair']}</code>\n"
-                       f"<b>Стратегия:</b> {decision['strategy_idea']}\n"
-                       f"<b>Алгоритм:</b> <i>{decision['algorithm_type']}</i>\n"
-                       f"<b>План:</b>\n"
-                       f"  - Вход: <code>{entry}</code>\n"
-                       f"  - SL: <code>{sl}</code>\n"
-                       f"  - TP: <code>{tp}</code>\n\n"
-                       f"<b>Обоснование:</b> <i>\"{decision['reason']}\"</i>")
+                msg = (f"<b>🔥 LLM РЕКОМЕНДАЦИЯ (RR {rr_ratio:.2f}:1, Оценка: {decision['confidence_score']}/10)</b>...")
                 await broadcast_func(app, msg)
                 
-                entry_atr = await get_entry_atr(decision.get("pair"))
+                entry_atr = await get_entry_atr(exchange, decision.get("pair"))
                 success = await log_trade_to_sheet(trade_log_ws, decision, entry_atr)
                 if success:
                     await broadcast_func(app, "✅ Виртуальная сделка успешно залогирована.")
@@ -165,14 +155,20 @@ async def scan_for_new_opportunities(app, ask_llm_func, broadcast_func, trade_lo
 
 # --- ГЛАВНЫЙ ЦИКЛ ---
 async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, state, save_state_func):
-    print("Main Engine loop started (v_rest_final).")
+    print("Main Engine loop started (REST-only, v_init_fix).")
+    
+    # --- ИНИЦИАЛИЗАЦИЯ ПЕРЕНЕСЕНА ВНУТРЬ ЦИКЛА ---
+    exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
+    
+    if 'llm_cooldown' not in state: state['llm_cooldown'] = {}
+
     while state.get("bot_on", True):
         try:
             print(f"\n--- Running Main Cycle | Active Trades: {len(state.get('monitored_signals',[]))} ---")
-            await monitor_active_trades(app, broadcast_func, trade_log_ws, state, save_state_func)
+            await monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func)
             
             if len(state.get('monitored_signals', [])) < MAX_PORTFOLIO_SIZE:
-                await scan_for_new_opportunities(app, ask_llm_func, broadcast_func, trade_log_ws, state)
+                await scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func, trade_log_ws, state)
             
             print("--- Cycle Finished. Sleeping for 30 seconds. ---")
             await asyncio.sleep(30)
@@ -182,5 +178,6 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, sta
         except Exception as e:
             print(f"Error in Main Engine loop: {e}")
             await asyncio.sleep(60)
+            
     print("Main Engine loop stopped.")
     await exchange.close()
