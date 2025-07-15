@@ -1,8 +1,7 @@
-python-telegram-bot[job-queue]>=21.0,<22
-ccxt>=4.4.90
+python-telegram-bot==21.1.1
+ccxt==4.3.52
 gspread==6.0.2
 oauth2client==4.1.3
 pandas==2.2.2
-numpy==1.24.4
-aiohttp>=3.9.0
-pandas-ta>=0.3.14b
+pandas-ta==0.3.14b0
+aiohttp==3.9.5
