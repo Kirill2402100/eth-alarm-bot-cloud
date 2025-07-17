@@ -1,12 +1,10 @@
-# File: scanner_engine.py (v34.0 - Manual ATR)
+# File: scanner_engine.py (v35.1 - Price Check)
 # Changelog 17-Jul-2025 (Europe/Belgrade):
-# • Полный отказ от библиотеки pandas_ta из-за критического сбоя.
-# • Реализован ручной расчет ATR для максимальной стабильности.
+# • Добавлен диагностический print для отслеживания цены, получаемой
+#   от биржи в цикле мониторинга.
 
 import asyncio
 import pandas as pd
-# pandas_ta больше не используется
-# import pandas_ta as ta 
 import ccxt.async_support as ccxt
 from trade_executor import log_trade_to_sheet, update_trade_in_sheet
 
@@ -31,7 +29,15 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
     try:
         ticker = await exchange.fetch_ticker(signal['pair'])
         current_price = ticker.get('last')
-        if not current_price: return
+
+        # --- ДИАГНОСТИЧЕСКАЯ СТРОКА ---
+        print(f"MONITORING_PRICE_CHECK: Bot received price {current_price} at {pd.Timestamp.now(tz='UTC')}")
+        # --- КОНЕЦ ДИАГНОСТИЧЕСКОЙ СТРОКИ ---
+
+        if not current_price:
+            print(f"Monitor Price Error: 'last' price was not received for {signal['pair']}.")
+            return
+
         exit_status, exit_price = None, None
         trigger_order_usd = signal.get('trigger_order_usd', 0)
         if trigger_order_usd > 0:
@@ -42,6 +48,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
             elif signal['side'] == 'SHORT':
                 counter_orders = [p * a for p, a in order_book.get('bids', []) if (p * a) > (trigger_order_usd * COUNTER_ORDER_RATIO)]
                 if counter_orders: exit_status, exit_price = "EMERGENCY_EXIT", current_price
+        
         if not exit_status:
             entry_price, sl_price, tp_price = signal['entry_price'], signal['sl_price'], signal['tp_price']
             if signal['side'] == 'LONG':
@@ -50,6 +57,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
             elif signal['side'] == 'SHORT':
                 if current_price >= sl_price: exit_status, exit_price = "SL_HIT", sl_price
                 elif current_price <= tp_price: exit_status, exit_price = "TP_HIT", tp_price
+        
         if exit_status:
             entry_price = signal['entry_price']
             position_size_usd, leverage = 50, 100
@@ -65,38 +73,29 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
             await broadcast_func(app, msg)
             state['monitored_signals'] = []
             save_state_func()
+
     except Exception as e:
-        print(f"Monitor Error: {e}", exc_info=True)
+        error_message = f"⚠️ <b>Ошибка мониторинга сделки!</b>\n\nБот не смог проверить состояние позиции. Проверьте сделку вручную.\n\n<code>Ошибка: {e}</code>"
+        print(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
+        await broadcast_func(app, error_message)
 
 async def get_entry_atr(exchange, pair):
     try:
         ohlcv = await exchange.fetch_ohlcv(pair, TIMEFRAME, limit=ATR_PERIOD * 2)
         if not ohlcv or len(ohlcv) < ATR_PERIOD:
-            print(f"ATR Error: Not enough OHLCV data for {pair}.")
             return 0
-
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col])
-
-        # --- РУЧНОЙ РАСЧЕТ ATR ---
         high_low = df['high'] - df['low']
         high_prev_close = (df['high'] - df['close'].shift()).abs()
         low_prev_close = (df['low'] - df['close'].shift()).abs()
-        
         tr = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
         atr = tr.ewm(alpha=1/ATR_PERIOD, adjust=False).mean()
-        # --- КОНЕЦ РУЧНОГО РАСЧЕТА ---
-
         atr_value = atr.iloc[-1]
-        if pd.isna(atr_value) or atr_value == 0:
-            print(f"ATR Error: ATR calculation resulted in NaN or Zero.")
-            return 0
-            
-        return atr_value
-        
+        return atr_value if not pd.isna(atr_value) and atr_value > 0 else 0
     except Exception as e:
-        print(f"ATR CRITICAL ERROR: An exception occurred in get_entry_atr: {e}", exc_info=True)
+        print(f"ATR Calculation Error: {e}", exc_info=True)
         return 0
 
 async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
@@ -105,7 +104,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         large_bids = sorted([{'price': p, 'value_usd': round(p*a)} for p, a in order_book.get('bids', []) if p and a and (p*a > LARGE_ORDER_USD)], key=lambda x: x['value_usd'], reverse=True)
         large_asks = sorted([{'price': p, 'value_usd': round(p*a)} for p, a in order_book.get('asks', []) if p and a and (p*a > LARGE_ORDER_USD)], key=lambda x: x['value_usd'], reverse=True)
     except Exception as e:
-        print(f"Could not fetch order book for {PAIR_TO_SCAN}: {e}")
+        print(f"Order Book Error: {e}")
         return
 
     top_bids = large_bids[:TOP_N_ORDERS_TO_ANALYZE]
@@ -147,15 +146,10 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
             await broadcast_func(app, f"⚠️ Не удалось получить текущую цену для {PAIR_TO_SCAN}. Сделка пропущена.")
             return
         
-        entry_atr = 0
-        try:
-            entry_atr = await asyncio.wait_for(get_entry_atr(exchange, PAIR_TO_SCAN), timeout=ATR_CALCULATION_TIMEOUT)
-        except asyncio.TimeoutError:
-            await broadcast_func(app, "⚠️ Не удалось рассчитать ATR (превышен таймаут). Сделка пропущена.")
-            return
+        entry_atr = await asyncio.wait_for(get_entry_atr(exchange, PAIR_TO_SCAN), timeout=ATR_CALCULATION_TIMEOUT)
 
         if entry_atr == 0:
-            await broadcast_func(app, "⚠️ Не удалось рассчитать ATR (данные не получены). Сделка пропущена.")
+            await broadcast_func(app, "⚠️ Не удалось рассчитать ATR. Сделка пропущена.")
             return
         
         trade_plan['strategy_idea'] = "Pure Quant Entry (ATR)"
@@ -191,13 +185,15 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         if success:
             await broadcast_func(app, "✅ Виртуальная сделка успешно залогирована и взята на мониторинг.")
 
+    except asyncio.TimeoutError:
+        await broadcast_func(app, "⚠️ Не удалось рассчитать ATR (превышен таймаут). Сделка пропущена.")
     except Exception as e:
         print(f"Error processing new opportunity: {e}", exc_info=True)
         await broadcast_func(app, "Произошла внутренняя ошибка при обработке сигнала.")
 
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    print("Main Engine loop started (v34.0_manual_atr).")
+    print("Main Engine loop started (v35.1_price_check).")
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
     scan_interval = 15
     
