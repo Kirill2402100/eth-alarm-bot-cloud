@@ -1,8 +1,8 @@
-# File: scanner_engine.py (v37.0 - Fixed Percentage SL/TP)
+# File: scanner_engine.py (v38.0 - Wick-Proof Monitoring)
 # Changelog 17-Jul-2025 (Europe/Belgrade):
-# • Полный отказ от ATR в пользу фиксированного процентного SL/TP.
-# • SL = 0.10%, TP = 0.15% от цены входа.
-# • Удалена функция get_entry_atr и связанные с ней зависимости.
+# • Логика мониторинга полностью переработана для надежности.
+# • Вместо последней цены ('last') теперь используется high/low последней
+#   минутной свечи, чтобы не пропускать быстрые "проколы" цены (фитили).
 
 import asyncio
 import pandas as pd
@@ -17,18 +17,8 @@ TOP_N_ORDERS_TO_ANALYZE = 15
 MIN_TOTAL_LIQUIDITY_USD = 2000000
 MIN_IMBALANCE_RATIO = 3.0
 MAX_PORTFOLIO_SIZE = 1
-
-# --- Новые параметры для SL/TP ---
 TP_PERCENT = 0.0015  # 0.15%
 SL_PERCENT = 0.0010  # 0.10%
-# RR ~1.5:1
-
-# --- Старые параметры (больше не используются) ---
-# MIN_RR_RATIO = 1.5
-# SL_ATR_MULTIPLIER = 2.0
-# ATR_CALCULATION_TIMEOUT = 10.0
-# ATR_PERIOD = 14
-
 COUNTER_ORDER_RATIO = 1.25
 
 async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
@@ -36,37 +26,43 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
     if not active_signals: return
     signal = active_signals[0]
     try:
-        ticker = await exchange.fetch_ticker(signal['pair'])
-        current_price = ticker.get('last')
-
-        # print(f"MONITORING_PRICE_CHECK: Bot received price {current_price} at {pd.Timestamp.now(tz='UTC')}")
-
-        if not current_price:
-            print(f"Monitor Price Error: 'last' price was not received for {signal['pair']}.")
+        # --- НОВАЯ ЛОГИКА: ПОЛУЧАЕМ ПОСЛЕДНЮЮ МИНУТНУЮ СВЕЧУ ---
+        ohlcv = await exchange.fetch_ohlcv(signal['pair'], timeframe='1m', limit=1)
+        if not ohlcv:
+            print(f"Monitor OHLCV Error: No 1m candle data received for {signal['pair']}.")
             return
+        
+        # [timestamp, open, high, low, close, volume]
+        current_candle = ohlcv[0]
+        candle_high = float(current_candle[2])
+        candle_low = float(current_candle[3])
+        # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
 
         exit_status, exit_price = None, None
-        trigger_order_usd = signal.get('trigger_order_usd', 0)
-        if trigger_order_usd > 0:
-            order_book = await exchange.fetch_order_book(signal['pair'], limit=25)
-            if signal['side'] == 'LONG':
-                counter_orders = [p * a for p, a in order_book.get('asks', []) if (p * a) > (trigger_order_usd * COUNTER_ORDER_RATIO)]
-                if counter_orders: exit_status, exit_price = "EMERGENCY_EXIT", current_price
-            elif signal['side'] == 'SHORT':
-                counter_orders = [p * a for p, a in order_book.get('bids', []) if (p * a) > (trigger_order_usd * COUNTER_ORDER_RATIO)]
-                if counter_orders: exit_status, exit_price = "EMERGENCY_EXIT", current_price
         
+        # Проверяем условия выхода на основе High/Low свечи
+        entry_price, sl_price, tp_price = signal['entry_price'], signal['sl_price'], signal['tp_price']
+        if signal['side'] == 'LONG':
+            if candle_low <= sl_price: exit_status, exit_price = "SL_HIT", sl_price
+            elif candle_high >= tp_price: exit_status, exit_price = "TP_HIT", tp_price
+        elif signal['side'] == 'SHORT':
+            if candle_high >= sl_price: exit_status, exit_price = "SL_HIT", sl_price
+            elif candle_low <= tp_price: exit_status, exit_price = "TP_HIT", tp_price
+
+        # Проверка на аварийный выход (оставлена без изменений)
         if not exit_status:
-            entry_price, sl_price, tp_price = signal['entry_price'], signal['sl_price'], signal['tp_price']
-            if signal['side'] == 'LONG':
-                if current_price <= sl_price: exit_status, exit_price = "SL_HIT", sl_price
-                elif current_price >= tp_price: exit_status, exit_price = "TP_HIT", tp_price
-            elif signal['side'] == 'SHORT':
-                if current_price >= sl_price: exit_status, exit_price = "SL_HIT", sl_price
-                elif current_price <= tp_price: exit_status, exit_price = "TP_HIT", tp_price
+            trigger_order_usd = signal.get('trigger_order_usd', 0)
+            if trigger_order_usd > 0:
+                order_book = await exchange.fetch_order_book(signal['pair'], limit=25)
+                current_price = float(current_candle[4]) # Берем цену закрытия свечи
+                if signal['side'] == 'LONG':
+                    counter_orders = [p * a for p, a in order_book.get('asks', []) if (p * a) > (trigger_order_usd * COUNTER_ORDER_RATIO)]
+                    if counter_orders: exit_status, exit_price = "EMERGENCY_EXIT", current_price
+                elif signal['side'] == 'SHORT':
+                    counter_orders = [p * a for p, a in order_book.get('bids', []) if (p * a) > (trigger_order_usd * COUNTER_ORDER_RATIO)]
+                    if counter_orders: exit_status, exit_price = "EMERGENCY_EXIT", current_price
         
         if exit_status:
-            entry_price = signal['entry_price']
             position_size_usd, leverage = 50, 100
             price_change_percent = ((exit_price - entry_price) / entry_price) if entry_price != 0 else 0
             if signal['side'] == 'SHORT': price_change_percent = -price_change_percent
@@ -82,11 +78,9 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
             save_state_func()
 
     except Exception as e:
-        error_message = f"⚠️ <b>Ошибка мониторинга сделки!</b>\n\nБот не смог проверить состояние позиции. Проверьте сделку вручную.\n\n<code>Ошибка: {e}</code>"
+        error_message = f"⚠️ <b>Ошибка мониторинга сделки!</b>\n\n<code>Ошибка: {e}</code>"
         print(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
         await broadcast_func(app, error_message)
-
-# Функция get_entry_atr() больше не нужна и удалена
 
 async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     try:
@@ -136,18 +130,16 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
             await broadcast_func(app, f"⚠️ Не удалось получить текущую цену для {PAIR_TO_SCAN}. Сделка пропущена.")
             return
         
-        # --- НОВЫЙ РАСЧЕТ SL/TP ---
         trade_plan['strategy_idea'] = "Pure Quant Entry (Fixed %)"
         trade_plan['entry_price'] = current_price
         if dominant_side_is_bids:
             trade_plan['side'] = "LONG"
             trade_plan['sl_price'] = current_price * (1 - SL_PERCENT)
             trade_plan['tp_price'] = current_price * (1 + TP_PERCENT)
-        else: # dominant_side_is_sellers
+        else:
             trade_plan['side'] = "SHORT"
             trade_plan['sl_price'] = current_price * (1 + SL_PERCENT)
             trade_plan['tp_price'] = current_price * (1 - TP_PERCENT)
-        # --- КОНЕЦ НОВОГО РАСЧЕТА ---
 
         decision = {
             "signal_id": f"signal_{int(time.time() * 1000)}",
@@ -160,9 +152,6 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         if largest_order:
             decision['trigger_order_usd'] = largest_order['value_usd']
         
-        # entry_atr больше нет, передаем 0
-        entry_atr = 0 
-        
         msg = (f"<b>ВХОД В СДЕЛКУ</b>\n\n"
                f"<b>Тип:</b> {decision['strategy_idea']}\n"
                f"<b>Рассчитанный план (RR ~1.5:1):</b>\n"
@@ -171,13 +160,12 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
                f" - TP: <code>{decision['tp_price']:.2f}</code>")
         await broadcast_func(app, msg)
 
-        # Логика сохранения сделки (сначала локально, потом в GSheets)
         state['monitored_signals'].append(decision)
         save_state_func()
         await broadcast_func(app, "✅ Сделка взята на мониторинг (сохранено локально).")
 
         try:
-            success = await log_trade_to_sheet(trade_log_ws, decision, entry_atr) 
+            success = await log_trade_to_sheet(trade_log_ws, decision, 0) 
             if success:
                 await broadcast_func(app, "✅ ...и успешно залогирована в Google Sheets.")
             else:
@@ -190,8 +178,9 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         print(f"Error processing new opportunity: {e}", exc_info=True)
         await broadcast_func(app, "Произошла внутренняя ошибка при обработке сигнала.")
 
+
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    print("Main Engine loop started (v37.0_fixed_percent).")
+    print("Main Engine loop started (v38.0_wick_proof).")
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
     scan_interval = 15
     
