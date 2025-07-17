@@ -1,7 +1,7 @@
-# File: scanner_engine.py (v33.3 - Timeout Fix)
+# File: scanner_engine.py (v33.4 - Diagnostic Build)
 # Changelog 17-Jul-2025 (Europe/Belgrade):
-# • Добавлен таймаут для функции расчета ATR, чтобы избежать "зависания"
-#   при долгом ответе от биржи.
+# • Добавлено исчерпывающее логгирование в функцию get_entry_atr для отлова
+#   ошибок, связанных с некорректными данными от биржи.
 
 import asyncio
 import pandas as pd
@@ -20,7 +20,7 @@ MAX_PORTFOLIO_SIZE = 1
 MIN_RR_RATIO = 1.5
 SL_ATR_MULTIPLIER = 2.0
 COUNTER_ORDER_RATIO = 1.25
-ATR_CALCULATION_TIMEOUT = 10.0 # Таймаут для расчета ATR в секундах
+ATR_CALCULATION_TIMEOUT = 10.0
 
 async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     active_signals = state.get('monitored_signals')
@@ -36,12 +36,10 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
             order_book = await exchange.fetch_order_book(signal['pair'], limit=25)
             if signal['side'] == 'LONG':
                 counter_orders = [p * a for p, a in order_book.get('asks', []) if (p * a) > (trigger_order_usd * COUNTER_ORDER_RATIO)]
-                if counter_orders:
-                    exit_status, exit_price = "EMERGENCY_EXIT", current_price
+                if counter_orders: exit_status, exit_price = "EMERGENCY_EXIT", current_price
             elif signal['side'] == 'SHORT':
                 counter_orders = [p * a for p, a in order_book.get('bids', []) if (p * a) > (trigger_order_usd * COUNTER_ORDER_RATIO)]
-                if counter_orders:
-                    exit_status, exit_price = "EMERGENCY_EXIT", current_price
+                if counter_orders: exit_status, exit_price = "EMERGENCY_EXIT", current_price
         if not exit_status:
             entry_price, sl_price, tp_price = signal['entry_price'], signal['sl_price'], signal['tp_price']
             if signal['side'] == 'LONG':
@@ -69,23 +67,44 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
         print(f"Monitor Error: {e}", exc_info=True)
 
 async def get_entry_atr(exchange, pair):
+    # --- НАЧАЛО ДИАГНОСТИЧЕСКОГО БЛОКА ---
+    print("ATR DEBUG: --- Entering get_entry_atr ---")
     try:
+        print(f"ATR DEBUG: 1. Fetching OHLCV for {pair}...")
         ohlcv = await exchange.fetch_ohlcv(pair, TIMEFRAME, limit=20)
+        print(f"ATR DEBUG: 2. Got OHLCV data. Type: {type(ohlcv)}. Length: {len(ohlcv) if ohlcv is not None else 'None'}.")
+        print(f"ATR DEBUG: RAW_DATA_FROM_EXCHANGE: {ohlcv}")
+
         if not ohlcv or len(ohlcv) < 15:
             print(f"ATR Error: Not enough OHLCV data for {pair}. Got: {len(ohlcv) if ohlcv else 0}")
+            print("ATR DEBUG: --- Exiting get_entry_atr (not enough data) ---")
             return 0
+
+        print("ATR DEBUG: 3. Creating DataFrame...")
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        print("ATR DEBUG: 4. Converting columns to numeric...")
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col])
+        
+        print("ATR DEBUG: 5. Calculating ATR with pandas_ta...")
         df.ta.atr(length=14, append=True)
+        print("ATR DEBUG: 6. Getting last ATR value...")
         atr_value = df.iloc[-1]['ATR_14']
+        
         if pd.isna(atr_value):
             print(f"ATR Error: ATR calculation resulted in NaN for {pair}.")
+            print("ATR DEBUG: --- Exiting get_entry_atr (NaN result) ---")
             return 0
+
+        print(f"ATR DEBUG: 7. Success! Returning ATR value: {atr_value}")
+        print("ATR DEBUG: --- Exiting get_entry_atr (Success) ---")
         return atr_value
+        
     except Exception as e:
-        print(f"ATR Error: {e}", exc_info=True)
+        print(f"ATR CRITICAL ERROR: An exception occurred in get_entry_atr: {e}", exc_info=True)
+        print("ATR DEBUG: --- Exiting get_entry_atr (Exception) ---")
         return 0
+    # --- КОНЕЦ ДИАГНОСТИЧЕСКОГО БЛОКА ---
 
 async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     try:
@@ -98,12 +117,10 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
 
     top_bids = large_bids[:TOP_N_ORDERS_TO_ANALYZE]
     top_asks = large_asks[:TOP_N_ORDERS_TO_ANALYZE]
-    
     total_bids_usd = sum(b['value_usd'] for b in top_bids)
     total_asks_usd = sum(a['value_usd'] for a in top_asks)
 
-    if (total_bids_usd + total_asks_usd) < MIN_TOTAL_LIQUIDITY_USD: 
-        return
+    if (total_bids_usd + total_asks_usd) < MIN_TOTAL_LIQUIDITY_USD: return
     
     imbalance_ratio = 0
     dominant_side_is_bids = total_bids_usd > total_asks_usd
@@ -112,8 +129,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
     elif total_bids_usd > 0 or total_asks_usd > 0:
         imbalance_ratio = float('inf')
 
-    if imbalance_ratio < MIN_IMBALANCE_RATIO:
-        return
+    if imbalance_ratio < MIN_IMBALANCE_RATIO: return
 
     dominant_side = "ПОКУПАТЕЛЕЙ" if dominant_side_is_bids else "ПРОДАВЦОВ"
     largest_order = (top_bids[0] if top_bids else None) if dominant_side_is_bids else (top_asks[0] if top_asks else None)
@@ -139,7 +155,6 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
             print(f"Price Error: Could not fetch 'last' price for {PAIR_TO_SCAN}.")
             return
         
-        # ИСПРАВЛЕНИЕ: Оборачиваем вызов ATR в таймаут
         entry_atr = 0
         try:
             entry_atr = await asyncio.wait_for(get_entry_atr(exchange, PAIR_TO_SCAN), timeout=ATR_CALCULATION_TIMEOUT)
@@ -191,17 +206,15 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
 
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    print("Main Engine loop started (v33.3_timeout_fix).")
+    print("Main Engine loop started (v33.4_diagnostic).")
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
     scan_interval = 15
     
     while state.get("bot_on", True):
         try:
             await monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func)
-            
             if len(state.get('monitored_signals', [])) < MAX_PORTFOLIO_SIZE:
                 await scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func)
-            
             await asyncio.sleep(scan_interval)
         except asyncio.CancelledError:
             print("Main Engine loop cancelled.")
