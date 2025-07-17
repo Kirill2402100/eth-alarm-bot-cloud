@@ -1,68 +1,73 @@
 # File: trade_executor.py
-import uuid
-import asyncio
+# Contains functions for interacting with Google Sheets.
+
+import gspread
 from datetime import datetime, timezone
 
-state = {}
-save_state_func = None
+# Список заголовков для поиска колонок по имени
+HEADERS = [
+    "Signal_ID", "Timestamp_UTC", "Pair", "Confidence_Score", "Algorithm_Type", 
+    "Strategy_Idea", "LLM_Reason", "Entry_Price", "SL_Price", "TP_Price", 
+    "Status", "Exit_Time_UTC", "Exit_Price", "Entry_ATR", "PNL_USD", "PNL_Percent",
+    "Trigger_Order_USD" # Убедитесь, что этот заголовок есть в вашей таблице
+]
 
-def init_executor(main_state, main_save_func):
-    global state, save_state_func
-    state = main_state
-    save_state_func = main_save_func
-
-async def log_trade_to_sheet(worksheet, decision: dict, entry_atr: float):
-    if not worksheet:
-        print("Trade Executor: Worksheet not available.")
-        return False
+# Эта функция используется при входе в сделку.
+# Она добавляет новую строку.
+async def log_trade_to_sheet(worksheet, decision, entry_atr):
+    if not worksheet: return False
     try:
-        signal_id = str(uuid.uuid4())[:8]
-        entry_time = datetime.now(timezone.utc)
-        pair = decision.get("pair")
-        strategy = decision.get("strategy_idea", "")
-
-        active_signal = {
-            "signal_id": signal_id, "pair": pair, "status": "ACTIVE",
-            "entry_time_utc": entry_time.isoformat(),
-            "side": "LONG" if "Long" in strategy else "SHORT" if "Short" in strategy else "N/A",
-            "entry_price": float(decision.get("entry_price")),
-            "sl_price": float(decision.get("sl_price")), 
-            "tp_price": float(decision.get("tp_price")),
-            "entry_atr": entry_atr,
-        }
+        # Убедимся, что все поля из HEADERS существуют в decision
+        row_to_add = []
+        for header in HEADERS:
+            # Поля, которые должны быть пустыми при входе
+            if header in ["Status", "Exit_Time_UTC", "Exit_Price", "PNL_USD", "PNL_Percent"]:
+                # Ставим 'ACTIVE' при создании
+                row_to_add.append('ACTIVE' if header == "Status" else '')
+            else:
+                row_to_add.append(decision.get(header, ''))
         
-        state.setdefault('monitored_signals', []).append(active_signal)
-        save_state_func()
-        print(f"Added {pair} to active monitoring portfolio.")
-
-        row_data = [
-            signal_id, entry_time.isoformat(), pair, decision.get("confidence_score"),
-            decision.get("algorithm_type"), strategy, decision.get("reason"),
-            active_signal["entry_price"], active_signal["sl_price"], active_signal["tp_price"],
-            "ACTIVE", "", "", entry_atr, "", ""
-        ]
-        await asyncio.to_thread(worksheet.append_row, row_data, value_input_option='USER_ENTERED')
-        print(f"✅ Trade logged to Google Sheets for pair {pair}")
+        worksheet.append_row(row_to_add)
         return True
     except Exception as e:
-        print(f"❌ Error logging trade to Google Sheets: {e}")
+        print(f"GSheets log_trade_to_sheet Error: {e}", exc_info=True)
         return False
 
-async def update_trade_in_sheet(worksheet, signal: dict, exit_status: str, exit_price: float, pnl_usd: float, pnl_percent: float):
-    if not worksheet: return
+# --- НОВАЯ, НАДЕЖНАЯ ФУНКЦИЯ ОБНОВЛЕНИЯ ---
+# Эта функция используется при выходе из сделки.
+# Она находит нужную строку и обновляет её.
+async def update_trade_in_sheet(worksheet, signal, exit_status, exit_price, pnl_usd, pnl_percent):
+    if not worksheet: return False
     try:
-        all_signal_ids = await asyncio.to_thread(worksheet.col_values, 1)
-        try:
-            row_number = all_signal_ids.index(signal['signal_id']) + 1
-        except ValueError:
-            print(f"Could not find row for signal_id {signal['signal_id']}. Update failed.")
-            return
+        signal_id_to_find = signal.get('signal_id')
+        if not signal_id_to_find:
+            print("Update Error: signal_id not found in the signal object.")
+            return False
+
+        # 1. Находим ячейку с ID сигнала
+        cell = worksheet.find(signal_id_to_find)
+        if not cell:
+            print(f"Update Error: Could not find row with Signal_ID {signal_id_to_find}")
+            return False
+
+        # 2. Готовим данные для обновления
+        row_number = cell.row
+        updates = [
+            {'range': f"K{row_number}", 'values': [[exit_status]]}, # Status
+            {'range': f"L{row_number}", 'values': [[datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')]]}, # Exit_Time_UTC
+            {'range': f"M{row_number}", 'values': [[exit_price]]}, # Exit_Price
+            {'range': f"O{row_number}", 'values': [[pnl_usd]]},     # PNL_USD
+            {'range': f"P{row_number}", 'values': [[pnl_percent]]}, # PNL_Percent
+        ]
         
-        exit_time = datetime.now(timezone.utc).isoformat()
-        update_range = f"K{row_number}:P{row_number}"
-        update_values = [[exit_status, exit_time, exit_price, signal.get('entry_atr', ''), pnl_usd, pnl_percent]]
-        
-        await asyncio.to_thread(worksheet.update, update_range, value_input_option='USER_ENTERED')
-        print(f"✅ Updated trade {signal['signal_id']} in Google Sheets with status {exit_status}.")
+        # 3. Отправляем все обновления одним пакетом
+        worksheet.batch_update(updates)
+        print(f"Successfully updated trade {signal_id_to_find} in Google Sheets.")
+        return True
+
+    except gspread.exceptions.CellNotFound:
+        print(f"Update Error: Cell with Signal_ID {signal_id_to_find} not found.")
+        return False
     except Exception as e:
-        print(f"❌ Error updating trade in Google Sheets: {e}")
+        print(f"GSheets update_trade_in_sheet Error: {e}", exc_info=True)
+        return False
