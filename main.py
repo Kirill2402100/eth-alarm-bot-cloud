@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v7.0.0 - Final Refactoring (Single Entry Point)
+# v7.1.0 - LLM Call Fix
 # Changelog 17-Jul-2025 (Europe/Belgrade):
-# • Вся логика запуска объединена в один файл main.py.
-# • Удален старый файл eth_alarm_bot.py для устранения путаницы.
-# • Код полностью синхронизирован с последней версией v25 сканера.
+# • Исправлена функция ask_llm: убран параметр response_format для соответствия
+#   текстовому промпту. Это должно решить проблему пустых ответов от LLM.
 # ============================================================================
 
 import os
@@ -22,7 +21,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION       = "7.0.0"
+BOT_VERSION       = "7.1.0"
 BOT_TOKEN         = os.getenv("BOT_TOKEN")
 CHAT_IDS          = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID          = os.getenv("SHEET_ID")
@@ -93,15 +92,24 @@ async def broadcast(app, txt:str):
         except Exception as e:
             log.error("Send fail %s: %s", cid, e)
 
+# === ИСПРАВЛЕННАЯ ФУНКЦИЯ ВЫЗОВА LLM =======================================
 async def ask_llm(prompt: str):
     if not LLM_API_KEY: return None
-    payload = { "model": LLM_MODEL_ID, "messages":[{"role":"user","content":prompt}], "temperature":0.4, "response_format":{"type":"json_object"} }
+    
+    # УБРАН ПАРАМЕТР "response_format", ТАК КАК МЫ ЖДЕМ ТЕКСТ
+    payload = { 
+        "model": LLM_MODEL_ID, 
+        "messages": [{"role":"user", "content":prompt}], 
+        "temperature": 0.4
+    }
     hdrs = {"Authorization":f"Bearer {LLM_API_KEY}","Content-Type":"application/json"}
+    
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(LLM_API_URL, json=payload, headers=hdrs, timeout=180) as r:
                 r.raise_for_status()
                 data = await r.json()
+                # Возвращаем текстовое содержимое ответа
                 return data["choices"][0]["message"]["content"]
     except Exception as e:
         log.error("LLM API request failed: %s", e, exc_info=True)
@@ -157,5 +165,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("run", cmd_run))
     
-    log.info(f"Bot v{BOT_VERSION} (BTC-only, v25 Engine) started polling.")
+    log.info(f"Bot v{BOT_VERSION} (BTC-only, Text-LLM Engine) started polling.")
     app.run_polling()
