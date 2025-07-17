@@ -1,30 +1,41 @@
-# File: trade_executor.py
-# Contains functions for interacting with Google Sheets.
+# File: trade_executor.py (Final Version)
+# Changelog 18-Jul-2025 (Europe/Belgrade):
+# • Исправлена критическая ошибка в функции log_trade_to_sheet,
+#   которая приводила к сбою при записи данных в Google-таблицу.
+# • Логика сбора данных для строки была полностью переработана
+#   для максимальной надежности.
 
 import gspread
 from datetime import datetime, timezone
 
-# Список заголовков для поиска колонок по имени
+# Список заголовков для точного соответствия с таблицей
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Confidence_Score", "Algorithm_Type", 
     "Strategy_Idea", "LLM_Reason", "Entry_Price", "SL_Price", "TP_Price", 
     "Status", "Exit_Time_UTC", "Exit_Price", "Entry_ATR", "PNL_USD", "PNL_Percent",
-    "Trigger_Order_USD" # Убедитесь, что этот заголовок есть в вашей таблице
+    "Trigger_Order_USD"
 ]
 
-# Эта функция используется при входе в сделку.
-# Она добавляет новую строку.
 async def log_trade_to_sheet(worksheet, decision, entry_atr):
+    """
+    Добавляет новую строку в таблицу при открытии сделки.
+    Эта версия имеет надежную логику сборки строки.
+    """
     if not worksheet: return False
     try:
-        # Убедимся, что все поля из HEADERS существуют в decision
         row_to_add = []
+        # Собираем строку строго в порядке заголовков
         for header in HEADERS:
-            # Поля, которые должны быть пустыми при входе
-            if header in ["Status", "Exit_Time_UTC", "Exit_Price", "PNL_USD", "PNL_Percent"]:
-                # Ставим 'ACTIVE' при создании
-                row_to_add.append('ACTIVE' if header == "Status" else '')
+            if header == "Status":
+                row_to_add.append("ACTIVE")
+            elif header == "Entry_ATR":
+                # Явно используем переданное значение ATR
+                row_to_add.append(entry_atr)
+            elif header in ["Exit_Time_UTC", "Exit_Price", "PNL_USD", "PNL_Percent"]:
+                # Эти поля остаются пустыми при создании
+                row_to_add.append("")
             else:
+                # Все остальные данные берем из словаря 'decision'
                 row_to_add.append(decision.get(header, ''))
         
         worksheet.append_row(row_to_add)
@@ -33,10 +44,10 @@ async def log_trade_to_sheet(worksheet, decision, entry_atr):
         print(f"GSheets log_trade_to_sheet Error: {e}", exc_info=True)
         return False
 
-# --- НОВАЯ, НАДЕЖНАЯ ФУНКЦИЯ ОБНОВЛЕНИЯ ---
-# Эта функция используется при выходе из сделки.
-# Она находит нужную строку и обновляет её.
 async def update_trade_in_sheet(worksheet, signal, exit_status, exit_price, pnl_usd, pnl_percent):
+    """
+    Находит существующую строку по ID и обновляет ее при закрытии сделки.
+    """
     if not worksheet: return False
     try:
         signal_id_to_find = signal.get('signal_id')
@@ -44,13 +55,11 @@ async def update_trade_in_sheet(worksheet, signal, exit_status, exit_price, pnl_
             print("Update Error: signal_id not found in the signal object.")
             return False
 
-        # 1. Находим ячейку с ID сигнала
         cell = worksheet.find(signal_id_to_find)
         if not cell:
             print(f"Update Error: Could not find row with Signal_ID {signal_id_to_find}")
             return False
 
-        # 2. Готовим данные для обновления
         row_number = cell.row
         updates = [
             {'range': f"K{row_number}", 'values': [[exit_status]]}, # Status
@@ -60,7 +69,6 @@ async def update_trade_in_sheet(worksheet, signal, exit_status, exit_price, pnl_
             {'range': f"P{row_number}", 'values': [[pnl_percent]]}, # PNL_Percent
         ]
         
-        # 3. Отправляем все обновления одним пакетом
         worksheet.batch_update(updates)
         print(f"Successfully updated trade {signal_id_to_find} in Google Sheets.")
         return True
