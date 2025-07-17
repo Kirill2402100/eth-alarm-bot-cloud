@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v10.0.0 - Final Cleanup
+# v12.0.0 - Unified Logging
 # Changelog 18-Jul-2025 (Europe/Belgrade):
-# • Убран устаревший столбец 'LLM_Reason' из конфигурации.
+# • Логирование параметров объединено с логом сделок.
+# • Добавлены новые колонки для записи параметров, активных в момент сделки.
 # ============================================================================
 
 import os
@@ -14,12 +15,11 @@ from telegram.ext import Application, ApplicationBuilder, CommandHandler, Contex
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# --- Импортируем наши модули ---
 import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "10.0.0" 
+BOT_VERSION        = "12.0.0" 
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -32,12 +32,14 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 TRADE_LOG_WS = None
 SHEET_NAME   = f"Trading_Log_v{BOT_VERSION}" 
 
-# Обновленный список заголовков
+# ОБНОВЛЕННЫЙ СПИСОК ЗАГОЛОВКОВ
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Confidence_Score", "Algorithm_Type", 
     "Strategy_Idea", "Entry_Price", "SL_Price", "TP_Price", 
     "Status", "Exit_Time_UTC", "Exit_Price", "Entry_ATR", "PNL_USD", "PNL_Percent",
-    "Trigger_Order_USD"
+    "Trigger_Order_USD", 
+    # Новые колонки для параметров
+    "Param_Liquidity", "Param_Imbalance", "Param_Large_Order"
 ]
 
 def setup_sheets():
@@ -49,24 +51,21 @@ def setup_sheets():
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         gs = gspread.authorize(creds)
         ss = gs.open_by_key(SHEET_ID)
-        try:
-            ws = ss.worksheet(SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            log.info("Worksheet '%s' not found. Creating a new one.", SHEET_NAME)
-            ws = ss.add_worksheet(title=SHEET_NAME, rows="1000", cols=len(HEADERS))
-        
-        if not ws.row_values(1):
-            ws.clear()
-            ws.update("A1",[HEADERS])
-            ws.format(f"A1:{chr(ord('A')+len(HEADERS)-1)}1",{"textFormat":{"bold":True}})
 
-        TRADE_LOG_WS = ws
-        log.info("Google-Sheets ready – logging to '%s'.", SHEET_NAME)
+        try:
+            TRADE_LOG_WS = ss.worksheet(SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            TRADE_LOG_WS = ss.add_worksheet(title=SHEET_NAME, rows="1000", cols=len(HEADERS))
+            TRADE_LOG_WS.update("A1", [HEADERS])
+            TRADE_LOG_WS.format(f"A1:{chr(ord('A')+len(HEADERS)-1)}1", {"textFormat":{"bold":True}})
+        
+        log.info("Google-Sheets ready. Logging to '%s'.", SHEET_NAME)
     except Exception as e:
         log.error("Sheets init failed: %s", e)
 
-# (Остальная часть файла main.py без изменений)
-# ...
+# (Остальная часть файла без изменений)
+STATE_FILE = "bot_state.json"
+state = {}
 def load_state():
     global state
     if os.path.exists(STATE_FILE):
@@ -123,10 +122,9 @@ async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
         if not state.get("bot_on", False):
             state["bot_on"] = True
         await update.message.reply_text(f"🚀 Запускаю основной цикл (v{BOT_VERSION})...")
+        # Убираем params_log_ws, он больше не нужен
         app._main_loop_task = asyncio.create_task(scanner_main_loop(app, broadcast, TRADE_LOG_WS, state, save_state))
 
-STATE_FILE = "bot_state.json"
-state = {}
 if __name__ == "__main__":
     load_state()
     setup_sheets()
@@ -136,5 +134,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("run", cmd_run))
-    log.info(f"Bot v{BOT_VERSION} started polling. Logging to sheet: {SHEET_NAME}")
+    log.info(f"Bot v{BOT_VERSION} started polling.")
     app.run_polling()
