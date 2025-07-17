@@ -1,26 +1,35 @@
-# File: scanner_engine.py (v35.1 - Price Check)
+# File: scanner_engine.py (v37.0 - Fixed Percentage SL/TP)
 # Changelog 17-Jul-2025 (Europe/Belgrade):
-# • Добавлен диагностический print для отслеживания цены, получаемой
-#   от биржи в цикле мониторинга.
+# • Полный отказ от ATR в пользу фиксированного процентного SL/TP.
+# • SL = 0.10%, TP = 0.15% от цены входа.
+# • Удалена функция get_entry_atr и связанные с ней зависимости.
 
 import asyncio
 import pandas as pd
 import ccxt.async_support as ccxt
 from trade_executor import log_trade_to_sheet, update_trade_in_sheet
+import time
 
 # === Конфигурация Сканера и Стратегии =====================================
 PAIR_TO_SCAN = 'BTC/USDT'
-TIMEFRAME = '15m'
 LARGE_ORDER_USD = 500000
 TOP_N_ORDERS_TO_ANALYZE = 15
 MIN_TOTAL_LIQUIDITY_USD = 2000000
 MIN_IMBALANCE_RATIO = 3.0
 MAX_PORTFOLIO_SIZE = 1
-MIN_RR_RATIO = 1.5
-SL_ATR_MULTIPLIER = 2.0
+
+# --- Новые параметры для SL/TP ---
+TP_PERCENT = 0.0015  # 0.15%
+SL_PERCENT = 0.0010  # 0.10%
+# RR ~1.5:1
+
+# --- Старые параметры (больше не используются) ---
+# MIN_RR_RATIO = 1.5
+# SL_ATR_MULTIPLIER = 2.0
+# ATR_CALCULATION_TIMEOUT = 10.0
+# ATR_PERIOD = 14
+
 COUNTER_ORDER_RATIO = 1.25
-ATR_CALCULATION_TIMEOUT = 10.0
-ATR_PERIOD = 14
 
 async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     active_signals = state.get('monitored_signals')
@@ -30,9 +39,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
         ticker = await exchange.fetch_ticker(signal['pair'])
         current_price = ticker.get('last')
 
-        # --- ДИАГНОСТИЧЕСКАЯ СТРОКА ---
-        print(f"MONITORING_PRICE_CHECK: Bot received price {current_price} at {pd.Timestamp.now(tz='UTC')}")
-        # --- КОНЕЦ ДИАГНОСТИЧЕСКОЙ СТРОКИ ---
+        # print(f"MONITORING_PRICE_CHECK: Bot received price {current_price} at {pd.Timestamp.now(tz='UTC')}")
 
         if not current_price:
             print(f"Monitor Price Error: 'last' price was not received for {signal['pair']}.")
@@ -79,24 +86,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
         print(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
         await broadcast_func(app, error_message)
 
-async def get_entry_atr(exchange, pair):
-    try:
-        ohlcv = await exchange.fetch_ohlcv(pair, TIMEFRAME, limit=ATR_PERIOD * 2)
-        if not ohlcv or len(ohlcv) < ATR_PERIOD:
-            return 0
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = pd.to_numeric(df[col])
-        high_low = df['high'] - df['low']
-        high_prev_close = (df['high'] - df['close'].shift()).abs()
-        low_prev_close = (df['low'] - df['close'].shift()).abs()
-        tr = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
-        atr = tr.ewm(alpha=1/ATR_PERIOD, adjust=False).mean()
-        atr_value = atr.iloc[-1]
-        return atr_value if not pd.isna(atr_value) and atr_value > 0 else 0
-    except Exception as e:
-        print(f"ATR Calculation Error: {e}", exc_info=True)
-        return 0
+# Функция get_entry_atr() больше не нужна и удалена
 
 async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     try:
@@ -146,24 +136,21 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
             await broadcast_func(app, f"⚠️ Не удалось получить текущую цену для {PAIR_TO_SCAN}. Сделка пропущена.")
             return
         
-        entry_atr = await asyncio.wait_for(get_entry_atr(exchange, PAIR_TO_SCAN), timeout=ATR_CALCULATION_TIMEOUT)
-
-        if entry_atr == 0:
-            await broadcast_func(app, "⚠️ Не удалось рассчитать ATR. Сделка пропущена.")
-            return
-        
-        trade_plan['strategy_idea'] = "Pure Quant Entry (ATR)"
+        # --- НОВЫЙ РАСЧЕТ SL/TP ---
+        trade_plan['strategy_idea'] = "Pure Quant Entry (Fixed %)"
         trade_plan['entry_price'] = current_price
         if dominant_side_is_bids:
             trade_plan['side'] = "LONG"
-            trade_plan['sl_price'] = current_price - (entry_atr * SL_ATR_MULTIPLIER)
-            trade_plan['tp_price'] = current_price + (entry_atr * SL_ATR_MULTIPLIER * MIN_RR_RATIO)
-        else:
+            trade_plan['sl_price'] = current_price * (1 - SL_PERCENT)
+            trade_plan['tp_price'] = current_price * (1 + TP_PERCENT)
+        else: # dominant_side_is_sellers
             trade_plan['side'] = "SHORT"
-            trade_plan['sl_price'] = current_price + (entry_atr * SL_ATR_MULTIPLIER)
-            trade_plan['tp_price'] = current_price - (entry_atr * SL_ATR_MULTIPLIER * MIN_RR_RATIO)
+            trade_plan['sl_price'] = current_price * (1 + SL_PERCENT)
+            trade_plan['tp_price'] = current_price * (1 - TP_PERCENT)
+        # --- КОНЕЦ НОВОГО РАСЧЕТА ---
 
         decision = {
+            "signal_id": f"signal_{int(time.time() * 1000)}",
             "confidence_score": 10,
             "reason": f"Дисбаланс {imbalance_ratio:.1f}x в пользу {dominant_side}",
             "algorithm_type": "Imbalance",
@@ -173,27 +160,38 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         if largest_order:
             decision['trigger_order_usd'] = largest_order['value_usd']
         
+        # entry_atr больше нет, передаем 0
+        entry_atr = 0 
+        
         msg = (f"<b>ВХОД В СДЕЛКУ</b>\n\n"
                f"<b>Тип:</b> {decision['strategy_idea']}\n"
-               f"<b>Рассчитанный план (RR ~{MIN_RR_RATIO:.1f}:1):</b>\n"
+               f"<b>Рассчитанный план (RR ~1.5:1):</b>\n"
                f" - Вход (<b>{decision['side']}</b>): <code>{decision['entry_price']:.2f}</code>\n"
                f" - SL: <code>{decision['sl_price']:.2f}</code>\n"
                f" - TP: <code>{decision['tp_price']:.2f}</code>")
         await broadcast_func(app, msg)
 
-        success = await log_trade_to_sheet(trade_log_ws, decision, entry_atr, state, save_state_func)
-        if success:
-            await broadcast_func(app, "✅ Виртуальная сделка успешно залогирована и взята на мониторинг.")
+        # Логика сохранения сделки (сначала локально, потом в GSheets)
+        state['monitored_signals'].append(decision)
+        save_state_func()
+        await broadcast_func(app, "✅ Сделка взята на мониторинг (сохранено локально).")
 
-    except asyncio.TimeoutError:
-        await broadcast_func(app, "⚠️ Не удалось рассчитать ATR (превышен таймаут). Сделка пропущена.")
+        try:
+            success = await log_trade_to_sheet(trade_log_ws, decision, entry_atr) 
+            if success:
+                await broadcast_func(app, "✅ ...и успешно залогирована в Google Sheets.")
+            else:
+                await broadcast_func(app, "⚠️ Не удалось сохранить сделку в Google Sheets (ошибка записи).")
+        except Exception as e:
+            print(f"Google Sheets logging failed: {e}", exc_info=True)
+            await broadcast_func(app, f"⚠️ Ошибка при записи в Google Sheets: {e}")
+
     except Exception as e:
         print(f"Error processing new opportunity: {e}", exc_info=True)
         await broadcast_func(app, "Произошла внутренняя ошибка при обработке сигнала.")
 
-
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    print("Main Engine loop started (v35.1_price_check).")
+    print("Main Engine loop started (v37.0_fixed_percent).")
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
     scan_interval = 15
     
