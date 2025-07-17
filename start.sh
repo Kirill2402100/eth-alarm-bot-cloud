@@ -1,1 +1,1 @@
-ls -R
+python3 main.py
