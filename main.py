@@ -193,7 +193,7 @@ async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func
             trade_plan['strategy_idea'] = "Short from Resistance"
 
         decision.update(trade_plan)
-        decision['pair'] = PAR_TO_SCAN
+        decision['pair'] = PAIR_TO_SCAN
 
         msg = (f"<b>🔥 НОВЫЙ СИГНАЛ (Оценка: {confidence}/10)</b>\n\n"
                f"<b>Инструмент:</b> <code>{PAIR_TO_SCAN}</code>\n"
