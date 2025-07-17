@@ -126,7 +126,6 @@ async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     load_state()
     setup_sheets()
-    trade_executor.init_executor(state, save_state)
     
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.chat_ids = set(CHAT_IDS)
