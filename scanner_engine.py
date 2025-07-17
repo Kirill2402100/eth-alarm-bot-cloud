@@ -1,10 +1,7 @@
-# File: scanner_engine.py (v33.2 - Fix & UI Update)
+# File: scanner_engine.py (v33.3 - Timeout Fix)
 # Changelog 17-Jul-2025 (Europe/Belgrade):
-# • Исправлена критическая ошибка, из-за которой бот не входил в сделку после
-#   обнаружения АЛГО-СИГНАЛА.
-# • Удалены преждевременные выходы из функции scan_for_new_opportunities.
-# • Добавлено логирование и уведомление при ошибке получения цены.
-# • Обновлен формат сообщения "АЛГО-СИГНАЛ" для лучшей читаемости.
+# • Добавлен таймаут для функции расчета ATR, чтобы избежать "зависания"
+#   при долгом ответе от биржи.
 
 import asyncio
 import pandas as pd
@@ -23,6 +20,7 @@ MAX_PORTFOLIO_SIZE = 1
 MIN_RR_RATIO = 1.5
 SL_ATR_MULTIPLIER = 2.0
 COUNTER_ORDER_RATIO = 1.25
+ATR_CALCULATION_TIMEOUT = 10.0 # Таймаут для расчета ATR в секундах
 
 async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     active_signals = state.get('monitored_signals')
@@ -104,7 +102,6 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
     total_bids_usd = sum(b['value_usd'] for b in top_bids)
     total_asks_usd = sum(a['value_usd'] for a in top_asks)
 
-    # --- ФИЛЬТР ---
     if (total_bids_usd + total_asks_usd) < MIN_TOTAL_LIQUIDITY_USD: 
         return
     
@@ -118,12 +115,10 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
     if imbalance_ratio < MIN_IMBALANCE_RATIO:
         return
 
-    # --- ЕСЛИ ФИЛЬТР ПРОЙДЕН, ВЫПОЛНЯЕМ ВСЮ ЛОГИКУ ДО КОНЦА ---
     dominant_side = "ПОКУПАТЕЛЕЙ" if dominant_side_is_bids else "ПРОДАВЦОВ"
     largest_order = (top_bids[0] if top_bids else None) if dominant_side_is_bids else (top_asks[0] if top_asks else None)
     expected_direction = "ВВЕРХ" if dominant_side_is_bids else "ВНИЗ"
     
-    # Формируем новое сообщение о сигнале
     signal_msg = f"🔥 <b>АЛГО-СИГНАЛ!</b>\n"
     signal_msg += f"Сильный перевес на стороне {dominant_side} (дисбаланс {imbalance_ratio:.1f}x).\n"
     if largest_order:
@@ -139,15 +134,22 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         ticker = await exchange.fetch_ticker(PAIR_TO_SCAN)
         current_price = ticker.get('last')
         
-        # ИСПРАВЛЕНИЕ: Проверяем, получили ли мы цену, и сообщаем, если нет
         if not current_price:
             await broadcast_func(app, f"⚠️ Не удалось получить текущую цену для {PAIR_TO_SCAN}. Сделка пропущена.")
             print(f"Price Error: Could not fetch 'last' price for {PAIR_TO_SCAN}.")
             return
         
-        entry_atr = await get_entry_atr(exchange, PAIR_TO_SCAN)
+        # ИСПРАВЛЕНИЕ: Оборачиваем вызов ATR в таймаут
+        entry_atr = 0
+        try:
+            entry_atr = await asyncio.wait_for(get_entry_atr(exchange, PAIR_TO_SCAN), timeout=ATR_CALCULATION_TIMEOUT)
+        except asyncio.TimeoutError:
+            print("ATR Error: Calculation timed out.")
+            await broadcast_func(app, "⚠️ Не удалось рассчитать ATR (превышен таймаут). Сделка пропущена.")
+            return
+
         if entry_atr == 0:
-            await broadcast_func(app, "⚠️ Не удалось рассчитать ATR. Сделка пропущена.")
+            await broadcast_func(app, "⚠️ Не удалось рассчитать ATR (данные не получены). Сделка пропущена.")
             return
         
         trade_plan['strategy_idea'] = "Pure Quant Entry (ATR)"
@@ -189,7 +191,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
 
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    print("Main Engine loop started (v33.2_fix_and_ui_update).")
+    print("Main Engine loop started (v33.3_timeout_fix).")
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
     scan_interval = 15
     
