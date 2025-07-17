@@ -1,8 +1,8 @@
-# File: scanner_engine.py (v27 - Detailed Signal)
+# File: scanner_engine.py (v28 - Hybrid Entry)
 # Changelog 17-Jul-2025 (Europe/Belgrade):
-# • Добавлена подробная информация в первичное сообщение об аномалии.
-# • Бот теперь указывает ключевой ордер и ожидаемое направление перед отправкой в LLM.
-# • Версия движка обновлена для отражения новой функциональности.
+# • Внедрена гибридная модель входа: по уровням и по импульсу.
+# • Добавлен новый тип входа "Momentum Entry" на основе ATR, если LLM не дает четких уровней.
+# • Добавлен новый параметр конфигурации SL_ATR_MULTIPLIER.
 
 import asyncio
 import json
@@ -26,6 +26,7 @@ MIN_IMBALANCE_RATIO = 3.0
 MAX_PORTFOLIO_SIZE = 1
 MIN_CONFIDENCE_SCORE = 6
 MIN_RR_RATIO = 1.5
+SL_ATR_MULTIPLIER = 2.0         # <--- НОВЫЙ ПАРАМЕТР: Множитель ATR для стоп-лосса
 ENTRY_OFFSET_PERCENT = 0.0005
 SL_OFFSET_PERCENT = 0.0010
 LLM_COOLDOWN_SECONDS = 180
@@ -40,18 +41,25 @@ LLM_PROMPT_MICROSTRUCTURE = """
 **КЛЮЧЕВЫЕ ПРИНЦИПЫ АНАЛИЗА:**
 1.  **Доверяй дисбалансу:** Сильный односторонний перевес ликвидности — это сам по себе мощный сигнал. Не считай его автоматически спуфингом только потому, что на другой стороне стакана пусто. Отсутствие сопротивления — это тоже признак слабости противоположной стороны.
 2.  **Оценивай реалистичность:** Задавай себе вопрос: "Похоже ли это на реальную попытку удержать уровень или это просто одинокая, подозрительная заявка далеко от цены?".
-3.  **Будь решительным:** Если видишь явную стену ликвидности, которая может служить поддержкой или сопротивлением, присваивай высокий `confidence_score`.
+3.  **Будь решительным:** Если видишь явную стену ликвидности, которая может служить поддержкой или сопротивлением, присваивай высокий `confidence_score`. Если четких уровней нет, но давление очевидно, все равно давай высокую оценку и объясняй это в причине.
 
 **ФОРМАТ ОТВЕТА:**
 Верни ТОЛЬКО JSON-объект.
 
-Пример уверенного сетапа (сильный перевес асков):
+Пример входа по уровням:
 {
   "confidence_score": 8,
   "algorithm_type": "Absorption",
-  "reason": "На стороне асков видна плотная стена ликвидности, которая оказывает давление на цену. Биды практически отсутствуют, что подтверждает слабость покупателей. Высокая вероятность движения вниз от этого уровня.",
+  "reason": "На стороне асков видна плотная стена ликвидности, которая оказывает давление на цену. Биды практически отсутствуют. Высокая вероятность движения вниз от этого уровня.",
   "key_support_level": 118500.0,
   "key_resistance_level": 119500.0
+}
+
+Пример входа по давлению (без четких уровней):
+{
+  "confidence_score": 7,
+  "algorithm_type": "Pressure",
+  "reason": "Четких уровней нет, но на стороне асков наблюдается постоянное давление множества средних ордеров. Это говорит о силе продавцов. Рекомендую вход по рынку."
 }
 """
 async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
@@ -123,6 +131,7 @@ async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func
         return
 
     imbalance_ratio = 0
+    dominant_side_is_bids = total_bids_usd > total_asks_usd
     if total_bids_usd > 0 and total_asks_usd > 0:
         imbalance_ratio = max(total_bids_usd / total_asks_usd, total_asks_usd / total_bids_usd)
     elif total_bids_usd > 0 or total_asks_usd > 0:
@@ -135,35 +144,20 @@ async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func
     state.setdefault('llm_cooldown', {})[PAIR_TO_SCAN] = time.time()
     save_state_func()
 
-    # --- НОВЫЙ БЛОК: ФОРМИРОВАНИЕ ДЕТАЛЬНОГО СООБЩЕНИЯ ---
-    dominant_side = ""
-    largest_order = None
-    direction_text = ""
-    if total_bids_usd > total_asks_usd:
-        dominant_side = "ПОКУПАТЕЛЕЙ"
-        largest_order = top_bids[0] if top_bids else None
-        direction_text = "вероятно движение ВВЕРХ"
-    else:
-        dominant_side = "ПРОДАВЦОВ"
-        largest_order = top_asks[0] if top_asks else None
-        direction_text = "вероятно движение ВНИЗ"
+    dominant_side = "ПОКУПАТЕЛЕЙ" if dominant_side_is_bids else "ПРОДАВЦОВ"
+    largest_order = (top_bids[0] if top_bids else None) if dominant_side_is_bids else (top_asks[0] if top_asks else None)
+    direction_text = "вероятно движение ВВЕРХ" if dominant_side_is_bids else "вероятно движение ВНИЗ"
 
     if largest_order:
-        order_value_mln = largest_order['value_usd'] / 1_000_000
-        order_price = largest_order['price']
-        
-        detailed_msg = (
-            f"🧠 **Обнаружена аномалия!**\n\n"
-            f"Сильный перевес на стороне {dominant_side} (дисбаланс {imbalance_ratio:.1f}x).\n"
-            f"Ключевой ордер: <code>${order_value_mln:.2f} млн</code> на уровне <code>{order_price}</code>.\n"
-            f"Ожидание: {direction_text}.\n\n"
-            f"Отправляю на глубокий анализ в LLM..."
-        )
+        detailed_msg = (f"🧠 **Обнаружена аномалия!**\n\n"
+                        f"Сильный перевес на стороне {dominant_side} (дисбаланс {imbalance_ratio:.1f}x).\n"
+                        f"Ключевой ордер: <code>${largest_order['value_usd']/1e6:.2f} млн</code> на уровне <code>{largest_order['price']}</code>.\n"
+                        f"Ожидание: {direction_text}.\n\n"
+                        f"Отправляю на глубокий анализ в LLM...")
     else:
         detailed_msg = f"🧠 Сканер нашел **качественную аномалию** (дисбаланс {imbalance_ratio:.1f}x). Отправляю на анализ LLM..."
     
     await broadcast_func(app, detailed_msg)
-    # --- КОНЕЦ НОВОГО БЛОКА ---
 
     focused_data = {PAIR_TO_SCAN: {'bids': top_bids, 'asks': top_asks}}
     prompt_data = json.dumps(focused_data, indent=2)
@@ -180,44 +174,55 @@ async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func
         reason = decision.get("reason", "Причина не указана.")
 
         if confidence < MIN_CONFIDENCE_SCORE:
-            msg = (f"🧐 <b>СИГНАЛ ОТКЛОНЕН LLM (Оценка: {confidence}/10)</b>\n\n"
-                   f"<b>Причина:</b> <i>\"{reason}\"</i>")
-            await broadcast_func(app, msg)
+            await broadcast_func(app, f"🧐 <b>СИГНАЛ ОТКЛОНЕН LLM (Оценка: {confidence}/10)</b>\n\n<b>Причина:</b> <i>\"{reason}\"</i>")
             return
 
-        support = decision.get("key_support_level")
-        resistance = decision.get("key_resistance_level")
-        if not all(isinstance(v, (int, float)) for v in [support, resistance]):
-            await broadcast_func(app, f"⚠️ LLM вернул уверенный сигнал, но без корректных уровней. Причина: {reason}")
-            return
-
+        # --- ГИБРИДНАЯ ЛОГИКА ПОСТРОЕНИЯ ПЛАНА ---
+        trade_plan = {}
         ticker = await exchange.fetch_ticker(PAIR_TO_SCAN)
         current_price = ticker.get('last')
         if not current_price: return
+        
+        support = decision.get("key_support_level")
+        resistance = decision.get("key_resistance_level")
+        levels_are_valid = support and resistance and isinstance(support, (int, float)) and isinstance(resistance, (int, float))
 
-        dist_to_support = abs(current_price - support)
-        dist_to_resistance = abs(current_price - resistance)
-        trade_plan = {}
-        if dist_to_support < dist_to_resistance:
-            trade_plan['side'] = "LONG"
-            trade_plan['entry_price'] = support * (1 + ENTRY_OFFSET_PERCENT)
-            trade_plan['sl_price'] = support * (1 - SL_OFFSET_PERCENT)
-            risk = trade_plan['entry_price'] - trade_plan['sl_price']
-            trade_plan['tp_price'] = trade_plan['entry_price'] + risk * MIN_RR_RATIO
-            trade_plan['strategy_idea'] = "Long from Support"
+        if levels_are_valid:
+            # РЕЖИМ 1: Вход по уровням
+            trade_plan['strategy_idea'] = "Level-based Entry"
+            if abs(current_price - support) < abs(current_price - resistance):
+                trade_plan['side'] = "LONG"
+                trade_plan['entry_price'] = support * (1 + ENTRY_OFFSET_PERCENT)
+                trade_plan['sl_price'] = support * (1 - SL_OFFSET_PERCENT)
+            else:
+                trade_plan['side'] = "SHORT"
+                trade_plan['entry_price'] = resistance * (1 - ENTRY_OFFSET_PERCENT)
+                trade_plan['sl_price'] = resistance * (1 + SL_OFFSET_PERCENT)
+            risk = abs(trade_plan['entry_price'] - trade_plan['sl_price'])
+            trade_plan['tp_price'] = trade_plan['entry_price'] + risk * MIN_RR_RATIO if trade_plan['side'] == 'LONG' else trade_plan['entry_price'] - risk * MIN_RR_RATIO
         else:
-            trade_plan['side'] = "SHORT"
-            trade_plan['entry_price'] = resistance * (1 - ENTRY_OFFSET_PERCENT)
-            trade_plan['sl_price'] = resistance * (1 + SL_OFFSET_PERCENT)
-            risk = trade_plan['sl_price'] - trade_plan['entry_price']
-            trade_plan['tp_price'] = trade_plan['entry_price'] - risk * MIN_RR_RATIO
-            trade_plan['strategy_idea'] = "Short from Resistance"
+            # РЕЖИМ 2: Вход по давлению (ATR)
+            trade_plan['strategy_idea'] = "Momentum Entry (ATR)"
+            entry_atr = await get_entry_atr(exchange, PAIR_TO_SCAN)
+            if entry_atr == 0:
+                await broadcast_func(app, "⚠️ Не удалось рассчитать ATR для Momentum-входа. Сделка пропущена.")
+                return
+            
+            trade_plan['entry_price'] = current_price
+            if dominant_side_is_bids: # Если давление покупателей, входим в LONG
+                trade_plan['side'] = "LONG"
+                trade_plan['sl_price'] = current_price - (entry_atr * SL_ATR_MULTIPLIER)
+                trade_plan['tp_price'] = current_price + (entry_atr * SL_ATR_MULTIPLIER * MIN_RR_RATIO)
+            else: # Если давление продавцов, входим в SHORT
+                trade_plan['side'] = "SHORT"
+                trade_plan['sl_price'] = current_price + (entry_atr * SL_ATR_MULTIPLIER)
+                trade_plan['tp_price'] = current_price - (entry_atr * SL_ATR_MULTIPLIER * MIN_RR_RATIO)
 
         decision.update(trade_plan)
         decision['pair'] = PAIR_TO_SCAN
         msg = (f"<b>🔥 НОВЫЙ СИГНАЛ (Оценка: {confidence}/10)</b>\n\n"
+               f"<b>Тип входа:</b> {decision['strategy_idea']}\n"
                f"<b>Инструмент:</b> <code>{PAIR_TO_SCAN}</code>\n"
-               f"<b>Стратегия:</b> {decision['strategy_idea']}\n"
                f"<b>Алгоритм в стакане:</b> <i>{decision.get('algorithm_type', 'N/A')}</i>\n"
                f"<b>Рассчитанный план (RR ~{MIN_RR_RATIO:.1f}:1):</b>\n"
                f"  - Вход: <code>{decision['entry_price']:.2f}</code>\n"
@@ -226,8 +231,8 @@ async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func
                f"<b>Обоснование LLM:</b> <i>\"{reason}\"</i>")
         await broadcast_func(app, msg)
 
-        entry_atr = await get_entry_atr(exchange, PAIR_TO_SCAN)
-        success = await log_trade_to_sheet(trade_log_ws, decision, entry_atr, state, save_state_func)
+        final_entry_atr = await get_entry_atr(exchange, PAIR_TO_SCAN) # Получаем свежий ATR
+        success = await log_trade_to_sheet(trade_log_ws, decision, final_entry_atr, state, save_state_func)
         if success:
             await broadcast_func(app, "✅ Виртуальная сделка успешно залогирована и взята на мониторинг.")
 
@@ -238,7 +243,7 @@ async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func
         print(f"Error processing new opportunity: {e}", exc_info=True)
 
 async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, state, save_state_func):
-    print("Main Engine loop started (v27_detailed_signal).")
+    print("Main Engine loop started (v28_hybrid_entry).")
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
     while state.get("bot_on", True):
         try:
