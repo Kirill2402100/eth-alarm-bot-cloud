@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v7.1.0 - LLM Call Fix
+# v8.0.0 - Pure Quant Model (No LLM)
 # Changelog 17-Jul-2025 (Europe/Belgrade):
-# • Исправлена функция ask_llm: убран параметр response_format для соответствия
-#   текстовому промпту. Это должно решить проблему пустых ответов от LLM.
+# • Полный отказ от LLM в пользу 100% алгоритмической модели.
+# • Удалена функция ask_llm и все связанные с ней зависимости.
 # ============================================================================
 
 import os
@@ -13,7 +13,6 @@ import logging
 from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 import gspread
-import aiohttp
 from oauth2client.service_account import ServiceAccountCredentials
 
 # --- Импортируем наши модули ---
@@ -21,13 +20,10 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION       = "7.1.0"
+BOT_VERSION       = "8.0.0 (Pure Quant)"
 BOT_TOKEN         = os.getenv("BOT_TOKEN")
 CHAT_IDS          = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID          = os.getenv("SHEET_ID")
-LLM_API_KEY       = os.getenv("LLM_API_KEY")
-LLM_API_URL       = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
-LLM_MODEL_ID      = os.getenv("LLM_MODEL_ID", "gpt-4o-mini")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
@@ -77,7 +73,6 @@ def load_state():
         except json.JSONDecodeError: state = {}
     state.setdefault("bot_on", False)
     state.setdefault("monitored_signals", [])
-    state.setdefault("llm_cooldown", {})
     log.info("State loaded. Active signals: %d", len(state.get("monitored_signals", [])))
 
 def save_state():
@@ -92,30 +87,6 @@ async def broadcast(app, txt:str):
         except Exception as e:
             log.error("Send fail %s: %s", cid, e)
 
-# === ИСПРАВЛЕННАЯ ФУНКЦИЯ ВЫЗОВА LLM =======================================
-async def ask_llm(prompt: str):
-    if not LLM_API_KEY: return None
-    
-    # УБРАН ПАРАМЕТР "response_format", ТАК КАК МЫ ЖДЕМ ТЕКСТ
-    payload = { 
-        "model": LLM_MODEL_ID, 
-        "messages": [{"role":"user", "content":prompt}], 
-        "temperature": 0.4
-    }
-    hdrs = {"Authorization":f"Bearer {LLM_API_KEY}","Content-Type":"application/json"}
-    
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(LLM_API_URL, json=payload, headers=hdrs, timeout=180) as r:
-                r.raise_for_status()
-                data = await r.json()
-                # Возвращаем текстовое содержимое ответа
-                return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        log.error("LLM API request failed: %s", e, exc_info=True)
-        log.error(f"LLM PROMPT THAT CAUSED ERROR:\n{prompt}")
-        return None
-
 # === Команды Telegram ============================================
 async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
@@ -123,7 +94,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
         ctx.application.chat_ids.add(cid)
     state["bot_on"] = True
     save_state()
-    await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} (BTC-only) запущен.</b>\n"
+    await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} запущен.</b>\n"
                                       "Используйте /run для запуска основного цикла.", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -149,8 +120,8 @@ async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
     else:
         if not state.get("bot_on", False):
             state["bot_on"] = True
-        await update.message.reply_text("🚀 Запускаю основной цикл (сканер + монитор)...")
-        app._main_loop_task = asyncio.create_task(scanner_main_loop(app, ask_llm, broadcast, TRADE_LOG_WS, state, save_state))
+        await update.message.reply_text("🚀 Запускаю основной цикл (100% алгоритмический сканер)...")
+        app._main_loop_task = asyncio.create_task(scanner_main_loop(app, broadcast, TRADE_LOG_WS, state, save_state))
 
 if __name__ == "__main__":
     load_state()
@@ -165,5 +136,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("run", cmd_run))
     
-    log.info(f"Bot v{BOT_VERSION} (BTC-only, Text-LLM Engine) started polling.")
+    log.info(f"Bot v{BOT_VERSION} started polling.")
     app.run_polling()
