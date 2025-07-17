@@ -1,8 +1,8 @@
-# File: scanner_engine.py (v28 - Hybrid Entry)
+# File: scanner_engine.py (v29 - Robust ATR)
 # Changelog 17-Jul-2025 (Europe/Belgrade):
-# • Внедрена гибридная модель входа: по уровням и по импульсу.
-# • Добавлен новый тип входа "Momentum Entry" на основе ATR, если LLM не дает четких уровней.
-# • Добавлен новый параметр конфигурации SL_ATR_MULTIPLIER.
+# • Функция get_entry_atr полностью переработана для повышения надежности.
+# • Добавлено детальное логирование ошибок и валидация данных при расчете ATR.
+# • Устранена причина сбоя при расчете ATR для Momentum-входа.
 
 import asyncio
 import json
@@ -17,16 +17,12 @@ PAIR_TO_SCAN = 'BTC/USDT'
 TIMEFRAME = '15m'
 LARGE_ORDER_USD = 500000
 TOP_N_ORDERS_TO_ANALYZE = 15
-
-# --- Параметры предварительного фильтра ---
 MIN_TOTAL_LIQUIDITY_USD = 2000000
 MIN_IMBALANCE_RATIO = 3.0
-
-# --- Параметры торговой стратегии ---
 MAX_PORTFOLIO_SIZE = 1
 MIN_CONFIDENCE_SCORE = 6
 MIN_RR_RATIO = 1.5
-SL_ATR_MULTIPLIER = 2.0         # <--- НОВЫЙ ПАРАМЕТР: Множитель ATR для стоп-лосса
+SL_ATR_MULTIPLIER = 2.0
 ENTRY_OFFSET_PERCENT = 0.0005
 SL_OFFSET_PERCENT = 0.0010
 LLM_COOLDOWN_SECONDS = 180
@@ -45,22 +41,6 @@ LLM_PROMPT_MICROSTRUCTURE = """
 
 **ФОРМАТ ОТВЕТА:**
 Верни ТОЛЬКО JSON-объект.
-
-Пример входа по уровням:
-{
-  "confidence_score": 8,
-  "algorithm_type": "Absorption",
-  "reason": "На стороне асков видна плотная стена ликвидности, которая оказывает давление на цену. Биды практически отсутствуют. Высокая вероятность движения вниз от этого уровня.",
-  "key_support_level": 118500.0,
-  "key_resistance_level": 119500.0
-}
-
-Пример входа по давлению (без четких уровней):
-{
-  "confidence_score": 7,
-  "algorithm_type": "Pressure",
-  "reason": "Четких уровней нет, но на стороне асков наблюдается постоянное давление множества средних ордеров. Это говорит о силе продавцов. Рекомендую вход по рынку."
-}
 """
 async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     active_signals = state.get('monitored_signals')
@@ -97,14 +77,49 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
         save_state_func()
         print(f"Trade {signal['signal_id']} closed. Portfolio is now empty.")
 
+# === НОВАЯ НАДЕЖНАЯ ФУНКЦИЯ РАСЧЕТА ATR =================================
 async def get_entry_atr(exchange, pair):
+    """
+    Надежно рассчитывает ATR, обрабатывая ошибки API и данных.
+    """
     try:
+        # 1. Запрашиваем исторические данные
         ohlcv = await exchange.fetch_ohlcv(pair, TIMEFRAME, limit=20)
+
+        # 2. Проверяем, что данные получены и их достаточно
+        if not ohlcv or len(ohlcv) < 15:
+            print(f"ATR Error: Not enough OHLCV data received for {pair}. Got: {len(ohlcv) if ohlcv else 0} candles.")
+            return 0
+
+        # 3. Создаем DataFrame
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        
+        # 4. Убеждаемся, что числовые колонки имеют правильный тип
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col])
+
+        # 5. Рассчитываем ATR
         df.ta.atr(length=14, append=True)
+        
+        # 6. Извлекаем последнее значение ATR и проверяем его
         atr_value = df.iloc[-1]['ATR_14']
-        return atr_value if pd.notna(atr_value) else 0
-    except Exception: return 0
+        
+        if pd.isna(atr_value):
+            print(f"ATR Error: ATR calculation resulted in NaN for {pair}.")
+            return 0
+            
+        return atr_value
+
+    except ccxt.NetworkError as e:
+        print(f"ATR Error: Network issue while fetching OHLCV for {pair}. Details: {e}")
+        return 0
+    except ccxt.ExchangeError as e:
+        print(f"ATR Error: Exchange returned an error for {pair}. Details: {e}")
+        return 0
+    except Exception as e:
+        # Ловим все остальные неожиданные ошибки
+        print(f"ATR Error: An unexpected error occurred in get_entry_atr for {pair}. Details: {e}", exc_info=True)
+        return 0
 
 async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func, trade_log_ws, state, save_state_func):
     current_time = time.time()
@@ -127,7 +142,8 @@ async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func
     total_asks_usd = sum(a['value_usd'] for a in top_asks)
 
     if (total_bids_usd + total_asks_usd) < MIN_TOTAL_LIQUIDITY_USD:
-        print(f"Pre-filter: Low liquidity (${total_bids_usd/1e6:.1f}M / ${total_asks_usd/1e6:.1f}M). Skipped.")
+        # This print is for our internal logs, not for Telegram
+        # print(f"Pre-filter: Low liquidity (${total_bids_usd/1e6:.1f}M / ${total_asks_usd/1e6:.1f}M). Skipped.")
         return
 
     imbalance_ratio = 0
@@ -138,7 +154,8 @@ async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func
         imbalance_ratio = float('inf')
 
     if imbalance_ratio < MIN_IMBALANCE_RATIO:
-        print(f"Pre-filter: Weak imbalance (ratio: {imbalance_ratio:.2f}, threshold: {MIN_IMBALANCE_RATIO:.2f}). Skipped.")
+        # This print is for our internal logs, not for Telegram
+        # print(f"Pre-filter: Weak imbalance (ratio: {imbalance_ratio:.2f}, threshold: {MIN_IMBALANCE_RATIO:.2f}). Skipped.")
         return
 
     state.setdefault('llm_cooldown', {})[PAIR_TO_SCAN] = time.time()
@@ -177,7 +194,6 @@ async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func
             await broadcast_func(app, f"🧐 <b>СИГНАЛ ОТКЛОНЕН LLM (Оценка: {confidence}/10)</b>\n\n<b>Причина:</b> <i>\"{reason}\"</i>")
             return
 
-        # --- ГИБРИДНАЯ ЛОГИКА ПОСТРОЕНИЯ ПЛАНА ---
         trade_plan = {}
         ticker = await exchange.fetch_ticker(PAIR_TO_SCAN)
         current_price = ticker.get('last')
@@ -188,7 +204,6 @@ async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func
         levels_are_valid = support and resistance and isinstance(support, (int, float)) and isinstance(resistance, (int, float))
 
         if levels_are_valid:
-            # РЕЖИМ 1: Вход по уровням
             trade_plan['strategy_idea'] = "Level-based Entry"
             if abs(current_price - support) < abs(current_price - resistance):
                 trade_plan['side'] = "LONG"
@@ -201,7 +216,6 @@ async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func
             risk = abs(trade_plan['entry_price'] - trade_plan['sl_price'])
             trade_plan['tp_price'] = trade_plan['entry_price'] + risk * MIN_RR_RATIO if trade_plan['side'] == 'LONG' else trade_plan['entry_price'] - risk * MIN_RR_RATIO
         else:
-            # РЕЖИМ 2: Вход по давлению (ATR)
             trade_plan['strategy_idea'] = "Momentum Entry (ATR)"
             entry_atr = await get_entry_atr(exchange, PAIR_TO_SCAN)
             if entry_atr == 0:
@@ -209,11 +223,11 @@ async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func
                 return
             
             trade_plan['entry_price'] = current_price
-            if dominant_side_is_bids: # Если давление покупателей, входим в LONG
+            if dominant_side_is_bids:
                 trade_plan['side'] = "LONG"
                 trade_plan['sl_price'] = current_price - (entry_atr * SL_ATR_MULTIPLIER)
                 trade_plan['tp_price'] = current_price + (entry_atr * SL_ATR_MULTIPLIER * MIN_RR_RATIO)
-            else: # Если давление продавцов, входим в SHORT
+            else:
                 trade_plan['side'] = "SHORT"
                 trade_plan['sl_price'] = current_price + (entry_atr * SL_ATR_MULTIPLIER)
                 trade_plan['tp_price'] = current_price - (entry_atr * SL_ATR_MULTIPLIER * MIN_RR_RATIO)
@@ -231,7 +245,7 @@ async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func
                f"<b>Обоснование LLM:</b> <i>\"{reason}\"</i>")
         await broadcast_func(app, msg)
 
-        final_entry_atr = await get_entry_atr(exchange, PAIR_TO_SCAN) # Получаем свежий ATR
+        final_entry_atr = await get_entry_atr(exchange, PAIR_TO_SCAN)
         success = await log_trade_to_sheet(trade_log_ws, decision, final_entry_atr, state, save_state_func)
         if success:
             await broadcast_func(app, "✅ Виртуальная сделка успешно залогирована и взята на мониторинг.")
@@ -243,7 +257,7 @@ async def scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func
         print(f"Error processing new opportunity: {e}", exc_info=True)
 
 async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, state, save_state_func):
-    print("Main Engine loop started (v28_hybrid_entry).")
+    print("Main Engine loop started (v29_robust_atr).")
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
     while state.get("bot_on", True):
         try:
@@ -251,7 +265,8 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, sta
             await monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func)
             if len(state.get('monitored_signals', [])) < MAX_PORTFOLIO_SIZE:
                 await scan_for_new_opportunities(exchange, app, ask_llm_func, broadcast_func, trade_log_ws, state, save_state_func)
-            print(f"--- Cycle Finished. Sleeping for 30 seconds. ---")
+            # Убрал лишние принты в консоль для чистоты логов
+            # print(f"--- Cycle Finished. Sleeping for 30 seconds. ---")
             await asyncio.sleep(30)
         except asyncio.CancelledError:
             print("Main Engine loop cancelled.")
