@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v9.0.0 - Dynamic Sheets
+# v10.0.0 - Final Cleanup
 # Changelog 18-Jul-2025 (Europe/Belgrade):
-# • Реализовано автоматическое создание нового листа в Google-таблице
-#   для каждой новой версии бота.
+# • Убран устаревший столбец 'LLM_Reason' из конфигурации.
 # ============================================================================
 
 import os
@@ -20,7 +19,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "9.0.0" # Просто меняйте эту версию
+BOT_VERSION        = "10.0.0" 
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -28,16 +27,15 @@ SHEET_ID           = os.getenv("SHEET_ID")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # === Google-Sheets =========================================================
 TRADE_LOG_WS = None
-# НОВАЯ ЛОГИКА: Название листа генерируется из версии бота
 SHEET_NAME   = f"Trading_Log_v{BOT_VERSION}" 
 
+# Обновленный список заголовков
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Confidence_Score", "Algorithm_Type", 
-    "Strategy_Idea", "LLM_Reason", "Entry_Price", "SL_Price", "TP_Price", 
+    "Strategy_Idea", "Entry_Price", "SL_Price", "TP_Price", 
     "Status", "Exit_Time_UTC", "Exit_Price", "Entry_ATR", "PNL_USD", "PNL_Percent",
     "Trigger_Order_USD"
 ]
@@ -67,25 +65,21 @@ def setup_sheets():
     except Exception as e:
         log.error("Sheets init failed: %s", e)
 
-# === Состояние ================================================================
-STATE_FILE = "bot_state.json"
-state = {}
+# (Остальная часть файла main.py без изменений)
+# ...
 def load_state():
     global state
     if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE, 'r') as f:
-                state = json.load(f)
+            with open(STATE_FILE, 'r') as f: state = json.load(f)
         except json.JSONDecodeError: state = {}
     state.setdefault("bot_on", False)
     state.setdefault("monitored_signals", [])
     log.info("State loaded. Active signals: %d", len(state.get("monitored_signals", [])))
 
 def save_state():
-    with open(STATE_FILE,"w") as f:
-        json.dump(state, f, indent=2)
+    with open(STATE_FILE,"w") as f: json.dump(state, f, indent=2)
 
-# === Вспомогательные функции ============================================
 async def broadcast(app, txt:str):
     for cid in getattr(app,"chat_ids", CHAT_IDS):
         try:
@@ -93,7 +87,6 @@ async def broadcast(app, txt:str):
         except Exception as e:
             log.error("Send fail %s: %s", cid, e)
 
-# === Команды Telegram ============================================
 async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     if cid not in ctx.application.chat_ids:
@@ -108,7 +101,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     state["bot_on"] = False
     save_state()
-    await update.message.reply_text("🛑 <b>Бот остановлен.</b> Основной цикл будет остановлен.", parse_mode=constants.ParseMode.HTML)
+    await update.message.reply_text("🛑 <b>Бот остановлен.</b>", parse_mode=constants.ParseMode.HTML)
     if hasattr(ctx.application, '_main_loop_task'):
         ctx.application._main_loop_task.cancel()
 
@@ -124,7 +117,6 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
     app = ctx.application
     is_running = hasattr(app, '_main_loop_task') and not app._main_loop_task.done()
-
     if is_running:
         await update.message.reply_text("ℹ️ Основной цикл уже запущен.")
     else:
@@ -133,17 +125,16 @@ async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🚀 Запускаю основной цикл (v{BOT_VERSION})...")
         app._main_loop_task = asyncio.create_task(scanner_main_loop(app, broadcast, TRADE_LOG_WS, state, save_state))
 
+STATE_FILE = "bot_state.json"
+state = {}
 if __name__ == "__main__":
     load_state()
     setup_sheets()
-    
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.chat_ids = set(CHAT_IDS)
-    
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("run", cmd_run))
-    
     log.info(f"Bot v{BOT_VERSION} started polling. Logging to sheet: {SHEET_NAME}")
     app.run_polling()
