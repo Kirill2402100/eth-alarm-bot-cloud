@@ -1,1 +1,1 @@
-python3 eth_alarm_bot.py
+python3 main.py
