@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v8.0.0 - Pure Quant Model (No LLM)
+# v8.0.1 - Final
 # Changelog 17-Jul-2025 (Europe/Belgrade):
-# • Полный отказ от LLM в пользу 100% алгоритмической модели.
-# • Удалена функция ask_llm и все связанные с ней зависимости.
+# • Исправлена логика очистки Google-таблицы при перезапуске.
+# • Синхронизирован список HEADERS.
+# • Удален неиспользуемый вызов init_executor.
 # ============================================================================
 
 import os
@@ -20,10 +21,10 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION       = "8.0.0 (Pure Quant)"
-BOT_TOKEN         = os.getenv("BOT_TOKEN")
-CHAT_IDS          = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
-SHEET_ID          = os.getenv("SHEET_ID")
+BOT_VERSION        = "8.0.1 (Final)"
+BOT_TOKEN          = os.getenv("BOT_TOKEN")
+CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
+SHEET_ID           = os.getenv("SHEET_ID")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
@@ -33,10 +34,12 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 # === Google-Sheets =========================================================
 TRADE_LOG_WS = None
 SHEET_NAME   = "BTC_Strategy_Log_v1"
+# ИСПРАВЛЕННЫЙ СПИСОК ЗАГОЛОВКОВ
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Confidence_Score", "Algorithm_Type", 
-    "Strategy_Idea", "LLM_Reason", "Entry_Price", "SL_Price", "TP_Price",
-    "Status", "Exit_Time_UTC", "Exit_Price", "Entry_ATR", "PNL_USD", "PNL_Percent"
+    "Strategy_Idea", "LLM_Reason", "Entry_Price", "SL_Price", "TP_Price", 
+    "Status", "Exit_Time_UTC", "Exit_Price", "Entry_ATR", "PNL_USD", "PNL_Percent",
+    "Trigger_Order_USD"
 ]
 
 def setup_sheets():
@@ -52,10 +55,14 @@ def setup_sheets():
             ws = ss.worksheet(SHEET_NAME)
         except gspread.WorksheetNotFound:
             ws = ss.add_worksheet(title=SHEET_NAME, rows="1000", cols=len(HEADERS))
-        if ws.row_values(1) != HEADERS:
+        
+        # ИСПРАВЛЕННАЯ ЛОГИКА ПРОВЕРКИ
+        # Очищаем и форматируем, только если первая строка ПОЛНОСТЬЮ пуста
+        if not ws.row_values(1):
             ws.clear()
             ws.update("A1",[HEADERS])
             ws.format(f"A1:{chr(ord('A')+len(HEADERS)-1)}1",{"textFormat":{"bold":True}})
+
         TRADE_LOG_WS = ws
         log.info("Google-Sheets ready – logging to '%s'.", SHEET_NAME)
     except Exception as e:
@@ -120,12 +127,13 @@ async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
     else:
         if not state.get("bot_on", False):
             state["bot_on"] = True
-        await update.message.reply_text("🚀 Запускаю основной цикл (100% алгоритмический сканер)...")
+        await update.message.reply_text("🚀 Запускаю основной цикл (сканер v39)...")
         app._main_loop_task = asyncio.create_task(scanner_main_loop(app, broadcast, TRADE_LOG_WS, state, save_state))
 
 if __name__ == "__main__":
     load_state()
     setup_sheets()
+    # Удален вызов неиспользуемой функции trade_executor.init_executor()
     
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.chat_ids = set(CHAT_IDS)
