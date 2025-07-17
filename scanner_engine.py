@@ -4,18 +4,28 @@ import ccxt.async_support as ccxt
 from trade_executor import log_trade_to_sheet, update_trade_in_sheet
 import time
 from datetime import datetime, timezone
+import numpy as np
 
-# --- Конфигурация ---
+# === Конфигурация ===
 PAIR_TO_SCAN = 'BTC/USDT'
-LARGE_ORDER_USD = 250000
 TOP_N_ORDERS_TO_ANALYZE = 15
-MIN_TOTAL_LIQUIDITY_USD = 1000000
-MIN_IMBALANCE_RATIO = 2.0
 MAX_PORTFOLIO_SIZE = 1
 TP_PERCENT = 0.0015
 SL_PERCENT = 0.0010
 COUNTER_ORDER_RATIO = 1.25
 
+class DynamicParameters:
+    def __init__(self):
+        self.MIN_TOTAL_LIQUIDITY_USD = 1000000
+        self.MIN_IMBALANCE_RATIO = 2.0
+        self.LARGE_ORDER_USD = 250000
+
+    def update(self, new_params):
+        self.MIN_TOTAL_LIQUIDITY_USD = new_params['MIN_TOTAL_LIQUIDITY_USD']
+        self.MIN_IMBALANCE_RATIO = new_params['MIN_IMBALANCE_RATIO']
+        self.LARGE_ORDER_USD = new_params['LARGE_ORDER_USD']
+
+# (monitor_active_trades без изменений)
 async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     active_signals = state.get('monitored_signals')
     if not active_signals: return
@@ -64,22 +74,71 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
         print(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
         await broadcast_func(app, error_message)
 
-async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
+async def recalculate_parameters_periodically(exchange, params_manager, app, broadcast_func):
+    while True:
+        await asyncio.sleep(3600)
+        await broadcast_func(app, "⏳ Начинаю ежечасную калибровку параметров (5 мин)...")
+        
+        liquidity_samples, imbalance_samples = [], []
+        for _ in range(20):
+            try:
+                order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100)
+                bids = sorted([p * a for p, a in order_book.get('bids', [])], reverse=True)
+                asks = sorted([p * a for p, a in order_book.get('asks', [])], reverse=True)
+                top_bids_usd = sum(bids[:TOP_N_ORDERS_TO_ANALYZE])
+                top_asks_usd = sum(asks[:TOP_N_ORDERS_TO_ANALYZE])
+                
+                liquidity_samples.append(top_bids_usd + top_asks_usd)
+                if top_bids_usd > 0 and top_asks_usd > 0:
+                    imbalance_samples.append(max(top_bids_usd, top_asks_usd) / min(top_bids_usd, top_asks_usd))
+            except Exception as e:
+                print(f"Data collection sample failed: {e}")
+            await asyncio.sleep(15)
+
+        if not liquidity_samples or not imbalance_samples:
+            await broadcast_func(app, "⚠️ Калибровка не удалась: не удалось собрать данные.")
+            continue
+
+        median_liquidity = np.median(liquidity_samples)
+        median_imbalance = np.median(imbalance_samples)
+
+        new_params = {
+            'MIN_TOTAL_LIQUIDITY_USD': int(median_liquidity * 0.8),
+            'MIN_IMBALANCE_RATIO': round(median_imbalance * 1.2, 1),
+            'LARGE_ORDER_USD': int(median_liquidity / 10)
+        }
+        
+        params_manager.update(new_params)
+
+        report_msg = (
+            f"📈 <b>Параметры обновлены (v{app.bot_version})</b>\n\n"
+            f"<b>Ликвидность:</b> <code>${new_params['MIN_TOTAL_LIQUIDITY_USD']:,}</code>\n"
+            f"<b>Дисбаланс:</b> <code>{new_params['MIN_IMBALANCE_RATIO']:.1f}x</code>\n"
+            f"<b>Крупный ордер:</b> <code>${new_params['LARGE_ORDER_USD']:,}</code>"
+        )
+        await broadcast_func(app, report_msg)
+
+async def scan_for_new_opportunities(exchange, params_manager, app, broadcast_func, trade_log_ws, state, save_state_func):
     try:
         order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=50)
     except Exception as e:
         print(f"Order Book Error: {e}")
         return
 
-    large_bids = sorted([{'price': p, 'value_usd': round(p*a)} for p, a in order_book.get('bids', []) if p and a and (p*a > LARGE_ORDER_USD)], key=lambda x: x['value_usd'], reverse=True)
-    large_asks = sorted([{'price': p, 'value_usd': round(p*a)} for p, a in order_book.get('asks', []) if p and a and (p*a > LARGE_ORDER_USD)], key=lambda x: x['value_usd'], reverse=True)
+    large_order_usd = params_manager.LARGE_ORDER_USD
+    min_total_liquidity = params_manager.MIN_TOTAL_LIQUIDITY_USD
+    min_imbalance_ratio = params_manager.MIN_IMBALANCE_RATIO
+
+    large_bids = sorted([{'price': p, 'value_usd': round(p*a)} for p, a in order_book.get('bids', []) if p and a and (p*a > large_order_usd)], key=lambda x: x['value_usd'], reverse=True)
+    large_asks = sorted([{'price': p, 'value_usd': round(p*a)} for p, a in order_book.get('asks', []) if p and a and (p*a > large_order_usd)], key=lambda x: x['value_usd'], reverse=True)
     total_bids_usd = sum(b['value_usd'] for b in large_bids[:TOP_N_ORDERS_TO_ANALYZE])
     total_asks_usd = sum(a['value_usd'] for a in large_asks[:TOP_N_ORDERS_TO_ANALYZE])
-    if (total_bids_usd + total_asks_usd) < MIN_TOTAL_LIQUIDITY_USD: return
+    
+    if (total_bids_usd + total_asks_usd) < min_total_liquidity: return
     
     imbalance_ratio = (max(total_bids_usd, total_asks_usd) / min(total_bids_usd, total_asks_usd) 
                        if total_bids_usd > 0 and total_asks_usd > 0 else float('inf'))
-    if imbalance_ratio < MIN_IMBALANCE_RATIO: return
+    if imbalance_ratio < min_imbalance_ratio: return
 
     dominant_side_is_bids = total_bids_usd > total_asks_usd
     dominant_side = "ПОКУПАТЕЛЕЙ" if dominant_side_is_bids else "ПРОДАВЦОВ"
@@ -105,6 +164,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         sl_price = current_price * (1 - SL_PERCENT if side == "LONG" else 1 + SL_PERCENT)
         tp_price = current_price * (1 + TP_PERCENT if side == "LONG" else 1 - TP_PERCENT)
 
+        # --- ИЗМЕНЕНИЕ: Добавляем текущие параметры в сделку ---
         decision = {
             "Signal_ID": f"signal_{int(time.time() * 1000)}",
             "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
@@ -117,6 +177,10 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
             "TP_Price": tp_price,
             "side": side,
             "Trigger_Order_USD": largest_order['value_usd'] if largest_order else 0,
+            # Записываем параметры, с которыми была открыта сделка
+            "Param_Liquidity": min_total_liquidity,
+            "Param_Imbalance": min_imbalance_ratio,
+            "Param_Large_Order": large_order_usd
         }
         
         msg = (f"<b>ВХОД В СДЕЛКУ</b>\n\n"
@@ -131,7 +195,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         save_state_func()
         await broadcast_func(app, "✅ Сделка взята на мониторинг.")
         
-        if await log_trade_to_sheet(trade_log_ws, decision, 0):
+        if await log_trade_to_sheet(trade_log_ws, decision):
             await broadcast_func(app, "✅ ...успешно залогирована в Google Sheets.")
         else:
             await broadcast_func(app, "⚠️ Не удалось сохранить сделку в Google Sheets.")
@@ -140,24 +204,33 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         print(f"Error processing new opportunity: {e}", exc_info=True)
         await broadcast_func(app, "Произошла внутренняя ошибка при обработке сигнала.")
 
+
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    print(f"Main Engine loop started (v10.1_OKX).")
-    # --- ИЗМЕНЕНИЕ ---
-    # Меняем ccxt.mexc на ccxt.okx
+    bot_version = "12.0.0"
+    app.bot_version = bot_version
+    print(f"Main Engine loop started (v{bot_version}).")
+    
     exchange = ccxt.okx({'options': {'defaultType': 'swap'}})
-    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+    params_manager = DynamicParameters()
+    
+    recalculation_task = asyncio.create_task(
+        recalculate_parameters_periodically(exchange, params_manager, app, broadcast_func)
+    )
+
     scan_interval = 15
     while state.get("bot_on", True):
         try:
             await monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func)
             if not state.get('monitored_signals'):
-                await scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func)
+                await scan_for_new_opportunities(exchange, params_manager, app, broadcast_func, trade_log_ws, state, save_state_func)
             await asyncio.sleep(scan_interval)
         except asyncio.CancelledError:
             print("Main Engine loop cancelled.")
+            recalculation_task.cancel()
             break
         except Exception as e:
             print(f"CRITICAL Error in Main Engine loop: {e}", exc_info=True)
             await asyncio.sleep(60)
+            
     print("Main Engine loop stopped.")
     await exchange.close()
