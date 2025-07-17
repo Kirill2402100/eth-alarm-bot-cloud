@@ -1,25 +1,19 @@
 import gspread
 from datetime import datetime, timezone
 
-# Обновленный список заголовков
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Confidence_Score", "Algorithm_Type", 
     "Strategy_Idea", "Entry_Price", "SL_Price", "TP_Price", 
     "Status", "Exit_Time_UTC", "Exit_Price", "Entry_ATR", "PNL_USD", "PNL_Percent",
-    "Trigger_Order_USD"
+    "Trigger_Order_USD",
+    "Param_Liquidity", "Param_Imbalance", "Param_Large_Order"
 ]
 
-async def log_trade_to_sheet(worksheet, decision, entry_atr):
+async def log_trade_to_sheet(worksheet, decision):
     if not worksheet: return False
     try:
-        row_to_add = []
-        for header in HEADERS:
-            if header == "Status": row_to_add.append("ACTIVE")
-            elif header == "Entry_ATR": row_to_add.append(entry_atr)
-            elif header in ["Exit_Time_UTC", "Exit_Price", "PNL_USD", "PNL_Percent"]:
-                row_to_add.append("")
-            else:
-                row_to_add.append(decision.get(header, ''))
+        row_to_add = [decision.get(h, '') for h in HEADERS]
+        row_to_add[HEADERS.index('Status')] = "ACTIVE"
         worksheet.append_row(row_to_add)
         return True
     except Exception as e:
@@ -36,7 +30,6 @@ async def update_trade_in_sheet(worksheet, signal, exit_status, exit_price, pnl_
         if not cell: return False
 
         row_number = cell.row
-        # Определяем буквы колонок по их позиции в HEADERS
         status_col = chr(ord('A') + HEADERS.index('Status'))
         exit_time_col = chr(ord('A') + HEADERS.index('Exit_Time_UTC'))
         exit_price_col = chr(ord('A') + HEADERS.index('Exit_Price'))
@@ -51,7 +44,6 @@ async def update_trade_in_sheet(worksheet, signal, exit_status, exit_price, pnl_
             {'range': f"{pnl_percent_col}{row_number}", 'values': [[pnl_percent]]},
         ]
         worksheet.batch_update(updates)
-        print(f"Successfully updated trade {signal_id_to_find} in Google Sheets.")
         return True
     except Exception as e:
         print(f"GSheets update_trade_in_sheet Error: {e}", exc_info=True)
