@@ -1,8 +1,8 @@
-# File: scanner_engine.py (v33 - Pure Quant)
+# File: scanner_engine.py (v33.1 - Entry Logic Fix)
 # Changelog 17-Jul-2025 (Europe/Belgrade):
-# • Полный отказ от LLM. Решение о входе принимается на основе прохождения
-#   алгоритмического фильтра.
-# • Удален весь код, связанный с LLM, для повышения надежности и скорости.
+# • Исправлена критическая ошибка, из-за которой бот не входил в сделку после
+#   обнаружения АЛГО-СИГНАЛА.
+# • Удалены преждевременные выходы из функции scan_for_new_opportunities.
 
 import asyncio
 import time
@@ -103,7 +103,9 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
     total_bids_usd = sum(b['value_usd'] for b in top_bids)
     total_asks_usd = sum(a['value_usd'] for a in top_asks)
 
-    if (total_bids_usd + total_asks_usd) < MIN_TOTAL_LIQUIDITY_USD: return
+    # --- ФИЛЬТР ---
+    if (total_bids_usd + total_asks_usd) < MIN_TOTAL_LIQUIDITY_USD: 
+        return # Если ликвидности мало, выходим
     
     imbalance_ratio = 0
     dominant_side_is_bids = total_bids_usd > total_asks_usd
@@ -112,9 +114,10 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
     elif total_bids_usd > 0 or total_asks_usd > 0:
         imbalance_ratio = float('inf')
 
-    if imbalance_ratio < MIN_IMBALANCE_RATIO: return
+    if imbalance_ratio < MIN_IMBALANCE_RATIO:
+        return # Если дисбаланс слабый, выходим
 
-    # --- ЛОГИКА ПРИНЯТИЯ РЕШЕНИЙ БЕЗ LLM ---
+    # --- ЕСЛИ ФИЛЬТР ПРОЙДЕН, ВЫПОЛНЯЕМ ВСЮ ЛОГИКУ ДО КОНЦА ---
     dominant_side = "ПОКУПАТЕЛЕЙ" if dominant_side_is_bids else "ПРОДАВЦОВ"
     largest_order = (top_bids[0] if top_bids else None) if dominant_side_is_bids else (top_asks[0] if top_asks else None)
     
@@ -145,7 +148,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
             trade_plan['tp_price'] = current_price - (entry_atr * SL_ATR_MULTIPLIER * MIN_RR_RATIO)
 
         decision = {
-            "confidence_score": 10, # Максимальная уверенность, т.к. фильтр пройден
+            "confidence_score": 10,
             "reason": reason_text,
             "algorithm_type": "Imbalance",
         }
@@ -170,16 +173,14 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         print(f"Error processing new opportunity: {e}", exc_info=True)
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    print("Main Engine loop started (v33_pure_quant).")
+    print("Main Engine loop started (v33.1_pure_quant_fix).")
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
-    scan_interval = 15 # секунд
+    scan_interval = 15
     
     while state.get("bot_on", True):
         try:
-            # Мониторим активные сделки чаще, чем ищем новые
             await monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func)
             
-            # Сканируем новые возможности только если нет активных сделок
             if len(state.get('monitored_signals', [])) < MAX_PORTFOLIO_SIZE:
                 await scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func)
             
