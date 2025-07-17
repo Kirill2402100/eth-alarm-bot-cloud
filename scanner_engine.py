@@ -1,11 +1,12 @@
-# File: scanner_engine.py (v33.1 - Entry Logic Fix)
+# File: scanner_engine.py (v33.2 - Fix & UI Update)
 # Changelog 17-Jul-2025 (Europe/Belgrade):
 # • Исправлена критическая ошибка, из-за которой бот не входил в сделку после
-#   обнаружения АЛГО-СИГНАЛА.
+#   обнаружения АЛГО-СИГНАЛА.
 # • Удалены преждевременные выходы из функции scan_for_new_opportunities.
+# • Добавлено логирование и уведомление при ошибке получения цены.
+# • Обновлен формат сообщения "АЛГО-СИГНАЛ" для лучшей читаемости.
 
 import asyncio
-import time
 import pandas as pd
 import pandas_ta as ta
 import ccxt.async_support as ccxt
@@ -105,7 +106,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
 
     # --- ФИЛЬТР ---
     if (total_bids_usd + total_asks_usd) < MIN_TOTAL_LIQUIDITY_USD: 
-        return # Если ликвидности мало, выходим
+        return
     
     imbalance_ratio = 0
     dominant_side_is_bids = total_bids_usd > total_asks_usd
@@ -115,21 +116,34 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         imbalance_ratio = float('inf')
 
     if imbalance_ratio < MIN_IMBALANCE_RATIO:
-        return # Если дисбаланс слабый, выходим
+        return
 
     # --- ЕСЛИ ФИЛЬТР ПРОЙДЕН, ВЫПОЛНЯЕМ ВСЮ ЛОГИКУ ДО КОНЦА ---
     dominant_side = "ПОКУПАТЕЛЕЙ" if dominant_side_is_bids else "ПРОДАВЦОВ"
     largest_order = (top_bids[0] if top_bids else None) if dominant_side_is_bids else (top_asks[0] if top_asks else None)
+    expected_direction = "ВВЕРХ" if dominant_side_is_bids else "ВНИЗ"
     
-    reason_text = f"Алгоритмический фильтр пройден. Дисбаланс {imbalance_ratio:.1f}x в пользу {dominant_side}."
+    # Формируем новое сообщение о сигнале
+    signal_msg = f"🔥 <b>АЛГО-СИГНАЛ!</b>\n"
+    signal_msg += f"Сильный перевес на стороне {dominant_side} (дисбаланс {imbalance_ratio:.1f}x).\n"
+    if largest_order:
+        order_value_mln = largest_order['value_usd'] / 1000000
+        order_price = largest_order['price']
+        signal_msg += f"Ключевой ордер: ${order_value_mln:.2f} млн на уровне {order_price}.\n"
+    signal_msg += f"Ожидание: вероятно движение {expected_direction}."
     
-    await broadcast_func(app, f"🔥 <b>АЛГО-СИГНАЛ!</b>\n\n{reason_text}")
+    await broadcast_func(app, signal_msg)
 
     try:
         trade_plan = {}
         ticker = await exchange.fetch_ticker(PAIR_TO_SCAN)
         current_price = ticker.get('last')
-        if not current_price: return
+        
+        # ИСПРАВЛЕНИЕ: Проверяем, получили ли мы цену, и сообщаем, если нет
+        if not current_price:
+            await broadcast_func(app, f"⚠️ Не удалось получить текущую цену для {PAIR_TO_SCAN}. Сделка пропущена.")
+            print(f"Price Error: Could not fetch 'last' price for {PAIR_TO_SCAN}.")
+            return
         
         entry_atr = await get_entry_atr(exchange, PAIR_TO_SCAN)
         if entry_atr == 0:
@@ -149,7 +163,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
 
         decision = {
             "confidence_score": 10,
-            "reason": reason_text,
+            "reason": f"Дисбаланс {imbalance_ratio:.1f}x в пользу {dominant_side}",
             "algorithm_type": "Imbalance",
         }
         decision.update(trade_plan)
@@ -160,9 +174,9 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         msg = (f"<b>ВХОД В СДЕЛКУ</b>\n\n"
                f"<b>Тип:</b> {decision['strategy_idea']}\n"
                f"<b>Рассчитанный план (RR ~{MIN_RR_RATIO:.1f}:1):</b>\n"
-               f"  - Вход: <code>{decision['entry_price']:.2f}</code>\n"
-               f"  - SL: <code>{decision['sl_price']:.2f}</code>\n"
-               f"  - TP: <code>{decision['tp_price']:.2f}</code>")
+               f" - Вход (<b>{decision['side']}</b>): <code>{decision['entry_price']:.2f}</code>\n"
+               f" - SL: <code>{decision['sl_price']:.2f}</code>\n"
+               f" - TP: <code>{decision['tp_price']:.2f}</code>")
         await broadcast_func(app, msg)
 
         success = await log_trade_to_sheet(trade_log_ws, decision, entry_atr, state, save_state_func)
@@ -171,9 +185,11 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
 
     except Exception as e:
         print(f"Error processing new opportunity: {e}", exc_info=True)
+        await broadcast_func(app, "Произошла внутренняя ошибка при обработке сигнала.")
+
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    print("Main Engine loop started (v33.1_pure_quant_fix).")
+    print("Main Engine loop started (v33.2_fix_and_ui_update).")
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
     scan_interval = 15
     
