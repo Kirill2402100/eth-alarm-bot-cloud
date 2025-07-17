@@ -242,3 +242,33 @@ async def scanner_main_loop(app, ask_llm_func, broadcast_func, trade_log_ws, sta
             await asyncio.sleep(60)
     print("Main Engine loop stopped.")
     await exchange.close()
+
+# ---------- запуск бота ----------
+if __name__ == "__main__":
+    import asyncio
+    from scanner_engine import scanner_main_loop
+
+    # === реальные зависимости ===
+    app = None                     # ваш объект aiohttp / FastAPI / whatever
+    async def ask_llm(prompt: str):
+        # здесь должен быть реальный вызов к GPT / Gemini
+        return None
+
+    async def broadcast(app, msg):
+        print(msg)                 # замените на отправку в Telegram
+
+    trade_log_ws = None            # объект Google Sheet (gspread и т.п.)
+    state = {"monitored_signals": [], "bot_on": True}
+    def save_state(): pass         # если сохраняете state на диск
+
+    # === старт нескончаемого цикла ===
+    asyncio.run(
+        scanner_main_loop(
+            app,
+            ask_llm,
+            broadcast,
+            trade_log_ws,
+            state,
+            save_state
+        )
+    )
