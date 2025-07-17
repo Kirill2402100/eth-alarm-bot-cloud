@@ -141,8 +141,11 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         await broadcast_func(app, "Произошла внутренняя ошибка при обработке сигнала.")
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    print(f"Main Engine loop started (v{BOT_VERSION}).")
-    exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
+    print(f"Main Engine loop started (v10.1_OKX).")
+    # --- ИЗМЕНЕНИЕ ---
+    # Меняем ccxt.mexc на ccxt.okx
+    exchange = ccxt.okx({'options': {'defaultType': 'swap'}})
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
     scan_interval = 15
     while state.get("bot_on", True):
         try:
