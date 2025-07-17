@@ -1,11 +1,12 @@
-# File: scanner_engine.py (v33.4 - Diagnostic Build)
+# File: scanner_engine.py (v34.0 - Manual ATR)
 # Changelog 17-Jul-2025 (Europe/Belgrade):
-# • Добавлено исчерпывающее логгирование в функцию get_entry_atr для отлова
-#   ошибок, связанных с некорректными данными от биржи.
+# • Полный отказ от библиотеки pandas_ta из-за критического сбоя.
+# • Реализован ручной расчет ATR для максимальной стабильности.
 
 import asyncio
 import pandas as pd
-import pandas_ta as ta
+# pandas_ta больше не используется
+# import pandas_ta as ta 
 import ccxt.async_support as ccxt
 from trade_executor import log_trade_to_sheet, update_trade_in_sheet
 
@@ -21,6 +22,7 @@ MIN_RR_RATIO = 1.5
 SL_ATR_MULTIPLIER = 2.0
 COUNTER_ORDER_RATIO = 1.25
 ATR_CALCULATION_TIMEOUT = 10.0
+ATR_PERIOD = 14
 
 async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     active_signals = state.get('monitored_signals')
@@ -67,44 +69,35 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
         print(f"Monitor Error: {e}", exc_info=True)
 
 async def get_entry_atr(exchange, pair):
-    # --- НАЧАЛО ДИАГНОСТИЧЕСКОГО БЛОКА ---
-    print("ATR DEBUG: --- Entering get_entry_atr ---")
     try:
-        print(f"ATR DEBUG: 1. Fetching OHLCV for {pair}...")
-        ohlcv = await exchange.fetch_ohlcv(pair, TIMEFRAME, limit=20)
-        print(f"ATR DEBUG: 2. Got OHLCV data. Type: {type(ohlcv)}. Length: {len(ohlcv) if ohlcv is not None else 'None'}.")
-        print(f"ATR DEBUG: RAW_DATA_FROM_EXCHANGE: {ohlcv}")
-
-        if not ohlcv or len(ohlcv) < 15:
-            print(f"ATR Error: Not enough OHLCV data for {pair}. Got: {len(ohlcv) if ohlcv else 0}")
-            print("ATR DEBUG: --- Exiting get_entry_atr (not enough data) ---")
+        ohlcv = await exchange.fetch_ohlcv(pair, TIMEFRAME, limit=ATR_PERIOD * 2)
+        if not ohlcv or len(ohlcv) < ATR_PERIOD:
+            print(f"ATR Error: Not enough OHLCV data for {pair}.")
             return 0
 
-        print("ATR DEBUG: 3. Creating DataFrame...")
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        print("ATR DEBUG: 4. Converting columns to numeric...")
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col])
-        
-        print("ATR DEBUG: 5. Calculating ATR with pandas_ta...")
-        df.ta.atr(length=14, append=True)
-        print("ATR DEBUG: 6. Getting last ATR value...")
-        atr_value = df.iloc[-1]['ATR_14']
-        
-        if pd.isna(atr_value):
-            print(f"ATR Error: ATR calculation resulted in NaN for {pair}.")
-            print("ATR DEBUG: --- Exiting get_entry_atr (NaN result) ---")
-            return 0
 
-        print(f"ATR DEBUG: 7. Success! Returning ATR value: {atr_value}")
-        print("ATR DEBUG: --- Exiting get_entry_atr (Success) ---")
+        # --- РУЧНОЙ РАСЧЕТ ATR ---
+        high_low = df['high'] - df['low']
+        high_prev_close = (df['high'] - df['close'].shift()).abs()
+        low_prev_close = (df['low'] - df['close'].shift()).abs()
+        
+        tr = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1/ATR_PERIOD, adjust=False).mean()
+        # --- КОНЕЦ РУЧНОГО РАСЧЕТА ---
+
+        atr_value = atr.iloc[-1]
+        if pd.isna(atr_value) or atr_value == 0:
+            print(f"ATR Error: ATR calculation resulted in NaN or Zero.")
+            return 0
+            
         return atr_value
         
     except Exception as e:
         print(f"ATR CRITICAL ERROR: An exception occurred in get_entry_atr: {e}", exc_info=True)
-        print("ATR DEBUG: --- Exiting get_entry_atr (Exception) ---")
         return 0
-    # --- КОНЕЦ ДИАГНОСТИЧЕСКОГО БЛОКА ---
 
 async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     try:
@@ -152,14 +145,12 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         
         if not current_price:
             await broadcast_func(app, f"⚠️ Не удалось получить текущую цену для {PAIR_TO_SCAN}. Сделка пропущена.")
-            print(f"Price Error: Could not fetch 'last' price for {PAIR_TO_SCAN}.")
             return
         
         entry_atr = 0
         try:
             entry_atr = await asyncio.wait_for(get_entry_atr(exchange, PAIR_TO_SCAN), timeout=ATR_CALCULATION_TIMEOUT)
         except asyncio.TimeoutError:
-            print("ATR Error: Calculation timed out.")
             await broadcast_func(app, "⚠️ Не удалось рассчитать ATR (превышен таймаут). Сделка пропущена.")
             return
 
@@ -206,7 +197,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
 
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    print("Main Engine loop started (v33.4_diagnostic).")
+    print("Main Engine loop started (v34.0_manual_atr).")
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
     scan_interval = 15
     
