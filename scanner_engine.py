@@ -65,26 +65,35 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
         print(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
         await broadcast_func(app, error_message)
 
-async def get_cvd_confirmation(exchange, pair, expected_side):
-    """Проверяет рыночные сделки для подтверждения сигнала."""
+# --- ОБНОВЛЕННАЯ ФУНКЦИЯ CVD ---
+async def get_cvd_analysis(exchange, pair, expected_side):
+    """
+    Анализирует рыночные сделки и возвращает результат проверки.
+    Возвращает словарь с результатом и данными для анализа.
+    """
     try:
         trades = await exchange.fetch_trades(pair, limit=100)
-        if not trades: return True # Если нет данных, пропускаем проверку
+        if not trades:
+            return {'confirmed': True, 'reason': "Нет данных о сделках, проверка пропущена."}
 
         buy_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'buy')
         sell_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'sell')
         
         cvd = buy_volume - sell_volume
+        
+        reason_text = f"Покупки: ${buy_volume/1000:,.0f}k | Продажи: ${sell_volume/1000:,.0f}k"
 
-        if expected_side == "LONG" and cvd < 0:
-            return False # Ожидали LONG, но продавцы агрессивнее
-        if expected_side == "SHORT" and cvd > 0:
-            return False # Ожидали SHORT, но покупатели агрессивнее
+        if expected_side == "LONG":
+            if cvd < 0:
+                return {'confirmed': False, 'reason': reason_text} # Ожидали LONG, но продавцы агрессивнее
+        elif expected_side == "SHORT":
+            if cvd > 0:
+                return {'confirmed': False, 'reason': reason_text} # Ожидали SHORT, но покупатели агрессивнее
             
-        return True # Сигнал подтвержден
+        return {'confirmed': True, 'reason': reason_text} # Сигнал подтвержден
     except Exception as e:
         print(f"CVD confirmation error: {e}")
-        return True # В случае ошибки, пропускаем проверку
+        return {'confirmed': True, 'reason': f"Ошибка при расчете CVD: {e}"}
 
 async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     try:
@@ -117,16 +126,22 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
     
     await broadcast_func(app, signal_msg)
 
-    # --- НОВЫЙ БЛОК: ПРОВЕРКА ПО CVD ---
+    # --- ОБНОВЛЕННЫЙ БЛОК ПРОВЕРКИ ПО CVD ---
     expected_side = "LONG" if dominant_side_is_bids else "SHORT"
-    cvd_confirmed = await get_cvd_confirmation(exchange, PAIR_TO_SCAN, expected_side)
+    cvd_analysis = await get_cvd_analysis(exchange, PAIR_TO_SCAN, expected_side)
 
-    if not cvd_confirmed:
+    if not cvd_analysis['confirmed']:
         cvd_msg = (f"⚠️ <b>Сигнал отфильтрован по CVD!</b>\n\n"
-                   f"<b>Причина:</b> Дисбаланс в стакане не подтвержден агрессией рыночных ордеров.")
+                   f"<b>Причина:</b> Стакан {dominant_side}, но агрессия рынка против.\n"
+                   f"<i>({cvd_analysis['reason']})</i>")
         await broadcast_func(app, cvd_msg)
         return
-    # --- КОНЕЦ НОВОГО БЛОКА ---
+    else:
+        # Сообщение об успешном прохождении фильтра
+        cvd_msg = (f"✅ <b>Сигнал подтвержден по CVD.</b>\n"
+                   f"<i>({cvd_analysis['reason']})</i>")
+        await broadcast_func(app, cvd_msg)
+    # --- КОНЕЦ ОБНОВЛЕННОГО БЛОКА ---
 
     try:
         ticker = await exchange.fetch_ticker(PAIR_TO_SCAN)
@@ -169,7 +184,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         await broadcast_func(app, "Произошла внутренняя ошибка при обработке сигнала.")
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    bot_version = "16.0.0"
+    bot_version = "17.0.0"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}).")
     
