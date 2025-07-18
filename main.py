@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v16.0.0 - Static Golden Corridor + CVD
-# Changelog 18-Jul-2025 (Europe/Belgrade):
-# • Вся динамическая адаптация удалена.
-# • Добавлен фильтр по CVD.
+# v18.0.0 - ADX Two-Mode Strategy
 # ============================================================================
 
 import os
@@ -19,7 +16,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "16.0.0" 
+BOT_VERSION        = "18.0.0" 
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -60,7 +57,6 @@ def setup_sheets():
     except Exception as e:
         log.error("Sheets init failed: %s", e)
 
-# (Остальная часть файла без изменений)
 STATE_FILE = "bot_state.json"
 state = {}
 def load_state():
