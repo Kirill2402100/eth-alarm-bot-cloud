@@ -16,33 +16,42 @@ COUNTER_ORDER_RATIO = 1.5
 PARAMS_CALM_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 1500000, "MIN_IMBALANCE_RATIO": 2.5, "LARGE_ORDER_USD": 250000}
 PARAMS_ACTIVE_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 3000000, "MIN_IMBALANCE_RATIO": 3.0, "LARGE_ORDER_USD": 500000}
 
-# (monitor_active_trades без изменений)
+# --- НОВАЯ ГИБРИДНАЯ ФУНКЦИЯ МОНИТОРИНГА ---
 async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     active_signals = state.get('monitored_signals')
     if not active_signals: return
     signal = active_signals[0]
     try:
-        ohlcv = await exchange.fetch_ohlcv(signal['Pair'], timeframe='1m', limit=1)
-        if not ohlcv: return
+        # Запрашиваем 2 последние минутные свечи
+        ohlcv = await exchange.fetch_ohlcv(signal['Pair'], timeframe='1m', limit=2)
+        if not ohlcv or len(ohlcv) < 2:
+            print(f"Monitor OHLCV Error: Not enough candle data for {signal['Pair']}.")
+            return
 
-        current_candle = ohlcv[0]
-        candle_high = float(current_candle[2])
-        candle_low = float(current_candle[3])
         exit_status, exit_price = None, None
         entry_price, sl_price, tp_price = signal['Entry_Price'], signal['SL_Price'], signal['TP_Price']
         
-        if signal['side'] == 'LONG':
-            if candle_low <= sl_price: exit_status, exit_price = "SL_HIT", sl_price
-            elif candle_high >= tp_price: exit_status, exit_price = "TP_HIT", tp_price
-        elif signal['side'] == 'SHORT':
-            if candle_high >= sl_price: exit_status, exit_price = "SL_HIT", sl_price
-            elif candle_low <= tp_price: exit_status, exit_price = "TP_HIT", tp_price
+        # Проверяем обе свечи (предпоследнюю и последнюю)
+        for candle in ohlcv:
+            candle_high = float(candle[2])
+            candle_low = float(candle[3])
+            
+            if signal['side'] == 'LONG':
+                if candle_low <= sl_price: exit_status, exit_price = "SL_HIT", sl_price
+                elif candle_high >= tp_price: exit_status, exit_price = "TP_HIT", tp_price
+            elif signal['side'] == 'SHORT':
+                if candle_high >= sl_price: exit_status, exit_price = "SL_HIT", sl_price
+                elif candle_low <= tp_price: exit_status, exit_price = "TP_HIT", tp_price
+            
+            if exit_status: # Если нашли выход на одной из свечей, прекращаем проверку
+                break
         
+        # Проверка на аварийный выход (только по последней свече)
         if not exit_status:
             trigger_order_usd = signal.get('Trigger_Order_USD', 0)
             if trigger_order_usd > 0:
                 order_book = await exchange.fetch_order_book(signal['Pair'], limit=25)
-                current_price = float(current_candle[4])
+                current_price = float(ohlcv[-1][4]) # Цена закрытия последней свечи
                 if signal['side'] == 'LONG' and any((p*a) > (trigger_order_usd * COUNTER_ORDER_RATIO) for p, a in order_book.get('asks', [])):
                     exit_status, exit_price = "EMERGENCY_EXIT", current_price
                 elif signal['side'] == 'SHORT' and any((p*a) > (trigger_order_usd * COUNTER_ORDER_RATIO) for p, a in order_book.get('bids', [])):
@@ -65,6 +74,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
         print(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
         await broadcast_func(app, error_message)
 
+# (Остальные функции без изменений)
 async def get_cvd_analysis(exchange, pair, expected_side):
     try:
         trades = await exchange.fetch_trades(pair, limit=100)
@@ -113,21 +123,18 @@ async def get_adx_value(exchange, pair, timeframe='15m', period=14):
 
 async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     if 'cvd_cooldown_until' in state:
-        if time.time() < state['cvd_cooldown_until']:
-            state['last_status_message'] = f"Кулдаун активен еще {int(state['cvd_cooldown_until'] - time.time())} сек."
-            return
+        if time.time() < state['cvd_cooldown_until']: return
         else:
             del state['cvd_cooldown_until']
             save_state_func()
     
     adx_value = await get_adx_value(exchange, PAIR_TO_SCAN)
     if adx_value is None:
-        state['last_status_message'] = "Не удалось рассчитать ADX."
+        print("ADX calculation failed, skipping scan.")
         return
 
     params = PARAMS_ACTIVE_MARKET if adx_value >= 25 else PARAMS_CALM_MARKET
     market_mode = "Активный" if adx_value >= 25 else "Спокойный"
-    state['last_status_message'] = f"Поиск. Режим: {market_mode} (ADX: {adx_value:.1f})"
     
     min_total_liquidity, min_imbalance_ratio, large_order_usd = params.values()
 
@@ -165,16 +172,14 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
     cvd_analysis = await get_cvd_analysis(exchange, PAIR_TO_SCAN, expected_side)
 
     if not cvd_analysis['confirmed']:
-        cvd_msg = (f"⚠️ <b>Сигнал отфильтрован по CVD!</b>\n"
-                   f"<i>({cvd_analysis['reason']})</i>\n"
+        cvd_msg = (f"⚠️ <b>Сигнал отфильтрован по CVD!</b>\n<i>({cvd_analysis['reason']})</i>\n"
                    f"<b>Активирован кулдаун на 3 минуты.</b>")
         await broadcast_func(app, cvd_msg)
-        state['cvd_cooldown_until'] = time.time() + 180 # 180 секунд = 3 минуты
+        state['cvd_cooldown_until'] = time.time() + 180
         save_state_func()
         return
     else:
-        cvd_msg = (f"✅ <b>Сигнал подтвержден по CVD.</b>\n"
-                   f"<i>({cvd_analysis['reason']})</i>")
+        cvd_msg = (f"✅ <b>Сигнал подтвержден по CVD.</b>\n<i>({cvd_analysis['reason']})</i>")
         await broadcast_func(app, cvd_msg)
         if 'cvd_cooldown_until' in state:
             del state['cvd_cooldown_until']
@@ -220,7 +225,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         await broadcast_func(app, "Произошла внутренняя ошибка при обработке сигнала.")
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    bot_version = "20.0.0"
+    bot_version = "21.0.0" # Финальная версия
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}).")
     
