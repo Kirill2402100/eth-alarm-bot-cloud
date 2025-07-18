@@ -16,16 +16,15 @@ COUNTER_ORDER_RATIO = 1.25
 
 class DynamicParameters:
     def __init__(self):
-        self.MIN_TOTAL_LIQUIDITY_USD = 1000000
-        self.MIN_IMBALANCE_RATIO = 2.0
-        self.LARGE_ORDER_USD = 250000
+        self.MIN_TOTAL_LIQUIDITY_USD = 2000000
+        self.MIN_IMBALANCE_RATIO = 3.0
+        self.LARGE_ORDER_USD = 500000
 
     def update(self, new_params):
         self.MIN_TOTAL_LIQUIDITY_USD = new_params['MIN_TOTAL_LIQUIDITY_USD']
         self.MIN_IMBALANCE_RATIO = new_params['MIN_IMBALANCE_RATIO']
         self.LARGE_ORDER_USD = new_params['LARGE_ORDER_USD']
 
-# (monitor_active_trades без изменений)
 async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     active_signals = state.get('monitored_signals')
     if not active_signals: return
@@ -164,7 +163,6 @@ async def scan_for_new_opportunities(exchange, params_manager, app, broadcast_fu
         sl_price = current_price * (1 - SL_PERCENT if side == "LONG" else 1 + SL_PERCENT)
         tp_price = current_price * (1 + TP_PERCENT if side == "LONG" else 1 - TP_PERCENT)
 
-        # --- ИЗМЕНЕНИЕ: Добавляем текущие параметры в сделку ---
         decision = {
             "Signal_ID": f"signal_{int(time.time() * 1000)}",
             "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
@@ -177,7 +175,6 @@ async def scan_for_new_opportunities(exchange, params_manager, app, broadcast_fu
             "TP_Price": tp_price,
             "side": side,
             "Trigger_Order_USD": largest_order['value_usd'] if largest_order else 0,
-            # Записываем параметры, с которыми была открыта сделка
             "Param_Liquidity": min_total_liquidity,
             "Param_Imbalance": min_imbalance_ratio,
             "Param_Large_Order": large_order_usd
@@ -204,13 +201,16 @@ async def scan_for_new_opportunities(exchange, params_manager, app, broadcast_fu
         print(f"Error processing new opportunity: {e}", exc_info=True)
         await broadcast_func(app, "Произошла внутренняя ошибка при обработке сигнала.")
 
-
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    bot_version = "12.0.0"
+    bot_version = "12.1.0"
     app.bot_version = bot_version
-    print(f"Main Engine loop started (v{bot_version}).")
+    print(f"Main Engine loop started (v{bot_version}_MEXC).")
     
-    exchange = ccxt.okx({'options': {'defaultType': 'swap'}})
+    # --- ИЗМЕНЕНИЕ ---
+    # Меняем ccxt.okx обратно на ccxt.mexc
+    exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+    
     params_manager = DynamicParameters()
     
     recalculation_task = asyncio.create_task(
@@ -222,6 +222,7 @@ async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state
         try:
             await monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func)
             if not state.get('monitored_signals'):
+                # Добавляем params_manager в вызов функции
                 await scan_for_new_opportunities(exchange, params_manager, app, broadcast_func, trade_log_ws, state, save_state_func)
             await asyncio.sleep(scan_interval)
         except asyncio.CancelledError:
