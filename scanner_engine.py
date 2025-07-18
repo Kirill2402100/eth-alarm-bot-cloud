@@ -26,23 +26,16 @@ class DynamicParameters:
         self.MIN_IMBALANCE_RATIO = 2.5
         self.LARGE_ORDER_USD = 300000
 
-    def update(self, new_params, soften=False):
-        """Обновляет параметры, применяя "смягчение" и коридор."""
-        
-        softening_factor = 0.9 if soften else 1.0 # 10% смягчение, если нужно
-        
-        # Применяем смягчение и коридор
+    def update(self, new_params):
+        # Применяем коридор к новым параметрам
         self.MIN_TOTAL_LIQUIDITY_USD = int(np.clip(
-            new_params['MIN_TOTAL_LIQUIDITY_USD'] * softening_factor,
-            PARAM_BOUNDS['MIN_LIQUIDITY'], PARAM_BOUNDS['MAX_LIQUIDITY']
+            new_params['MIN_TOTAL_LIQUIDITY_USD'], PARAM_BOUNDS['MIN_LIQUIDITY'], PARAM_BOUNDS['MAX_LIQUIDITY']
         ))
         self.MIN_IMBALANCE_RATIO = round(np.clip(
-            new_params['MIN_IMBALANCE_RATIO'] * softening_factor,
-            PARAM_BOUNDS['MIN_IMBALANCE'], PARAM_BOUNDS['MAX_IMBALANCE']
+            new_params['MIN_IMBALANCE_RATIO'], PARAM_BOUNDS['MIN_IMBALANCE'], PARAM_BOUNDS['MAX_IMBALANCE']
         ), 1)
         self.LARGE_ORDER_USD = int(np.clip(
-            new_params['LARGE_ORDER_USD'] * softening_factor,
-            PARAM_BOUNDS['MIN_LARGE_ORDER'], PARAM_BOUNDS['MAX_LARGE_ORDER']
+            new_params['LARGE_ORDER_USD'], PARAM_BOUNDS['MIN_LARGE_ORDER'], PARAM_BOUNDS['MAX_LARGE_ORDER']
         ))
 
 # (monitor_active_trades без изменений)
@@ -94,48 +87,55 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
         print(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
         await broadcast_func(app, error_message)
 
+# --- НОВАЯ ВЕРСИЯ ФУНКЦИИ КАЛИБРОВКИ ---
 async def recalculate_parameters_periodically(exchange, params_manager, app, broadcast_func, state):
-    """Каждые 10 минут собирает данные, пересчитывает и смягчает (если нужно) параметры."""
+    """Каждые 10 минут адаптирует параметры."""
     while True:
         await asyncio.sleep(600) # Ждем 10 минут
         
-        # Проверяем, была ли сделка за последние 10 минут
         time_since_last_trade = time.time() - state.get('last_trade_timestamp', 0)
-        should_soften = time_since_last_trade > 600
-
-        status_msg = "не было, смягчаю фильтры" if should_soften else "была, стандартная калибровка"
-        await broadcast_func(app, f"⏳ Калибровка... (Сделок за 10 мин {status_msg})")
         
-        liquidity_samples, imbalance_samples = [], []
-        # Собираем данные 2 минуты (8 раз * 15 сек)
-        for _ in range(8):
-            try:
-                order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100)
-                bids = sorted([p * a for p, a in order_book.get('bids', [])], reverse=True)
-                asks = sorted([p * a for p, a in order_book.get('asks', [])], reverse=True)
-                top_bids_usd = sum(bids[:TOP_N_ORDERS_TO_ANALYZE])
-                top_asks_usd = sum(asks[:TOP_N_ORDERS_TO_ANALYZE])
-                liquidity_samples.append(top_bids_usd + top_asks_usd)
-                if top_bids_usd > 0 and top_asks_usd > 0:
-                    imbalance_samples.append(max(top_bids_usd, top_asks_usd) / min(top_bids_usd, top_asks_usd))
-            except Exception as e:
-                print(f"Data collection sample failed: {e}")
-            await asyncio.sleep(15)
+        if time_since_last_trade > 600: # Если сделок не было
+            await broadcast_func(app, "⏳ Сделок за 10 мин не было, смягчаю фильтры на 10%...")
+            
+            # Берем ТЕКУЩИЕ параметры и УМЕНЬШАЕМ их
+            new_params = {
+                'MIN_TOTAL_LIQUIDITY_USD': params_manager.MIN_TOTAL_LIQUIDITY_USD * 0.9,
+                'MIN_IMBALANCE_RATIO': params_manager.MIN_IMBALANCE_RATIO * 0.9,
+                'LARGE_ORDER_USD': params_manager.LARGE_ORDER_USD * 0.9
+            }
+            params_manager.update(new_params)
 
-        if not liquidity_samples or not imbalance_samples:
-            await broadcast_func(app, "⚠️ Калибровка не удалась: нет данных.")
-            continue
+        else: # Если сделки были
+            await broadcast_func(app, "⏳ Сделки были, запускаю стандартную калибровку (2 мин)...")
+            
+            liquidity_samples, imbalance_samples = [], []
+            for _ in range(8): # Собираем данные 2 минуты
+                try:
+                    order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100)
+                    bids = sorted([p * a for p, a in order_book.get('bids', [])], reverse=True)
+                    asks = sorted([p * a for p, a in order_book.get('asks', [])], reverse=True)
+                    top_bids_usd = sum(bids[:TOP_N_ORDERS_TO_ANALYZE])
+                    top_asks_usd = sum(asks[:TOP_N_ORDERS_TO_ANALYZE])
+                    liquidity_samples.append(top_bids_usd + top_asks_usd)
+                    if top_bids_usd > 0 and top_asks_usd > 0:
+                        imbalance_samples.append(max(top_bids_usd, top_asks_usd) / min(top_bids_usd, top_asks_usd))
+                except Exception as e:
+                    print(f"Data collection sample failed: {e}")
+                await asyncio.sleep(15)
 
-        median_liquidity = np.median(liquidity_samples)
-        median_imbalance = np.median(imbalance_samples)
-
-        base_params = {
-            'MIN_TOTAL_LIQUIDITY_USD': int(median_liquidity * 0.8),
-            'MIN_IMBALANCE_RATIO': round(median_imbalance * 1.2, 1),
-            'LARGE_ORDER_USD': int(median_liquidity / 10)
-        }
-        
-        params_manager.update(base_params, soften=should_soften)
+            if liquidity_samples and imbalance_samples:
+                median_liquidity = np.median(liquidity_samples)
+                median_imbalance = np.median(imbalance_samples)
+                base_params = {
+                    'MIN_TOTAL_LIQUIDITY_USD': median_liquidity * 0.8,
+                    'MIN_IMBALANCE_RATIO': median_imbalance * 1.2,
+                    'LARGE_ORDER_USD': median_liquidity / 10
+                }
+                params_manager.update(base_params)
+            else:
+                await broadcast_func(app, "⚠️ Калибровка не удалась: нет данных.")
+                continue
 
         report_msg = (
             f"📈 <b>Параметры обновлены (v{app.bot_version})</b>\n\n"
@@ -145,6 +145,7 @@ async def recalculate_parameters_periodically(exchange, params_manager, app, bro
         )
         await broadcast_func(app, report_msg)
 
+# (scan_for_new_opportunities без изменений)
 async def scan_for_new_opportunities(exchange, params_manager, app, broadcast_func, trade_log_ws, state, save_state_func):
     try:
         order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=50)
@@ -210,7 +211,6 @@ async def scan_for_new_opportunities(exchange, params_manager, app, broadcast_fu
         await broadcast_func(app, msg)
 
         state['monitored_signals'].append(decision)
-        # --- ИЗМЕНЕНИЕ: Запоминаем время последней сделки ---
         state['last_trade_timestamp'] = time.time()
         save_state_func()
         await broadcast_func(app, "✅ Сделка взята на мониторинг.")
@@ -224,8 +224,9 @@ async def scan_for_new_opportunities(exchange, params_manager, app, broadcast_fu
         print(f"Error processing new opportunity: {e}", exc_info=True)
         await broadcast_func(app, "Произошла внутренняя ошибка при обработке сигнала.")
 
+# (scanner_main_loop без изменений, кроме передачи 'state')
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    bot_version = "14.0.0"
+    bot_version = "15.0.0"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}).")
     
