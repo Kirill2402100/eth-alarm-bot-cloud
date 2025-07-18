@@ -65,12 +65,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
         print(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
         await broadcast_func(app, error_message)
 
-# --- ОБНОВЛЕННАЯ ФУНКЦИЯ CVD ---
 async def get_cvd_analysis(exchange, pair, expected_side):
-    """
-    Анализирует рыночные сделки и возвращает результат проверки.
-    Возвращает словарь с результатом и данными для анализа.
-    """
     try:
         trades = await exchange.fetch_trades(pair, limit=100)
         if not trades:
@@ -80,17 +75,14 @@ async def get_cvd_analysis(exchange, pair, expected_side):
         sell_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'sell')
         
         cvd = buy_volume - sell_volume
-        
         reason_text = f"Покупки: ${buy_volume/1000:,.0f}k | Продажи: ${sell_volume/1000:,.0f}k"
 
-        if expected_side == "LONG":
-            if cvd < 0:
-                return {'confirmed': False, 'reason': reason_text} # Ожидали LONG, но продавцы агрессивнее
-        elif expected_side == "SHORT":
-            if cvd > 0:
-                return {'confirmed': False, 'reason': reason_text} # Ожидали SHORT, но покупатели агрессивнее
+        if expected_side == "LONG" and cvd < 0:
+            return {'confirmed': False, 'reason': reason_text}
+        if expected_side == "SHORT" and cvd > 0:
+            return {'confirmed': False, 'reason': reason_text}
             
-        return {'confirmed': True, 'reason': reason_text} # Сигнал подтвержден
+        return {'confirmed': True, 'reason': reason_text}
     except Exception as e:
         print(f"CVD confirmation error: {e}")
         return {'confirmed': True, 'reason': f"Ошибка при расчете CVD: {e}"}
@@ -111,6 +103,11 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
     
     imbalance_ratio = (max(total_bids_usd, total_asks_usd) / min(total_bids_usd, total_asks_usd) 
                        if total_bids_usd > 0 and total_asks_usd > 0 else float('inf'))
+
+    # --- ИСПРАВЛЕНИЕ: Отсеиваем "бесконечный" дисбаланс ---
+    if imbalance_ratio == float('inf'):
+        return # Игнорируем сигналы на "тонком" рынке
+
     if imbalance_ratio < MIN_IMBALANCE_RATIO: return
 
     dominant_side_is_bids = total_bids_usd > total_asks_usd
@@ -126,7 +123,6 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
     
     await broadcast_func(app, signal_msg)
 
-    # --- ОБНОВЛЕННЫЙ БЛОК ПРОВЕРКИ ПО CVD ---
     expected_side = "LONG" if dominant_side_is_bids else "SHORT"
     cvd_analysis = await get_cvd_analysis(exchange, PAIR_TO_SCAN, expected_side)
 
@@ -137,11 +133,9 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         await broadcast_func(app, cvd_msg)
         return
     else:
-        # Сообщение об успешном прохождении фильтра
         cvd_msg = (f"✅ <b>Сигнал подтвержден по CVD.</b>\n"
                    f"<i>({cvd_analysis['reason']})</i>")
         await broadcast_func(app, cvd_msg)
-    # --- КОНЕЦ ОБНОВЛЕННОГО БЛОКА ---
 
     try:
         ticker = await exchange.fetch_ticker(PAIR_TO_SCAN)
@@ -184,7 +178,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         await broadcast_func(app, "Произошла внутренняя ошибка при обработке сигнала.")
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    bot_version = "17.0.0"
+    bot_version = "17.1.0"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}).")
     
