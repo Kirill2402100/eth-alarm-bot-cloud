@@ -5,8 +5,7 @@ HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Confidence_Score", "Algorithm_Type", 
     "Strategy_Idea", "Entry_Price", "SL_Price", "TP_Price", 
     "Status", "Exit_Time_UTC", "Exit_Price", "Entry_ATR", "PNL_USD", "PNL_Percent",
-    "Trigger_Order_USD",
-    "Param_Liquidity", "Param_Imbalance", "Param_Large_Order"
+    "Trigger_Order_USD"
 ]
 
 async def log_trade_to_sheet(worksheet, decision):
