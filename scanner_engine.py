@@ -4,7 +4,7 @@ import ccxt.async_support as ccxt
 from trade_executor import log_trade_to_sheet, update_trade_in_sheet
 import time
 from datetime import datetime, timezone
-import numpy as np # <-- Добавляем numpy для безопасного деления
+import numpy as np
 
 # === Конфигурация ===
 PAIR_TO_SCAN = 'BTC/USDT'
@@ -16,7 +16,6 @@ COUNTER_ORDER_RATIO = 1.5
 PARAMS_CALM_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 1500000, "MIN_IMBALANCE_RATIO": 2.5, "LARGE_ORDER_USD": 250000}
 PARAMS_ACTIVE_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 3000000, "MIN_IMBALANCE_RATIO": 3.0, "LARGE_ORDER_USD": 500000}
 
-# (monitor_active_trades без изменений)
 async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     active_signals = state.get('monitored_signals')
     if not active_signals: return
@@ -85,11 +84,12 @@ async def get_cvd_analysis(exchange, pair, expected_side):
         print(f"CVD confirmation error: {e}")
         return {'confirmed': True, 'reason': f"Ошибка при расчете CVD: {e}"}
 
-async def get_adx_value(exchange, pair, timeframe='15m', period=14):
-    """Рассчитывает и возвращает последнее значение ADX с защитой от деления на ноль."""
+async def get_adx_value(exchange, app, broadcast_func, pair, timeframe='15m', period=14):
     try:
         ohlcv = await exchange.fetch_ohlcv(pair, timeframe, limit=period * 3)
-        if len(ohlcv) < period * 2: return None
+        if len(ohlcv) < period * 2:
+            print("Not enough data for ADX calculation.")
+            return None
             
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
@@ -104,16 +104,15 @@ async def get_adx_value(exchange, pair, timeframe='15m', period=14):
         plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
         minus_di = 100 * (abs(minus_dm.ewm(alpha=1/period, adjust=False).mean()) / atr)
         
-        # --- ИСПРАВЛЕНИЕ: Защита от деления на ноль ---
         di_sum = plus_di + minus_di
-        dx = (abs(plus_di - minus_di) / di_sum.replace(0, np.nan)) * 100 # Заменяем 0 на NaN для безопасного деления
-        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
-
-        adx = dx.ewm(alpha=1/period, adjust=False).mean().fillna(0) # Заполняем возможные NaN нулями
+        dx = (abs(plus_di - minus_di) / di_sum.replace(0, np.nan)) * 100
+        adx = dx.ewm(alpha=1/period, adjust=False).mean().fillna(0)
         
         return adx.iloc[-1]
     except Exception as e:
         print(f"ADX calculation error: {e}")
+        # --- ИЗМЕНЕНИЕ: Отправляем уведомление об ошибке ---
+        await broadcast_func(app, f"⚠️ Не удалось рассчитать ADX. Поиск сигналов временно приостановлен. Ошибка: <code>{e}</code>")
         return None
 
 async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
@@ -123,10 +122,8 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
             del state['cvd_cooldown_until']
             save_state_func()
     
-    adx_value = await get_adx_value(exchange, PAIR_TO_SCAN)
-    if adx_value is None:
-        print("ADX calculation failed, skipping scan.")
-        return
+    adx_value = await get_adx_value(exchange, app, broadcast_func, PAIR_TO_SCAN)
+    if adx_value is None: return
 
     params = PARAMS_ACTIVE_MARKET if adx_value >= 25 else PARAMS_CALM_MARKET
     market_mode = "Активный" if adx_value >= 25 else "Спокойный"
@@ -167,16 +164,14 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
     cvd_analysis = await get_cvd_analysis(exchange, PAIR_TO_SCAN, expected_side)
 
     if not cvd_analysis['confirmed']:
-        cvd_msg = (f"⚠️ <b>Сигнал отфильтрован по CVD!</b>\n"
-                   f"<i>({cvd_analysis['reason']})</i>\n"
+        cvd_msg = (f"⚠️ <b>Сигнал отфильтрован по CVD!</b>\n<i>({cvd_analysis['reason']})</i>\n"
                    f"<b>Активирован кулдаун на 5 минут.</b>")
         await broadcast_func(app, cvd_msg)
         state['cvd_cooldown_until'] = time.time() + 300
         save_state_func()
         return
     else:
-        cvd_msg = (f"✅ <b>Сигнал подтвержден по CVD.</b>\n"
-                   f"<i>({cvd_analysis['reason']})</i>")
+        cvd_msg = (f"✅ <b>Сигнал подтвержден по CVD.</b>\n<i>({cvd_analysis['reason']})</i>")
         await broadcast_func(app, cvd_msg)
         if 'cvd_cooldown_until' in state:
             del state['cvd_cooldown_until']
@@ -222,7 +217,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         await broadcast_func(app, "Произошла внутренняя ошибка при обработке сигнала.")
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    bot_version = "19.1.0"
+    bot_version = "20.0.0"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}).")
     
