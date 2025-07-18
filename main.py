@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v12.0.0 - Unified Logging
+# v16.0.0 - Static Golden Corridor + CVD
 # Changelog 18-Jul-2025 (Europe/Belgrade):
-# • Логирование параметров объединено с логом сделок.
-# • Добавлены новые колонки для записи параметров, активных в момент сделки.
+# • Вся динамическая адаптация удалена.
+# • Добавлен фильтр по CVD.
 # ============================================================================
 
 import os
@@ -19,7 +19,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "12.0.0" 
+BOT_VERSION        = "16.0.0" 
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -32,14 +32,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 TRADE_LOG_WS = None
 SHEET_NAME   = f"Trading_Log_v{BOT_VERSION}" 
 
-# ОБНОВЛЕННЫЙ СПИСОК ЗАГОЛОВКОВ
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Confidence_Score", "Algorithm_Type", 
     "Strategy_Idea", "Entry_Price", "SL_Price", "TP_Price", 
     "Status", "Exit_Time_UTC", "Exit_Price", "Entry_ATR", "PNL_USD", "PNL_Percent",
-    "Trigger_Order_USD", 
-    # Новые колонки для параметров
-    "Param_Liquidity", "Param_Imbalance", "Param_Large_Order"
+    "Trigger_Order_USD"
 ]
 
 def setup_sheets():
@@ -122,7 +119,6 @@ async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
         if not state.get("bot_on", False):
             state["bot_on"] = True
         await update.message.reply_text(f"🚀 Запускаю основной цикл (v{BOT_VERSION})...")
-        # Убираем params_log_ws, он больше не нужен
         app._main_loop_task = asyncio.create_task(scanner_main_loop(app, broadcast, TRADE_LOG_WS, state, save_state))
 
 if __name__ == "__main__":
