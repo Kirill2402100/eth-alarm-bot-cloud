@@ -4,6 +4,7 @@ import ccxt.async_support as ccxt
 from trade_executor import log_trade_to_sheet, update_trade_in_sheet
 import time
 from datetime import datetime, timezone
+import numpy as np # <-- Добавляем numpy для безопасного деления
 
 # === Конфигурация ===
 PAIR_TO_SCAN = 'BTC/USDT'
@@ -85,11 +86,13 @@ async def get_cvd_analysis(exchange, pair, expected_side):
         return {'confirmed': True, 'reason': f"Ошибка при расчете CVD: {e}"}
 
 async def get_adx_value(exchange, pair, timeframe='15m', period=14):
+    """Рассчитывает и возвращает последнее значение ADX с защитой от деления на ноль."""
     try:
         ohlcv = await exchange.fetch_ohlcv(pair, timeframe, limit=period * 3)
         if len(ohlcv) < period * 2: return None
             
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        
         plus_dm = df['high'].diff()
         minus_dm = df['low'].diff()
         plus_dm[plus_dm < 0] = 0
@@ -100,27 +103,30 @@ async def get_adx_value(exchange, pair, timeframe='15m', period=14):
         
         plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
         minus_di = 100 * (abs(minus_dm.ewm(alpha=1/period, adjust=False).mean()) / atr)
-        dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
-        adx = dx.ewm(alpha=1/period, adjust=False).mean()
+        
+        # --- ИСПРАВЛЕНИЕ: Защита от деления на ноль ---
+        di_sum = plus_di + minus_di
+        dx = (abs(plus_di - minus_di) / di_sum.replace(0, np.nan)) * 100 # Заменяем 0 на NaN для безопасного деления
+        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
+        adx = dx.ewm(alpha=1/period, adjust=False).mean().fillna(0) # Заполняем возможные NaN нулями
+        
         return adx.iloc[-1]
     except Exception as e:
         print(f"ADX calculation error: {e}")
         return None
 
 async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
-    # --- ИСПРАВЛЕННАЯ ЛОГИКА КУЛДАУНА ---
     if 'cvd_cooldown_until' in state:
-        if time.time() < state['cvd_cooldown_until']:
-            return # Кулдаун еще активен, пропускаем
+        if time.time() < state['cvd_cooldown_until']: return
         else:
-            # Кулдаун истек, удаляем ключ и продолжаем
             del state['cvd_cooldown_until']
             save_state_func()
-            print("CVD cooldown expired. Resuming signal search.")
-    # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
     
     adx_value = await get_adx_value(exchange, PAIR_TO_SCAN)
-    if adx_value is None: return
+    if adx_value is None:
+        print("ADX calculation failed, skipping scan.")
+        return
 
     params = PARAMS_ACTIVE_MARKET if adx_value >= 25 else PARAMS_CALM_MARKET
     market_mode = "Активный" if adx_value >= 25 else "Спокойный"
@@ -172,6 +178,9 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         cvd_msg = (f"✅ <b>Сигнал подтвержден по CVD.</b>\n"
                    f"<i>({cvd_analysis['reason']})</i>")
         await broadcast_func(app, cvd_msg)
+        if 'cvd_cooldown_until' in state:
+            del state['cvd_cooldown_until']
+            save_state_func()
 
     try:
         ticker = await exchange.fetch_ticker(PAIR_TO_SCAN)
@@ -213,7 +222,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         await broadcast_func(app, "Произошла внутренняя ошибка при обработке сигнала.")
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    bot_version = "18.3.0"
+    bot_version = "19.1.0"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}).")
     
