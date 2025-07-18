@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v20.0.0 - Final
+# v20.0.0 - Info Command & Cooldown Update
 # ============================================================================
 
 import os
@@ -57,7 +57,7 @@ def setup_sheets():
     except Exception as e:
         log.error("Sheets init failed: %s", e)
 
-# (Остальная часть файла без изменений)
+# (load_state, save_state, broadcast без изменений)
 STATE_FILE = "bot_state.json"
 state = {}
 def load_state():
@@ -80,6 +80,7 @@ async def broadcast(app, txt:str):
         except Exception as e:
             log.error("Send fail %s: %s", cid, e)
 
+# === Команды Telegram ============================================
 async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     if cid not in ctx.application.chat_ids:
@@ -88,7 +89,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     save_state()
     await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} запущен.</b>\n"
                                       f"Логирование в лист: <b>{SHEET_NAME}</b>\n"
-                                      "Используйте /run для запуска основного цикла.", 
+                                      "Используйте /run для запуска и /info для статуса.", 
                                       parse_mode=constants.ParseMode.HTML)
 
 async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -103,9 +104,21 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     msg = (f"<b>Состояние бота v{BOT_VERSION}</b>\n"
            f"<b>Статус:</b> {'✅ ON' if state.get('bot_on') else '🛑 OFF'}\n"
            f"<b>Основной цикл:</b> {'🚀 RUNNING' if is_running else '🔌 STOPPED'}\n"
-           f"<b>Активных сделок:</b> {len(state.get('monitored_signals', []))}\n"
-           f"<b>Логи в листе:</b> <code>{SHEET_NAME}</code>")
+           f"<b>Активных сделок:</b> {len(state.get('monitored_signals', []))}\n")
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
+
+# --- НОВАЯ КОМАНДА INFO ---
+async def cmd_info(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    """Отправляет детальную информацию о текущем состоянии сканера."""
+    status_msg = state.get('last_status_message', 'Статус не определен.')
+    msg = f"<b>Детальный статус сканера:</b>\n\n"
+    if len(state.get('monitored_signals', [])) > 0:
+        msg += "▶️ Режим: <b>Мониторинг активной сделки</b>"
+    else:
+        msg += f"▶️ Режим: <b>{status_msg}</b>"
+    
+    await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
+# --- КОНЕЦ НОВОЙ КОМАНДЫ ---
 
 async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
     app = ctx.application
@@ -126,6 +139,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("info", cmd_info)) # Добавляем новую команду
     app.add_handler(CommandHandler("run", cmd_run))
     log.info(f"Bot v{BOT_VERSION} started polling.")
     app.run_polling()
