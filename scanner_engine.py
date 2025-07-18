@@ -12,20 +12,10 @@ MAX_PORTFOLIO_SIZE = 1
 TP_PERCENT = 0.0018
 SL_PERCENT = 0.0012
 COUNTER_ORDER_RATIO = 1.5
+PARAMS_CALM_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 1500000, "MIN_IMBALANCE_RATIO": 2.5, "LARGE_ORDER_USD": 250000}
+PARAMS_ACTIVE_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 3000000, "MIN_IMBALANCE_RATIO": 3.0, "LARGE_ORDER_USD": 500000}
 
-# --- Коридоры параметров для двух режимов ---
-PARAMS_CALM_MARKET = { # ADX < 25
-    "MIN_TOTAL_LIQUIDITY_USD": 1500000,
-    "MIN_IMBALANCE_RATIO": 2.5,
-    "LARGE_ORDER_USD": 250000
-}
-PARAMS_ACTIVE_MARKET = { # ADX >= 25
-    "MIN_TOTAL_LIQUIDITY_USD": 3000000,
-    "MIN_IMBALANCE_RATIO": 3.0,
-    "LARGE_ORDER_USD": 500000
-}
-
-# (monitor_active_trades без изменений)
+# (monitor_active_trades и другие функции без изменений)
 async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     active_signals = state.get('monitored_signals')
     if not active_signals: return
@@ -86,10 +76,8 @@ async def get_cvd_analysis(exchange, pair, expected_side):
         cvd = buy_volume - sell_volume
         reason_text = f"Покупки: ${buy_volume/1000:,.0f}k | Продажи: ${sell_volume/1000:,.0f}k"
 
-        if expected_side == "LONG" and cvd < 0:
-            return {'confirmed': False, 'reason': reason_text}
-        if expected_side == "SHORT" and cvd > 0:
-            return {'confirmed': False, 'reason': reason_text}
+        if expected_side == "LONG" and cvd < 0: return {'confirmed': False, 'reason': reason_text}
+        if expected_side == "SHORT" and cvd > 0: return {'confirmed': False, 'reason': reason_text}
             
         return {'confirmed': True, 'reason': reason_text}
     except Exception as e:
@@ -97,59 +85,39 @@ async def get_cvd_analysis(exchange, pair, expected_side):
         return {'confirmed': True, 'reason': f"Ошибка при расчете CVD: {e}"}
 
 async def get_adx_value(exchange, pair, timeframe='15m', period=14):
-    """Рассчитывает и возвращает последнее значение ADX."""
     try:
-        # Запрашиваем больше данных для корректного расчета ADX
         ohlcv = await exchange.fetch_ohlcv(pair, timeframe, limit=period * 3)
-        if len(ohlcv) < period * 2:
-            print("Not enough data for ADX calculation.")
-            return None # Возвращаем None, если данных недостаточно
+        if len(ohlcv) < period * 2: return None
             
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        
-        # Ручной расчет ADX
         plus_dm = df['high'].diff()
         minus_dm = df['low'].diff()
         plus_dm[plus_dm < 0] = 0
         minus_dm[minus_dm > 0] = 0
         
-        tr1 = pd.DataFrame(df['high'] - df['low'])
-        tr2 = pd.DataFrame(abs(df['high'] - df['close'].shift(1)))
-        tr3 = pd.DataFrame(abs(df['low'] - df['close'].shift(1)))
-        tr = pd.concat([tr1, tr2, tr3], axis=1, join='inner').max(axis=1)
-        
+        tr = pd.concat([df['high'] - df['low'], abs(df['high'] - df['close'].shift(1)), abs(df['low'] - df['close'].shift(1))], axis=1).max(axis=1)
         atr = tr.ewm(alpha=1/period, adjust=False).mean()
         
         plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
         minus_di = 100 * (abs(minus_dm.ewm(alpha=1/period, adjust=False).mean()) / atr)
-        
         dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
         adx = dx.ewm(alpha=1/period, adjust=False).mean()
-        
         return adx.iloc[-1]
     except Exception as e:
         print(f"ADX calculation error: {e}")
         return None
 
 async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
-    # --- НОВЫЙ БЛОК: ОПРЕДЕЛЕНИЕ РЕЖИМА РАБОТЫ ПО ADX ---
-    adx_value = await get_adx_value(exchange, PAIR_TO_SCAN)
-    if adx_value is None:
-        print("Could not get ADX value, skipping scan.")
-        return # Пропускаем поиск, если не удалось посчитать ADX
-
-    if adx_value >= 25:
-        params = PARAMS_ACTIVE_MARKET
-        market_mode = "Активный"
-    else:
-        params = PARAMS_CALM_MARKET
-        market_mode = "Спокойный"
+    if 'cvd_cooldown_until' in state and time.time() < state['cvd_cooldown_until']:
+        return
     
-    # Используем выбранные параметры
-    min_total_liquidity = params["MIN_TOTAL_LIQUIDITY_USD"]
-    min_imbalance_ratio = params["MIN_IMBALANCE_RATIO"]
-    large_order_usd = params["LARGE_ORDER_USD"]
-    # --- КОНЕЦ НОВОГО БЛОКА ---
+    adx_value = await get_adx_value(exchange, PAIR_TO_SCAN)
+    if adx_value is None: return
+
+    params = PARAMS_ACTIVE_MARKET if adx_value >= 25 else PARAMS_CALM_MARKET
+    market_mode = "Активный" if adx_value >= 25 else "Спокойный"
+    
+    min_total_liquidity, min_imbalance_ratio, large_order_usd = params.values()
 
     try:
         order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=50)
@@ -164,8 +132,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
     
     if (total_bids_usd + total_asks_usd) < min_total_liquidity: return
     
-    imbalance_ratio = (max(total_bids_usd, total_asks_usd) / min(total_bids_usd, total_asks_usd) 
-                       if total_bids_usd > 0 and total_asks_usd > 0 else float('inf'))
+    imbalance_ratio = (max(total_bids_usd, total_asks_usd) / min(total_bids_usd, total_asks_usd) if total_bids_usd > 0 and total_asks_usd > 0 else float('inf'))
     if imbalance_ratio == float('inf'): return
     if imbalance_ratio < min_imbalance_ratio: return
 
@@ -187,13 +154,17 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
 
     if not cvd_analysis['confirmed']:
         cvd_msg = (f"⚠️ <b>Сигнал отфильтрован по CVD!</b>\n"
-                   f"<i>({cvd_analysis['reason']})</i>")
+                   f"<i>({cvd_analysis['reason']})</i>\n"
+                   f"<b>Активирован кулдаун на 5 минут.</b>")
         await broadcast_func(app, cvd_msg)
+        state['cvd_cooldown_until'] = time.time() + 300
+        save_state_func()
         return
     else:
         cvd_msg = (f"✅ <b>Сигнал подтвержден по CVD.</b>\n"
                    f"<i>({cvd_analysis['reason']})</i>")
         await broadcast_func(app, cvd_msg)
+        if 'cvd_cooldown_until' in state: del state['cvd_cooldown_until']
 
     try:
         ticker = await exchange.fetch_ticker(PAIR_TO_SCAN)
@@ -206,17 +177,17 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         sl_price = current_price * (1 - SL_PERCENT if side == "LONG" else 1 + SL_PERCENT)
         tp_price = current_price * (1 + TP_PERCENT if side == "LONG" else 1 - TP_PERCENT)
 
-        decision = {
-            "Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+        decision = {"Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
             "Pair": PAIR_TO_SCAN, "Confidence_Score": 10, "Algorithm_Type": f"Imbalance + CVD (ADX: {adx_value:.1f})",
             "Strategy_Idea": f"Дисбаланс {imbalance_ratio:.1f}x в пользу {dominant_side}",
             "Entry_Price": current_price, "SL_Price": sl_price, "TP_Price": tp_price, "side": side,
-            "Trigger_Order_USD": largest_order['value_usd'] if largest_order else 0,
-        }
+            "Trigger_Order_USD": largest_order['value_usd'] if largest_order else 0,}
         
+        # --- ИСПРАВЛЕНИЕ: Динамический расчет RR для сообщения ---
+        rr_ratio = TP_PERCENT / SL_PERCENT if SL_PERCENT > 0 else 0
         msg = (f"<b>ВХОД В СДЕЛКУ</b>\n\n"
                f"<b>Тип:</b> Pure Quant Entry (Fixed %)\n"
-               f"<b>Рассчитанный план (RR ~1.5:1):</b>\n"
+               f"<b>Рассчитанный план (RR ~{rr_ratio:.1f}:1):</b>\n"
                f" - Вход (<b>{side}</b>): <code>{current_price:.2f}</code>\n"
                f" - SL: <code>{sl_price:.2f}</code>\n"
                f" - TP: <code>{tp_price:.2f}</code>")
@@ -236,7 +207,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         await broadcast_func(app, "Произошла внутренняя ошибка при обработке сигнала.")
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    bot_version = "18.0.0"
+    bot_version = "18.2.0"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}).")
     
