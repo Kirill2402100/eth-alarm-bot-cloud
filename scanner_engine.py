@@ -15,7 +15,7 @@ COUNTER_ORDER_RATIO = 1.5
 PARAMS_CALM_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 1500000, "MIN_IMBALANCE_RATIO": 2.5, "LARGE_ORDER_USD": 250000}
 PARAMS_ACTIVE_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 3000000, "MIN_IMBALANCE_RATIO": 3.0, "LARGE_ORDER_USD": 500000}
 
-# (monitor_active_trades и другие функции без изменений)
+# (monitor_active_trades без изменений)
 async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     active_signals = state.get('monitored_signals')
     if not active_signals: return
@@ -108,8 +108,16 @@ async def get_adx_value(exchange, pair, timeframe='15m', period=14):
         return None
 
 async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
-    if 'cvd_cooldown_until' in state and time.time() < state['cvd_cooldown_until']:
-        return
+    # --- ИСПРАВЛЕННАЯ ЛОГИКА КУЛДАУНА ---
+    if 'cvd_cooldown_until' in state:
+        if time.time() < state['cvd_cooldown_until']:
+            return # Кулдаун еще активен, пропускаем
+        else:
+            # Кулдаун истек, удаляем ключ и продолжаем
+            del state['cvd_cooldown_until']
+            save_state_func()
+            print("CVD cooldown expired. Resuming signal search.")
+    # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
     
     adx_value = await get_adx_value(exchange, PAIR_TO_SCAN)
     if adx_value is None: return
@@ -164,7 +172,6 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         cvd_msg = (f"✅ <b>Сигнал подтвержден по CVD.</b>\n"
                    f"<i>({cvd_analysis['reason']})</i>")
         await broadcast_func(app, cvd_msg)
-        if 'cvd_cooldown_until' in state: del state['cvd_cooldown_until']
 
     try:
         ticker = await exchange.fetch_ticker(PAIR_TO_SCAN)
@@ -183,7 +190,6 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
             "Entry_Price": current_price, "SL_Price": sl_price, "TP_Price": tp_price, "side": side,
             "Trigger_Order_USD": largest_order['value_usd'] if largest_order else 0,}
         
-        # --- ИСПРАВЛЕНИЕ: Динамический расчет RR для сообщения ---
         rr_ratio = TP_PERCENT / SL_PERCENT if SL_PERCENT > 0 else 0
         msg = (f"<b>ВХОД В СДЕЛКУ</b>\n\n"
                f"<b>Тип:</b> Pure Quant Entry (Fixed %)\n"
@@ -207,7 +213,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         await broadcast_func(app, "Произошла внутренняя ошибка при обработке сигнала.")
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    bot_version = "18.2.0"
+    bot_version = "18.3.0"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}).")
     
