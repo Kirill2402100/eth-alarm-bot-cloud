@@ -37,19 +37,18 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
 
     try:
         try:
-            # --- ИЗМЕНЕНИЕ: Явно указываем, что нужны данные с фьючерсов ---
             params = {'type': 'swap'}
             ohlcv = await asyncio.wait_for(exchange.fetch_ohlcv(pair, timeframe='1m', limit=2, params=params), timeout=API_TIMEOUT)
-            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         except asyncio.TimeoutError:
             print(f"Monitor OHLCV Timeout for {pair}")
+            await broadcast_func(app, f"⏱️ API Timeout: Не удалось получить данные о свечах для мониторинга.")
             return
 
-        if not ohlcv or len(ohlcv) < 2: return
-
-        # Диагностический print, который помог найти ошибку
-        prev_candle, last_candle = ohlcv[0], ohlcv[1]
-        print(f"MONITOR CHECK | Prev Candle: H={prev_candle[2]} L={prev_candle[3]} | Last Candle: H={last_candle[2]} L={last_candle[3]} | SL={sl_price} TP={tp_price}")
+        # --- ИЗМЕНЕНИЕ: Добавляем уведомление при отсутствии данных ---
+        if not ohlcv or len(ohlcv) < 2:
+            await broadcast_func(app, f"⏱️ API Warning: Биржа не предоставила данные о свечах. Пропускаю проверку.")
+            return
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
         exit_status, exit_price = None, None
         
@@ -87,9 +86,10 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
         print(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
         await broadcast_func(app, error_message)
 
+# (Остальные функции без изменений)
 async def get_cvd_analysis(exchange, pair, expected_side):
     try:
-        trades = await exchange.fetch_trades(pair, limit=100, params={'type': 'swap'}) # Добавляем params и сюда
+        trades = await exchange.fetch_trades(pair, limit=100, params={'type': 'swap'})
         if not trades: return {'confirmed': True, 'reason': "Нет данных о сделках"}
         buy_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'buy')
         sell_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'sell')
@@ -104,10 +104,8 @@ async def get_cvd_analysis(exchange, pair, expected_side):
 
 async def get_adx_value(exchange, pair, timeframe='15m', period=14):
     try:
-        # --- ИЗМЕНЕНИЕ: Явно указываем, что нужны данные с фьючерсов ---
         params = {'type': 'swap'}
         ohlcv = await exchange.fetch_ohlcv(pair, timeframe, limit=period * 3, params=params)
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         if len(ohlcv) < period * 2: return None
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         plus_dm = df['high'].diff()
@@ -146,7 +144,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
     
     min_total_liquidity, min_imbalance_ratio, large_order_usd = params.values()
     
-    order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=50, params={'type': 'swap'}) # Добавляем params и сюда
+    order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=50, params={'type': 'swap'})
     large_bids = sorted([{'price': p, 'value_usd': round(p*a)} for p, a in order_book.get('bids', []) if p and a and (p*a > large_order_usd)], key=lambda x: x['value_usd'], reverse=True)
     large_asks = sorted([{'price': p, 'value_usd': round(p*a)} for p, a in order_book.get('asks', []) if p and a and (p*a > large_order_usd)], key=lambda x: x['value_usd'], reverse=True)
     total_bids_usd = sum(b['value_usd'] for b in large_bids[:TOP_N_ORDERS_TO_ANALYZE])
@@ -187,7 +185,12 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
             del state['cvd_cooldown_until']
             save_state_func()
     
-    ticker = await exchange.fetch_ticker(PAIR_TO_SCAN, params={'type': 'swap'}) # Добавляем params и сюда
+    try:
+        ticker = await asyncio.wait_for(exchange.fetch_ticker(PAIR_TO_SCAN, params={'type': 'swap'}), timeout=API_TIMEOUT)
+    except asyncio.TimeoutError:
+        await broadcast_func(app, "⚠️ Не удалось получить цену (таймаут API). Сделка пропущена.")
+        return
+
     current_price = ticker.get('last')
     if not current_price:
         await broadcast_func(app, f"⚠️ Не удалось получить цену. Сделка пропущена.")
@@ -220,7 +223,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         await broadcast_func(app, "⚠️ Не удалось сохранить сделку в Google Sheets.")
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    bot_version = "24.0.0"
+    bot_version = "25.0.0"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}).")
     
