@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v20.0.0 - Info Command & Cooldown Update
+# v24.1 - API Test Command
 # ============================================================================
 
 import os
@@ -11,12 +11,14 @@ from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import ccxt.async_support as ccxt # Добавляем импорт ccxt
+from datetime import datetime # Добавляем импорт datetime
 
 import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "20.0.0" 
+BOT_VERSION        = "24.1" 
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -45,19 +47,16 @@ def setup_sheets():
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         gs = gspread.authorize(creds)
         ss = gs.open_by_key(SHEET_ID)
-
         try:
             TRADE_LOG_WS = ss.worksheet(SHEET_NAME)
         except gspread.WorksheetNotFound:
             TRADE_LOG_WS = ss.add_worksheet(title=SHEET_NAME, rows="1000", cols=len(HEADERS))
             TRADE_LOG_WS.update("A1", [HEADERS])
             TRADE_LOG_WS.format(f"A1:{chr(ord('A')+len(HEADERS)-1)}1", {"textFormat":{"bold":True}})
-        
         log.info("Google-Sheets ready. Logging to '%s'.", SHEET_NAME)
     except Exception as e:
         log.error("Sheets init failed: %s", e)
 
-# (load_state, save_state, broadcast без изменений)
 STATE_FILE = "bot_state.json"
 state = {}
 def load_state():
@@ -107,17 +106,35 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
            f"<b>Активных сделок:</b> {len(state.get('monitored_signals', []))}\n")
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
-# --- НОВАЯ КОМАНДА INFO ---
 async def cmd_info(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    """Отправляет детальную информацию о текущем состоянии сканера."""
-    status_msg = state.get('last_status_message', 'Статус не определен.')
-    msg = f"<b>Детальный статус сканера:</b>\n\n"
-    if len(state.get('monitored_signals', [])) > 0:
-        msg += "▶️ Режим: <b>Мониторинг активной сделки</b>"
-    else:
-        msg += f"▶️ Режим: <b>{status_msg}</b>"
-    
+    status_info = "Мониторинг активной сделки" if state.get('monitored_signals') else state.get('last_status_info', 'инициализация...')
+    msg = f"<b>Детальный статус сканера (v{BOT_VERSION}):</b>\n\n▶️ {status_info}"
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
+
+# --- НОВАЯ ТЕСТОВАЯ КОМАНДА ---
+async def cmd_testapi(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Начинаю тест API биржи MEXC для фьючерсов...")
+    exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
+    symbol = 'BTC/USDT'
+    reply_text = f"<b>Результат теста API для {symbol} фьючерсов на {exchange.id}:</b>\n\n"
+    
+    try:
+        params = {'type': 'swap'}
+        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe='1m', limit=2, params=params)
+        
+        if ohlcv and len(ohlcv) > 0:
+            reply_text += "✅ <b>УСПЕХ!</b> Данные по свечам получены:\n"
+            for candle in ohlcv:
+                dt_object = datetime.fromtimestamp(candle[0] / 1000)
+                reply_text += f"<pre>  - {dt_object.strftime('%H:%M:%S')}, H: {candle[2]}, L: {candle[3]}</pre>\n"
+        else:
+            reply_text += "❌ <b>ПРОВАЛ!</b> Биржа вернула пустой ответ. Данные по фьючерсам недоступны."
+
+    except Exception as e:
+        reply_text += f"❌ <b>КРИТИЧЕСКАЯ ОШИБКА:</b>\n<pre>{e}</pre>"
+    
+    await exchange.close()
+    await update.message.reply_text(reply_text, parse_mode=constants.ParseMode.HTML)
 # --- КОНЕЦ НОВОЙ КОМАНДЫ ---
 
 async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -139,7 +156,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("info", cmd_info)) # Добавляем новую команду
+    app.add_handler(CommandHandler("info", cmd_info))
+    app.add_handler(CommandHandler("testapi", cmd_testapi)) # Добавляем новую команду
     app.add_handler(CommandHandler("run", cmd_run))
     log.info(f"Bot v{BOT_VERSION} started polling.")
     app.run_polling()
