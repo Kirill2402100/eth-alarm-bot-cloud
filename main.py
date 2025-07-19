@@ -1,6 +1,6 @@
 # main_bot.py
 # ============================================================================
-# v25.3 - Исправление критических ошибок в логике
+# v25.5 - Возвращена логика экстренного выхода и столбец Trigger_Order_USD
 # ============================================================================
 
 import os
@@ -19,7 +19,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "25.3"
+BOT_VERSION        = "25.5"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -32,13 +32,14 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 TRADE_LOG_WS = None
 SHEET_NAME   = f"Trading_Log_v{BOT_VERSION}"
 
+# --- ИЗМЕНЕНИЕ: Возвращен столбец Trigger_Order_USD ---
 HEADERS = [
-    "Signal_ID", "Timestamp_UTC", "Pair", "Confidence_Score", "Algorithm_Type",
-    "Strategy_Idea", "Entry_Price", "SL_Price", "TP_Price", "side",
-    "Deposit", "Leverage",
+    "Signal_ID", "Timestamp_UTC", "Pair", "Algorithm_Type", "Strategy_Idea",
+    "Entry_Price", "SL_Price", "TP_Price", "side", "Deposit", "Leverage",
     "Status", "Exit_Time_UTC", "Exit_Price", "PNL_USD", "PNL_Percent",
     "Trigger_Order_USD"
 ]
+# --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
 def setup_sheets():
     global TRADE_LOG_WS
@@ -65,7 +66,7 @@ def setup_sheets():
         TRADE_LOG_WS = None
         trade_executor.TRADE_LOG_WS = None
 
-# === Состояние бота =======================================================
+# === Состояние бота (без изменений) =======================================
 STATE_FILE = "bot_state.json"
 state = {}
 def load_state():
@@ -91,7 +92,7 @@ async def broadcast(app, txt:str):
         except Exception as e:
             log.error("Send fail %s: %s", cid, e)
 
-# === Команды Telegram ============================================
+# === Команды Telegram (без изменений) =======================================
 async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     if cid not in ctx.application.chat_ids:
