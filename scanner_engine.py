@@ -1,3 +1,4 @@
+# scanner_engine.py
 import asyncio
 import pandas as pd
 import ccxt.async_support as ccxt
@@ -18,6 +19,7 @@ PARAMS_ACTIVE_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 3000000, "MIN_IMBALANCE_RATIO
 API_TIMEOUT = 10.0
 
 async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
+    """Мониторит открытые сделки на предмет достижения TP/SL или экстренного выхода."""
     active_signals = state.get('monitored_signals')
     if not active_signals: return
     signal = active_signals[0]
@@ -52,6 +54,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
 
         exit_status, exit_price = None, None
         
+        # Проверка на SL/TP по последним свечам
         for candle in ohlcv:
             candle_high = float(candle[2])
             candle_low = float(candle[3])
@@ -63,17 +66,19 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
                 elif candle_low <= tp_price: exit_status, exit_price = "TP_HIT", tp_price
             if exit_status: break
         
+        # Проверка на экстренный выход (появление контр-ордера)
         if not exit_status and trigger_order_usd > 0:
             order_book = await exchange.fetch_order_book(pair, limit=25, params={'type': 'swap'}) # Явное указание
-            current_price = float(ohlcv[-1][4])
+            current_price = float(ohlcv[-1][4]) # Берем последнюю цену закрытия
             if side == 'LONG' and any((p*a) > (trigger_order_usd * COUNTER_ORDER_RATIO) for p, a in order_book.get('asks', [])):
                 exit_status, exit_price = "EMERGENCY_EXIT", current_price
             elif side == 'SHORT' and any((p*a) > (trigger_order_usd * COUNTER_ORDER_RATIO) for p, a in order_book.get('bids', [])):
                 exit_status, exit_price = "EMERGENCY_EXIT", current_price
 
+        # Если сделка закрыта
         if exit_status:
-            pnl_percent = (((exit_price - entry_price) / entry_price if entry_price != 0 else 0) * (-1 if side == 'SHORT' else 1) * 100 * 100)
-            pnl_usd = 50 * (pnl_percent / 100)
+            pnl_percent = (((exit_price - entry_price) / entry_price if entry_price != 0 else 0) * (-1 if side == 'SHORT' else 1) * 100)
+            pnl_usd = 50 * (pnl_percent / 100) # Примерный расчет для плеча x100 и депозита 50$
             await update_trade_in_sheet(trade_log_ws, signal, exit_status, exit_price, pnl_usd, pnl_percent)
             emoji = "⚠️" if exit_status == "EMERGENCY_EXIT" else ("✅" if pnl_usd > 0 else "❌")
             msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({exit_status})</b>\n\n<b>Инструмент:</b> <code>{pair}</code>\n<b>Результат: ${pnl_usd:+.2f} ({pnl_percent:+.2f}%)</b>")
@@ -87,6 +92,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
         await broadcast_func(app, error_message)
 
 async def get_cvd_analysis(exchange, pair, expected_side):
+    """Анализирует кумулятивную дельту объема (CVD) для подтверждения сигнала."""
     try:
         trades = await exchange.fetch_trades(pair, limit=100, params={'type': 'swap'}) # Явное указание
         if not trades: return {'confirmed': True, 'reason': "Нет данных о сделках"}
@@ -102,6 +108,7 @@ async def get_cvd_analysis(exchange, pair, expected_side):
         return {'confirmed': True, 'reason': f"Ошибка CVD: {e}"}
 
 async def get_adx_value(exchange, pair, timeframe='15m', period=14):
+    """Рассчитывает значение ADX для определения волатильности рынка."""
     try:
         params = {'type': 'swap'}
         ohlcv = await exchange.fetch_ohlcv(pair, timeframe, limit=period * 3, params=params) # Явное указание
@@ -124,6 +131,7 @@ async def get_adx_value(exchange, pair, timeframe='15m', period=14):
         return None
 
 async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
+    """Сканирует рынок на наличие новых торговых возможностей."""
     if 'cvd_cooldown_until' in state:
         if time.time() < state['cvd_cooldown_until']:
             state['last_status_info'] = f"Кулдаун активен еще {int(state['cvd_cooldown_until'] - time.time())} сек."
@@ -184,18 +192,37 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
             del state['cvd_cooldown_until']
             save_state_func()
     
+    # === КЛЮЧЕВОЕ ИЗМЕНЕНИЕ ===
+    # Было: После подтверждения сигнала по CVD, бот делал еще один запрос fetch_ticker,
+    # чтобы получить актуальную цену. Этот запрос "зависал" и останавливал бота.
+    #
+    # Стало: Бот больше не делает этот запрос. Вместо этого он мгновенно берет цену
+    # из книги ордеров, которую он уже получил для анализа сигнала.
+    # Это гарантирует, что бот не "зависнет" на этом шаге, и, как бонус,
+    # делает вход в сделку немного быстрее.
+    side = "LONG" if dominant_side_is_bids else "SHORT"
     try:
-        ticker = await asyncio.wait_for(exchange.fetch_ticker(PAIR_TO_SCAN, params={'type': 'swap'}), timeout=API_TIMEOUT)
-    except asyncio.TimeoutError:
-        await broadcast_func(app, "⚠️ Не удалось получить цену (таймаут API). Сделка пропущена.")
+        if side == "LONG":
+            # Для лонга берем лучшую цену продажи (ask), так как мы покупаем по рынку
+            if not order_book['asks']:
+                await broadcast_func(app, "⚠️ Не удалось получить цену (пустой стакан asks). Сделка пропущена.")
+                return
+            current_price = order_book['asks'][0][0]
+        else: # SHORT
+            # Для шорта берем лучшую цену покупки (bid), так как мы продаем по рынку
+            if not order_book['bids']:
+                await broadcast_func(app, "⚠️ Не удалось получить цену (пустой стакан bids). Сделка пропущена.")
+                return
+            current_price = order_book['bids'][0][0]
+    except (IndexError, KeyError) as e:
+        await broadcast_func(app, f"⚠️ Не удалось извлечь цену из стакана ({e}). Сделка пропущена.")
         return
+    # === КОНЕЦ КЛЮЧЕВОГО ИЗМЕНЕНИЯ ===
 
-    current_price = ticker.get('last')
     if not current_price:
         await broadcast_func(app, f"⚠️ Не удалось получить цену. Сделка пропущена.")
         return
 
-    side = "LONG" if dominant_side_is_bids else "SHORT"
     sl_price = current_price * (1 - SL_PERCENT if side == "LONG" else 1 + SL_PERCENT)
     tp_price = current_price * (1 + TP_PERCENT if side == "LONG" else 1 - TP_PERCENT)
     decision = {"Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
@@ -222,10 +249,12 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         await broadcast_func(app, "⚠️ Не удалось сохранить сделку в Google Sheets.")
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    bot_version = "24.0.0"
+    """Главный цикл работы сканера."""
+    bot_version = "24.1.0" # Обновляем версию с учетом исправлений
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}).")
     
+    # Инициализируем биржу с типом по умолчанию 'swap' для фьючерсов
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
     scan_interval = 15
     while state.get("bot_on", True):
@@ -239,6 +268,7 @@ async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state
             break
         except Exception as e:
             print(f"CRITICAL Error in Main Engine loop: {e}", exc_info=True)
+            await broadcast_func(app, f"Критическая ошибка в главном цикле: {e}")
             await asyncio.sleep(60)
             
     print("Main Engine loop stopped.")
