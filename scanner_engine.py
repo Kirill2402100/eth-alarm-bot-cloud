@@ -15,14 +15,22 @@ SL_PERCENT = 0.0012
 COUNTER_ORDER_RATIO = 1.5
 PARAMS_CALM_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 1500000, "MIN_IMBALANCE_RATIO": 2.5, "LARGE_ORDER_USD": 250000}
 PARAMS_ACTIVE_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 3000000, "MIN_IMBALANCE_RATIO": 3.0, "LARGE_ORDER_USD": 500000}
+API_TIMEOUT = 10.0 # Таймаут для запросов к API в секундах
 
 async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     active_signals = state.get('monitored_signals')
     if not active_signals: return
     signal = active_signals[0]
     try:
-        ohlcv = await exchange.fetch_ohlcv(signal['Pair'], timeframe='1m', limit=2)
-        if len(ohlcv) < 2: return
+        # --- ИЗМЕНЕНИЕ: Добавляем таймаут на запрос ---
+        try:
+            ohlcv = await asyncio.wait_for(exchange.fetch_ohlcv(signal['Pair'], timeframe='1m', limit=2), timeout=API_TIMEOUT)
+        except asyncio.TimeoutError:
+            print(f"Monitor OHLCV Timeout: API call for {signal['Pair']} timed out after {API_TIMEOUT} seconds.")
+            return # Пропускаем эту проверку, если API зависло
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
+        if not ohlcv or len(ohlcv) < 2: return
 
         exit_status, exit_price = None, None
         entry_price, sl_price, tp_price = signal['Entry_Price'], signal['SL_Price'], signal['TP_Price']
@@ -63,6 +71,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
         print(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
         await broadcast_func(app, error_message)
 
+# (Остальные функции без изменений)
 async def get_cvd_analysis(exchange, pair, expected_side):
     try:
         trades = await exchange.fetch_trades(pair, limit=100)
@@ -102,6 +111,7 @@ async def get_adx_value(exchange, pair, timeframe='15m', period=14):
 async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     if 'cvd_cooldown_until' in state:
         if time.time() < state['cvd_cooldown_until']:
+            state['last_status_info'] = f"Кулдаун активен еще {int(state['cvd_cooldown_until'] - time.time())} сек."
             return
         else:
             del state['cvd_cooldown_until']
@@ -109,10 +119,12 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
     
     adx_value = await get_adx_value(exchange, PAIR_TO_SCAN)
     if adx_value is None:
+        state['last_status_info'] = "Ошибка расчета ADX."
         return
 
     params = PARAMS_ACTIVE_MARKET if adx_value >= 25 else PARAMS_CALM_MARKET
     market_mode = "Активный" if adx_value >= 25 else "Спокойный"
+    state['last_status_info'] = f"Поиск | Режим: {market_mode} (ADX: {adx_value:.1f})"
     
     min_total_liquidity, min_imbalance_ratio, large_order_usd = params.values()
     
@@ -189,9 +201,8 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
     else:
         await broadcast_func(app, "⚠️ Не удалось сохранить сделку в Google Sheets.")
 
-# --- ИЗМЕНЕНИЕ: Исправлена передача аргументов ---
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    bot_version = "21.1.0" # Финальная версия
+    bot_version = "22.1.0"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}).")
     
@@ -201,7 +212,6 @@ async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state
         try:
             await monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func)
             if not state.get('monitored_signals'):
-                # Передаем все необходимые аргументы
                 await scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws, state, save_state_func)
             await asyncio.sleep(scan_interval)
         except asyncio.CancelledError:
