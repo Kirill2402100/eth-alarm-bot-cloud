@@ -1,49 +1,73 @@
-import gspread
+# trade_executor.py
+# ============================================================================
+# v25.1 - Модуль для работы с Google Sheets (без изменений)
+# ============================================================================
+import asyncio
 from datetime import datetime, timezone
+import gspread
 
-HEADERS = [
-    "Signal_ID", "Timestamp_UTC", "Pair", "Confidence_Score", "Algorithm_Type", 
-    "Strategy_Idea", "Entry_Price", "SL_Price", "TP_Price", 
-    "Status", "Exit_Time_UTC", "Exit_Price", "Entry_ATR", "PNL_USD", "PNL_Percent",
-    "Trigger_Order_USD"
-]
+TRADE_LOG_WS = None # Сюда будет передан объект воркшита из main_bot.py
 
-async def log_trade_to_sheet(worksheet, decision):
-    if not worksheet: return False
+async def log_trade_to_sheet(decision: dict):
+    """Асинхронно логирует новую сделку в Google Sheets."""
+    if not TRADE_LOG_WS: return False
     try:
-        row_to_add = [decision.get(h, '') for h in HEADERS]
-        row_to_add[HEADERS.index('Status')] = "ACTIVE"
-        worksheet.append_row(row_to_add)
+        # Порядок важен и должен соответствовать HEADERS в main_bot.py
+        row_data = [
+            decision.get("Signal_ID"),
+            decision.get("Timestamp_UTC"),
+            decision.get("Pair"),
+            decision.get("Confidence_Score"),
+            decision.get("Algorithm_Type"),
+            decision.get("Strategy_Idea"),
+            decision.get("Entry_Price"),
+            decision.get("SL_Price"),
+            decision.get("TP_Price"),
+            decision.get("side"),
+            decision.get("Deposit"),
+            decision.get("Leverage"),
+            "OPEN",  # Status
+            None,    # Exit_Time_UTC
+            None,    # Exit_Price
+            None,    # PNL_USD
+            None,    # PNL_Percent
+            decision.get("Trigger_Order_USD")
+        ]
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: TRADE_LOG_WS.append_row(row_data, value_input_option='USER_ENTERED'))
         return True
     except Exception as e:
-        print(f"GSheets log_trade_to_sheet Error: {e}", exc_info=True)
+        print(f"Google Sheets log error: {e}")
         return False
 
-async def update_trade_in_sheet(worksheet, signal, exit_status, exit_price, pnl_usd, pnl_percent):
-    if not worksheet: return False
+async def update_trade_in_sheet(signal: dict, status: str, exit_price: float, pnl_usd: float, pnl_percent: float):
+    """Асинхронно обновляет существующую сделку в Google Sheets."""
+    if not TRADE_LOG_WS: return False
     try:
-        signal_id_to_find = signal.get('Signal_ID')
-        if not signal_id_to_find: return False
-        
-        cell = worksheet.find(signal_id_to_find)
+        signal_id = signal.get("Signal_ID")
+        if not signal_id: return False
+
+        loop = asyncio.get_event_loop()
+        cell = await loop.run_in_executor(None, lambda: TRADE_LOG_WS.find(signal_id))
         if not cell: return False
 
-        row_number = cell.row
-        status_col = chr(ord('A') + HEADERS.index('Status'))
-        exit_time_col = chr(ord('A') + HEADERS.index('Exit_Time_UTC'))
-        exit_price_col = chr(ord('A') + HEADERS.index('Exit_Price'))
-        pnl_usd_col = chr(ord('A') + HEADERS.index('PNL_USD'))
-        pnl_percent_col = chr(ord('A') + HEADERS.index('PNL_Percent'))
-
-        updates = [
-            {'range': f"{status_col}{row_number}", 'values': [[exit_status]]},
-            {'range': f"{exit_time_col}{row_number}", 'values': [[datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')]]},
-            {'range': f"{exit_price_col}{row_number}", 'values': [[exit_price]]},
-            {'range': f"{pnl_usd_col}{row_number}", 'values': [[pnl_usd]]},
-            {'range': f"{pnl_percent_col}{row_number}", 'values': [[pnl_percent]]},
+        exit_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Обновляем ячейки в найденной строке
+        update_tasks = [
+            (f'K{cell.row}', status),
+            (f'L{cell.row}', exit_time),
+            (f'M{cell.row}', exit_price),
+            (f'N{cell.row}', pnl_usd),
+            (f'O{cell.row}', pnl_percent),
         ]
-        worksheet.batch_update(updates)
+        
+        await loop.run_in_executor(None, lambda: TRADE_LOG_WS.batch_update([{'range': r, 'values': [[v]]} for r, v in update_tasks]))
+
         return True
+    except gspread.exceptions.CellNotFound:
+        print(f"Signal ID {signal_id} not found in Google Sheet to update.")
+        return False
     except Exception as e:
-        print(f"GSheets update_trade_in_sheet Error: {e}", exc_info=True)
+        print(f"Google Sheets update error: {e}")
         return False
