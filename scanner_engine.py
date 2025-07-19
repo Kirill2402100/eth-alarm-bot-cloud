@@ -41,14 +41,9 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
             ohlcv = await asyncio.wait_for(exchange.fetch_ohlcv(pair, timeframe='1m', limit=2, params=params), timeout=API_TIMEOUT)
         except asyncio.TimeoutError:
             print(f"Monitor OHLCV Timeout for {pair}")
-            await broadcast_func(app, f"⏱️ API Timeout: Не удалось получить данные о свечах для мониторинга.")
             return
 
-        # --- ИЗМЕНЕНИЕ: Добавляем уведомление при отсутствии данных ---
-        if not ohlcv or len(ohlcv) < 2:
-            await broadcast_func(app, f"⏱️ API Warning: Биржа не предоставила данные о свечах. Пропускаю проверку.")
-            return
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+        if not ohlcv or len(ohlcv) < 2: return
 
         exit_status, exit_price = None, None
         
@@ -64,7 +59,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
             if exit_status: break
         
         if not exit_status and trigger_order_usd > 0:
-            order_book = await exchange.fetch_order_book(pair, limit=25)
+            order_book = await exchange.fetch_order_book(pair, limit=25, params={'type': 'swap'})
             current_price = float(ohlcv[-1][4])
             if side == 'LONG' and any((p*a) > (trigger_order_usd * COUNTER_ORDER_RATIO) for p, a in order_book.get('asks', [])):
                 exit_status, exit_price = "EMERGENCY_EXIT", current_price
@@ -86,7 +81,6 @@ async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, sta
         print(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
         await broadcast_func(app, error_message)
 
-# (Остальные функции без изменений)
 async def get_cvd_analysis(exchange, pair, expected_side):
     try:
         trades = await exchange.fetch_trades(pair, limit=100, params={'type': 'swap'})
@@ -185,16 +179,18 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
             del state['cvd_cooldown_until']
             save_state_func()
     
+    # --- ИЗМЕНЕНИЕ: Берем цену из стакана, а не через fetch_ticker ---
     try:
-        ticker = await asyncio.wait_for(exchange.fetch_ticker(PAIR_TO_SCAN, params={'type': 'swap'}), timeout=API_TIMEOUT)
-    except asyncio.TimeoutError:
-        await broadcast_func(app, "⚠️ Не удалось получить цену (таймаут API). Сделка пропущена.")
+        best_bid = order_book['bids'][0][0] if order_book.get('bids') else None
+        best_ask = order_book['asks'][0][0] if order_book.get('asks') else None
+        if not best_bid or not best_ask:
+            await broadcast_func(app, "⚠️ Не удалось определить цену из стакана. Сделка пропущена.")
+            return
+        current_price = (best_bid + best_ask) / 2
+    except Exception as e:
+        await broadcast_func(app, f"⚠️ Ошибка при получении цены из стакана: {e}")
         return
-
-    current_price = ticker.get('last')
-    if not current_price:
-        await broadcast_func(app, f"⚠️ Не удалось получить цену. Сделка пропущена.")
-        return
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     side = "LONG" if dominant_side_is_bids else "SHORT"
     sl_price = current_price * (1 - SL_PERCENT if side == "LONG" else 1 + SL_PERCENT)
