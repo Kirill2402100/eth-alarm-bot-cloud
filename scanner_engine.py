@@ -12,62 +12,77 @@ TOP_N_ORDERS_TO_ANALYZE = 15
 MAX_PORTFOLIO_SIZE = 1
 TP_PERCENT = 0.0018
 SL_PERCENT = 0.0012
-COUNTER_ORDER_RATIO = 2
+COUNTER_ORDER_RATIO = 2.0
 PARAMS_CALM_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 1500000, "MIN_IMBALANCE_RATIO": 2.5, "LARGE_ORDER_USD": 250000}
 PARAMS_ACTIVE_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 3000000, "MIN_IMBALANCE_RATIO": 3.0, "LARGE_ORDER_USD": 500000}
-API_TIMEOUT = 10.0 # Таймаут для запросов к API в секундах
+API_TIMEOUT = 10.0
 
 async def monitor_active_trades(exchange, app, broadcast_func, trade_log_ws, state, save_state_func):
     active_signals = state.get('monitored_signals')
     if not active_signals: return
     signal = active_signals[0]
+    
+    # Используем .get() для безопасного доступа к ключам
+    pair = signal.get('Pair')
+    entry_price = signal.get('Entry_Price')
+    sl_price = signal.get('SL_Price')
+    tp_price = signal.get('TP_Price')
+    side = signal.get('side')
+    trigger_order_usd = signal.get('Trigger_Order_USD', 0)
+    
+    if not all([pair, entry_price, sl_price, tp_price, side]):
+        state['monitored_signals'] = []
+        save_state_func()
+        await broadcast_func(app, "⚠️ Ошибка в данных сделки, мониторинг остановлен.")
+        return
+
     try:
-        # --- ИЗМЕНЕНИЕ: Добавляем таймаут на запрос ---
         try:
-            ohlcv = await asyncio.wait_for(exchange.fetch_ohlcv(signal['Pair'], timeframe='1m', limit=2), timeout=API_TIMEOUT)
+            ohlcv = await asyncio.wait_for(exchange.fetch_ohlcv(pair, timeframe='1m', limit=2), timeout=API_TIMEOUT)
         except asyncio.TimeoutError:
-            print(f"Monitor OHLCV Timeout: API call for {signal['Pair']} timed out after {API_TIMEOUT} seconds.")
-            return # Пропускаем эту проверку, если API зависло
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+            print(f"Monitor OHLCV Timeout for {pair}")
+            return
 
         if not ohlcv or len(ohlcv) < 2: return
 
+        # --- ДИАГНОСТИЧЕСКИЙ PRINT ---
+        prev_candle, last_candle = ohlcv[0], ohlcv[1]
+        print(f"MONITOR CHECK | Prev Candle: H={prev_candle[2]} L={prev_candle[3]} | Last Candle: H={last_candle[2]} L={last_candle[3]} | SL={sl_price} TP={tp_price}")
+        # --- КОНЕЦ PRINT ---
+
         exit_status, exit_price = None, None
-        entry_price, sl_price, tp_price = signal['Entry_Price'], signal['SL_Price'], signal['TP_Price']
         
         for candle in ohlcv:
             candle_high = float(candle[2])
             candle_low = float(candle[3])
-            if signal['side'] == 'LONG':
+            if side == 'LONG':
                 if candle_low <= sl_price: exit_status, exit_price = "SL_HIT", sl_price
                 elif candle_high >= tp_price: exit_status, exit_price = "TP_HIT", tp_price
-            elif signal['side'] == 'SHORT':
+            elif side == 'SHORT':
                 if candle_high >= sl_price: exit_status, exit_price = "SL_HIT", sl_price
                 elif candle_low <= tp_price: exit_status, exit_price = "TP_HIT", tp_price
             if exit_status: break
         
-        if not exit_status:
-            trigger_order_usd = signal.get('Trigger_Order_USD', 0)
-            if trigger_order_usd > 0:
-                order_book = await exchange.fetch_order_book(signal['Pair'], limit=25)
-                current_price = float(ohlcv[-1][4])
-                if signal['side'] == 'LONG' and any((p*a) > (trigger_order_usd * COUNTER_ORDER_RATIO) for p, a in order_book.get('asks', [])):
-                    exit_status, exit_price = "EMERGENCY_EXIT", current_price
-                elif signal['side'] == 'SHORT' and any((p*a) > (trigger_order_usd * COUNTER_ORDER_RATIO) for p, a in order_book.get('bids', [])):
-                    exit_status, exit_price = "EMERGENCY_EXIT", current_price
+        if not exit_status and trigger_order_usd > 0:
+            order_book = await exchange.fetch_order_book(pair, limit=25)
+            current_price = float(ohlcv[-1][4])
+            if side == 'LONG' and any((p*a) > (trigger_order_usd * COUNTER_ORDER_RATIO) for p, a in order_book.get('asks', [])):
+                exit_status, exit_price = "EMERGENCY_EXIT", current_price
+            elif side == 'SHORT' and any((p*a) > (trigger_order_usd * COUNTER_ORDER_RATIO) for p, a in order_book.get('bids', [])):
+                exit_status, exit_price = "EMERGENCY_EXIT", current_price
 
         if exit_status:
-            pnl_percent = (((exit_price - entry_price) / entry_price if entry_price != 0 else 0) * (-1 if signal['side'] == 'SHORT' else 1) * 100 * 100)
+            pnl_percent = (((exit_price - entry_price) / entry_price if entry_price != 0 else 0) * (-1 if side == 'SHORT' else 1) * 100 * 100)
             pnl_usd = 50 * (pnl_percent / 100)
             await update_trade_in_sheet(trade_log_ws, signal, exit_status, exit_price, pnl_usd, pnl_percent)
             emoji = "⚠️" if exit_status == "EMERGENCY_EXIT" else ("✅" if pnl_usd > 0 else "❌")
-            msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({exit_status})</b>\n\n<b>Инструмент:</b> <code>{signal['Pair']}</code>\n<b>Результат: ${pnl_usd:+.2f} ({pnl_percent:+.2f}%)</b>")
+            msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({exit_status})</b>\n\n<b>Инструмент:</b> <code>{pair}</code>\n<b>Результат: ${pnl_usd:+.2f} ({pnl_percent:+.2f}%)</b>")
             await broadcast_func(app, msg)
             state['monitored_signals'] = []
             save_state_func()
 
     except Exception as e:
-        error_message = f"⚠️ <b>Ошибка мониторинга сделки!</b>\n<code>Ошибка: {e}</code>"
+        error_message = f"⚠️ <b>Критическая ошибка мониторинга!</b>\n<code>Ошибка: {e}</code>"
         print(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
         await broadcast_func(app, error_message)
 
@@ -178,7 +193,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
     side = "LONG" if dominant_side_is_bids else "SHORT"
     sl_price = current_price * (1 - SL_PERCENT if side == "LONG" else 1 + SL_PERCENT)
     tp_price = current_price * (1 + TP_PERCENT if side == "LONG" else 1 - TP_PERCENT)
-    decision = {"Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+    decision = {"Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%м-%d %H:%M:%S'),
         "Pair": PAIR_TO_SCAN, "Confidence_Score": 10, "Algorithm_Type": f"Imbalance + CVD (ADX: {adx_value:.1f})",
         "Strategy_Idea": f"Дисбаланс {imbalance_ratio:.1f}x в пользу {dominant_side}",
         "Entry_Price": current_price, "SL_Price": sl_price, "TP_Price": tp_price, "side": side,
@@ -202,7 +217,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, trade_log_ws
         await broadcast_func(app, "⚠️ Не удалось сохранить сделку в Google Sheets.")
 
 async def scanner_main_loop(app, broadcast_func, trade_log_ws, state, save_state_func):
-    bot_version = "22.1.0"
+    bot_version = "23.0.0"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}).")
     
