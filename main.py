@@ -1,6 +1,6 @@
 # main_bot.py
 # ============================================================================
-# v25.1 - Автоматическое создание нового листа Google Sheets при смене версии
+# v25.3 - Исправление критических ошибок в логике
 # ============================================================================
 
 import os
@@ -19,9 +19,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-# --- ИЗМЕНЕНИЕ: Обновлена версия бота ---
-BOT_VERSION        = "25.1"
-# --- КОНЕЦ ИЗМЕНЕНИЯ ---
+BOT_VERSION        = "25.3"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -53,7 +51,6 @@ def setup_sheets():
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         gs = gspread.authorize(creds)
         ss = gs.open_by_key(SHEET_ID)
-        # --- ИЗМЕНЕНИЕ: Логика упрощена. Бот всегда создает новый лист, если имя не найдено. ---
         try:
             TRADE_LOG_WS = ss.worksheet(SHEET_NAME)
         except gspread.WorksheetNotFound:
@@ -61,9 +58,8 @@ def setup_sheets():
             TRADE_LOG_WS = ss.add_worksheet(title=SHEET_NAME, rows="1000", cols=len(HEADERS))
             TRADE_LOG_WS.update("A1", [HEADERS])
             TRADE_LOG_WS.format(f"A1:{chr(ord('A')+len(HEADERS)-1)}1", {"textFormat":{"bold":True}})
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         log.info("Google-Sheets ready. Logging to '%s'.", SHEET_NAME)
-        trade_executor.TRADE_LOG_WS = TRADE_LOG_WS # Передаем воркшит в модуль
+        trade_executor.TRADE_LOG_WS = TRADE_LOG_WS
     except Exception as e:
         log.error("Sheets init failed: %s", e)
         TRADE_LOG_WS = None
@@ -139,7 +135,6 @@ async def cmd_info(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
 async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Устанавливает размер депозита для расчета PNL."""
     try:
         new_deposit = float(ctx.args[0])
         if new_deposit <= 0:
@@ -149,11 +144,9 @@ async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_state()
         await update.message.reply_text(f"✅ Депозит установлен: <b>${new_deposit}</b>", parse_mode=constants.ParseMode.HTML)
     except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ Неверный формат. Используйте: <code>/deposit &lt;сумма&gt;</code>\n"
-                                      f"Например: <code>/deposit 100.50</code>", parse_mode=constants.ParseMode.HTML)
+        await update.message.reply_text("⚠️ Неверный формат. Используйте: <code>/deposit &lt;сумма&gt;</code>", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Устанавливает размер плеча для расчета PNL."""
     try:
         new_leverage = int(ctx.args[0])
         if not 1 <= new_leverage <= 200:
@@ -163,8 +156,7 @@ async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_state()
         await update.message.reply_text(f"✅ Плечо установлено: <b>x{new_leverage}</b>", parse_mode=constants.ParseMode.HTML)
     except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ Неверный формат. Используйте: <code>/leverage &lt;число&gt;</code>\n"
-                                      f"Например: <code>/leverage 100</code>", parse_mode=constants.ParseMode.HTML)
+        await update.message.reply_text("⚠️ Неверный формат. Используйте: <code>/leverage &lt;число&gt;</code>", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_testapi(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Начинаю тест API биржи MEXC для фьючерсов...")
@@ -180,7 +172,7 @@ async def cmd_testapi(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
                 dt_object = datetime.fromtimestamp(candle[0] / 1000)
                 reply_text += f"<pre>  - {dt_object.strftime('%H:%M:%S')}, H: {candle[2]}, L: {candle[3]}</pre>\n"
         else:
-            reply_text += "❌ <b>ПРОВАЛ!</b> Биржа вернула пустой ответ. Данные по фьючерсам недоступны."
+            reply_text += "❌ <b>ПРОВАЛ!</b> Биржа вернула пустой ответ."
     except Exception as e:
         reply_text += f"❌ <b>КРИТИЧЕСКАЯ ОШИБКА:</b>\n<pre>{e}</pre>"
     await exchange.close()
