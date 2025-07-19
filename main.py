@@ -1,6 +1,6 @@
 # main_bot.py
 # ============================================================================
-# v25.7 - Восстановлена логика "коридора" для дисбаланса
+# v25.8 - Добавлен фильтр по EMA для подтверждения ценового импульса
 # ============================================================================
 
 import os
@@ -19,7 +19,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "25.7"
+BOT_VERSION        = "25.8"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
