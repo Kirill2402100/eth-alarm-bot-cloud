@@ -1,23 +1,22 @@
 # trade_executor.py
 # ============================================================================
-# v25.1 - Модуль для работы с Google Sheets (без изменений)
+# v25.5 - Возвращена логика экстренного выхода и столбец Trigger_Order_USD
 # ============================================================================
 import asyncio
 from datetime import datetime, timezone
 import gspread
 
-TRADE_LOG_WS = None # Сюда будет передан объект воркшита из main_bot.py
+TRADE_LOG_WS = None
 
 async def log_trade_to_sheet(decision: dict):
     """Асинхронно логирует новую сделку в Google Sheets."""
     if not TRADE_LOG_WS: return False
     try:
-        # Порядок важен и должен соответствовать HEADERS в main_bot.py
+        # --- ИЗМЕНЕНИЕ: Возвращен столбец Trigger_Order_USD ---
         row_data = [
             decision.get("Signal_ID"),
             decision.get("Timestamp_UTC"),
             decision.get("Pair"),
-            decision.get("Confidence_Score"),
             decision.get("Algorithm_Type"),
             decision.get("Strategy_Idea"),
             decision.get("Entry_Price"),
@@ -31,8 +30,9 @@ async def log_trade_to_sheet(decision: dict):
             None,    # Exit_Price
             None,    # PNL_USD
             None,    # PNL_Percent
-            decision.get("Trigger_Order_USD")
+            decision.get("Trigger_Order_USD") # Возвращенное поле
         ]
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: TRADE_LOG_WS.append_row(row_data, value_input_option='USER_ENTERED'))
         return True
@@ -53,13 +53,14 @@ async def update_trade_in_sheet(signal: dict, status: str, exit_price: float, pn
 
         exit_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         
-        # Обновляем ячейки в найденной строке
+        # --- ИЗМЕНЕНИЕ: Буквы столбцов остались прежними, т.к. Trigger_Order_USD идет после обновляемых полей ---
+        # Столбцы: L=Status, M=Exit_Time, N=Exit_Price, O=PNL_USD, P=PNL_%
         update_tasks = [
-            (f'K{cell.row}', status),
-            (f'L{cell.row}', exit_time),
-            (f'M{cell.row}', exit_price),
-            (f'N{cell.row}', pnl_usd),
-            (f'O{cell.row}', pnl_percent),
+            (f'L{cell.row}', status),
+            (f'M{cell.row}', exit_time),
+            (f'N{cell.row}', exit_price),
+            (f'O{cell.row}', pnl_usd),
+            (f'P{cell.row}', pnl_percent),
         ]
         
         await loop.run_in_executor(None, lambda: TRADE_LOG_WS.batch_update([{'range': r, 'values': [[v]]} for r, v in update_tasks]))
