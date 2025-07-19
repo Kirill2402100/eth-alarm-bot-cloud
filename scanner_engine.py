@@ -1,5 +1,6 @@
+# scanner_engine.py
 # ============================================================================
-# v25.7 - Восстановлена логика "коридора" для дисбаланса
+# v25.8 - Добавлен фильтр по EMA для подтверждения ценового импульса
 # ============================================================================
 import asyncio
 import pandas as pd
@@ -15,12 +16,15 @@ TOP_N_ORDERS_TO_ANALYZE = 15
 TP_PERCENT = 0.0018
 SL_PERCENT = 0.0012
 COUNTER_ORDER_RATIO = 2.0
-# --- НОВОЕ ИЗМЕНЕНИЕ: Добавлен максимальный порог для дисбаланса ---
-MAX_IMBALANCE_RATIO = 15.0 # Максимально допустимый дисбаланс, чтобы отсеять сигналы на неликвидном рынке
-# --- КОНЕЦ ИЗМЕНЕНИЯ ---
+MAX_IMBALANCE_RATIO = 15.0 
 PARAMS_CALM_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 1500000, "MIN_IMBALANCE_RATIO": 2.5, "LARGE_ORDER_USD": 250000}
 PARAMS_ACTIVE_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 3000000, "MIN_IMBALANCE_RATIO": 3.0, "LARGE_ORDER_USD": 500000}
 API_TIMEOUT = 10.0
+# --- НОВЫЕ ПАРАМЕТРЫ ---
+EMA_TIMEFRAME = '1m'
+EMA_PERIOD = 9
+# --- КОНЕЦ НОВЫХ ПАРАМЕТРОВ ---
+
 
 async def monitor_active_trades(exchange, app, broadcast_func, state, save_state_func):
     active_signals = state.get('monitored_signals')
@@ -116,6 +120,31 @@ async def get_adx_value(exchange, pair, timeframe='15m', period=14):
         print(f"ADX calculation error: {e}")
         return None
 
+# --- НОВАЯ ФУНКЦИЯ ---
+async def get_ema_filter(exchange, pair, timeframe, period, current_price, side):
+    """Проверяет положение цены относительно EMA для подтверждения импульса."""
+    try:
+        ohlcv = await exchange.fetch_ohlcv(pair, timeframe, limit=period * 2, params={'type': 'swap'})
+        if len(ohlcv) < period:
+            return {'confirmed': True, 'reason': "Недостаточно данных для EMA"}
+        
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        ema = df['close'].ewm(span=period, adjust=False).mean().iloc[-1]
+        
+        reason_text = f"Цена: {current_price:.2f} | EMA({period}): {ema:.2f}"
+        
+        if side == "LONG" and current_price < ema:
+            return {'confirmed': False, 'reason': reason_text}
+        if side == "SHORT" and current_price > ema:
+            return {'confirmed': False, 'reason': reason_text}
+            
+        return {'confirmed': True, 'reason': reason_text}
+    except Exception as e:
+        print(f"EMA filter error: {e}")
+        return {'confirmed': True, 'reason': f"Ошибка EMA: {e}"} # В случае ошибки, пропускаем фильтр
+# --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
+
+
 async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_state_func):
     if 'cvd_cooldown_until' in state and time.time() < state['cvd_cooldown_until']:
         state['last_status_info'] = f"Кулдаун: {int(state['cvd_cooldown_until'] - time.time())} сек."
@@ -140,11 +169,8 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
     
     imbalance_ratio = (max(total_bids_usd, total_asks_usd) / min(total_bids_usd, total_asks_usd) if total_bids_usd > 0 and total_asks_usd > 0 else float('inf'))
     
-    # --- НОВОЕ ИЗМЕНЕНИЕ: Проверяем, что дисбаланс находится в заданном "коридоре" ---
-    # Это отфильтровывает как слишком слабые сигналы, так и подозрительно сильные (признак неликвидности)
     if not (min_imbalance_ratio <= imbalance_ratio <= MAX_IMBALANCE_RATIO):
         return
-    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
     
     dominant_side_is_bids = total_bids_usd > total_asks_usd
     dominant_side = "ПОКУПАТЕЛЕЙ" if dominant_side_is_bids else "ПРОДАВЦОВ"
@@ -160,6 +186,8 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
     await broadcast_func(app, signal_msg)
     
     side = "LONG" if dominant_side_is_bids else "SHORT"
+    
+    # --- ИЗМЕНЕНИЕ: Добавлен третий фильтр по EMA ---
     cvd_analysis = await get_cvd_analysis(exchange, PAIR_TO_SCAN, side)
     if not cvd_analysis['confirmed']:
         await broadcast_func(app, f"⚠️ <b>Сигнал отфильтрован по CVD!</b>\n<i>({cvd_analysis['reason']})</i>\n<b>Кулдаун 3 мин.</b>")
@@ -168,11 +196,20 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
         return
     else:
         await broadcast_func(app, f"✅ <b>Сигнал подтвержден по CVD.</b>\n<i>({cvd_analysis['reason']})</i>")
+
     try:
         current_price = order_book['asks'][0][0] if side == "LONG" else order_book['bids'][0][0]
     except (IndexError, KeyError) as e:
         await broadcast_func(app, f"⚠️ Не удалось извлечь цену из стакана ({e}). Сделка пропущена.")
         return
+
+    ema_filter = await get_ema_filter(exchange, PAIR_TO_SCAN, EMA_TIMEFRAME, EMA_PERIOD, current_price, side)
+    if not ema_filter['confirmed']:
+        await broadcast_func(app, f"⚠️ <b>Сигнал отфильтрован по EMA!</b>\n<i>({ema_filter['reason']})</i>")
+        return
+    else:
+        await broadcast_func(app, f"✅ <b>Сигнал подтвержден по EMA.</b>\n<i>({ema_filter['reason']})</i>")
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
     sl_delta = current_price * SL_PERCENT
     tp_delta = current_price * TP_PERCENT
@@ -188,7 +225,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
         "Signal_ID": f"signal_{int(time.time() * 1000)}",
         "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
         "Pair": PAIR_TO_SCAN,
-        "Algorithm_Type": f"Imbalance + CVD (ADX: {adx_value:.1f})",
+        "Algorithm_Type": f"Imbalance + CVD + EMA (ADX: {adx_value:.1f})", # Добавлен EMA в тип
         "Strategy_Idea": f"Дисбаланс {imbalance_ratio:.1f}x в пользу {dominant_side}",
         "Entry_Price": current_price,
         "SL_Price": sl_price,
@@ -216,7 +253,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
         await broadcast_func(app, "⚠️ Не удалось сохранить сделку в Google Sheets.")
 
 async def scanner_main_loop(app, broadcast_func, state, save_state_func):
-    bot_version = "25.7"
+    bot_version = "25.8"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}).")
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
