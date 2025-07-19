@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
+# main_bot.py
 # ============================================================================
-# v24.1 - API Test Command
+# v25.1 - Автоматическое создание нового листа Google Sheets при смене версии
 # ============================================================================
 
 import os
@@ -11,14 +11,17 @@ from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import ccxt.async_support as ccxt # Добавляем импорт ccxt
-from datetime import datetime # Добавляем импорт datetime
+import ccxt.async_support as ccxt
+from datetime import datetime
 
+# Локальные импорты
 import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "24.1" 
+# --- ИЗМЕНЕНИЕ: Обновлена версия бота ---
+BOT_VERSION        = "25.1"
+# --- КОНЕЦ ИЗМЕНЕНИЯ ---
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -29,34 +32,44 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # === Google-Sheets =========================================================
 TRADE_LOG_WS = None
-SHEET_NAME   = f"Trading_Log_v{BOT_VERSION}" 
+SHEET_NAME   = f"Trading_Log_v{BOT_VERSION}"
 
 HEADERS = [
-    "Signal_ID", "Timestamp_UTC", "Pair", "Confidence_Score", "Algorithm_Type", 
-    "Strategy_Idea", "Entry_Price", "SL_Price", "TP_Price", 
-    "Status", "Exit_Time_UTC", "Exit_Price", "Entry_ATR", "PNL_USD", "PNL_Percent",
+    "Signal_ID", "Timestamp_UTC", "Pair", "Confidence_Score", "Algorithm_Type",
+    "Strategy_Idea", "Entry_Price", "SL_Price", "TP_Price", "side",
+    "Deposit", "Leverage",
+    "Status", "Exit_Time_UTC", "Exit_Price", "PNL_USD", "PNL_Percent",
     "Trigger_Order_USD"
 ]
 
 def setup_sheets():
     global TRADE_LOG_WS
-    if not SHEET_ID: return
+    if not SHEET_ID:
+        log.warning("SHEET_ID не задан. Логирование в Google Sheets отключено.")
+        return
     try:
         scope = ["https://spreadsheets.google.com/feeds","https://www.googleapis.com/auth/drive"]
         creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         gs = gspread.authorize(creds)
         ss = gs.open_by_key(SHEET_ID)
+        # --- ИЗМЕНЕНИЕ: Логика упрощена. Бот всегда создает новый лист, если имя не найдено. ---
         try:
             TRADE_LOG_WS = ss.worksheet(SHEET_NAME)
         except gspread.WorksheetNotFound:
+            log.info(f"Лист '{SHEET_NAME}' не найден. Создаю новый.")
             TRADE_LOG_WS = ss.add_worksheet(title=SHEET_NAME, rows="1000", cols=len(HEADERS))
             TRADE_LOG_WS.update("A1", [HEADERS])
             TRADE_LOG_WS.format(f"A1:{chr(ord('A')+len(HEADERS)-1)}1", {"textFormat":{"bold":True}})
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         log.info("Google-Sheets ready. Logging to '%s'.", SHEET_NAME)
+        trade_executor.TRADE_LOG_WS = TRADE_LOG_WS # Передаем воркшит в модуль
     except Exception as e:
         log.error("Sheets init failed: %s", e)
+        TRADE_LOG_WS = None
+        trade_executor.TRADE_LOG_WS = None
 
+# === Состояние бота =======================================================
 STATE_FILE = "bot_state.json"
 state = {}
 def load_state():
@@ -67,7 +80,10 @@ def load_state():
         except json.JSONDecodeError: state = {}
     state.setdefault("bot_on", False)
     state.setdefault("monitored_signals", [])
-    log.info("State loaded. Active signals: %d", len(state.get("monitored_signals", [])))
+    state.setdefault("deposit", 50)
+    state.setdefault("leverage", 100)
+    log.info("State loaded. Active signals: %d. Deposit: %s, Leverage: %s",
+             len(state.get("monitored_signals", [])), state.get('deposit'), state.get('leverage'))
 
 def save_state():
     with open(STATE_FILE,"w") as f: json.dump(state, f, indent=2)
@@ -88,7 +104,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     save_state()
     await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} запущен.</b>\n"
                                       f"Логирование в лист: <b>{SHEET_NAME}</b>\n"
-                                      "Используйте /run для запуска и /info для статуса.", 
+                                      "Используйте /run для запуска и /status для статуса.",
                                       parse_mode=constants.ParseMode.HTML)
 
 async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -100,10 +116,21 @@ async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     is_running = hasattr(update.application, '_main_loop_task') and not update.application._main_loop_task.done()
+    active_signals = state.get('monitored_signals', [])
+    
     msg = (f"<b>Состояние бота v{BOT_VERSION}</b>\n"
            f"<b>Статус:</b> {'✅ ON' if state.get('bot_on') else '🛑 OFF'}\n"
            f"<b>Основной цикл:</b> {'🚀 RUNNING' if is_running else '🔌 STOPPED'}\n"
-           f"<b>Активных сделок:</b> {len(state.get('monitored_signals', []))}\n")
+           f"<b>Активных сделок:</b> {len(active_signals)}\n"
+           f"<b>Депозит:</b> ${state.get('deposit', 50)}\n"
+           f"<b>Плечо:</b> x{state.get('leverage', 100)}\n\n")
+
+    if active_signals:
+        signal = active_signals[0]
+        msg += (f"<b>Активная сделка:</b> <code>{signal.get('Pair')} {signal.get('side')}</code>\n"
+                f"<b>Вход:</b> {signal.get('Entry_Price')}\n"
+                f"<b>SL:</b> {signal.get('SL_Price')} | <b>TP:</b> {signal.get('TP_Price')}\n")
+
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
 async def cmd_info(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -111,17 +138,42 @@ async def cmd_info(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     msg = f"<b>Детальный статус сканера (v{BOT_VERSION}):</b>\n\n▶️ {status_info}"
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
-# --- НОВАЯ ТЕСТОВАЯ КОМАНДА ---
+async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Устанавливает размер депозита для расчета PNL."""
+    try:
+        new_deposit = float(ctx.args[0])
+        if new_deposit <= 0:
+            await update.message.reply_text("❌ Депозит должен быть положительным числом.")
+            return
+        state['deposit'] = new_deposit
+        save_state()
+        await update.message.reply_text(f"✅ Депозит установлен: <b>${new_deposit}</b>", parse_mode=constants.ParseMode.HTML)
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ Неверный формат. Используйте: <code>/deposit &lt;сумма&gt;</code>\n"
+                                      f"Например: <code>/deposit 100.50</code>", parse_mode=constants.ParseMode.HTML)
+
+async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Устанавливает размер плеча для расчета PNL."""
+    try:
+        new_leverage = int(ctx.args[0])
+        if not 1 <= new_leverage <= 200:
+            await update.message.reply_text("❌ Плечо должно быть целым числом от 1 до 200.")
+            return
+        state['leverage'] = new_leverage
+        save_state()
+        await update.message.reply_text(f"✅ Плечо установлено: <b>x{new_leverage}</b>", parse_mode=constants.ParseMode.HTML)
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ Неверный формат. Используйте: <code>/leverage &lt;число&gt;</code>\n"
+                                      f"Например: <code>/leverage 100</code>", parse_mode=constants.ParseMode.HTML)
+
 async def cmd_testapi(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Начинаю тест API биржи MEXC для фьючерсов...")
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
     symbol = 'BTC/USDT'
     reply_text = f"<b>Результат теста API для {symbol} фьючерсов на {exchange.id}:</b>\n\n"
-    
     try:
         params = {'type': 'swap'}
         ohlcv = await exchange.fetch_ohlcv(symbol, timeframe='1m', limit=2, params=params)
-        
         if ohlcv and len(ohlcv) > 0:
             reply_text += "✅ <b>УСПЕХ!</b> Данные по свечам получены:\n"
             for candle in ohlcv:
@@ -129,13 +181,10 @@ async def cmd_testapi(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
                 reply_text += f"<pre>  - {dt_object.strftime('%H:%M:%S')}, H: {candle[2]}, L: {candle[3]}</pre>\n"
         else:
             reply_text += "❌ <b>ПРОВАЛ!</b> Биржа вернула пустой ответ. Данные по фьючерсам недоступны."
-
     except Exception as e:
         reply_text += f"❌ <b>КРИТИЧЕСКАЯ ОШИБКА:</b>\n<pre>{e}</pre>"
-    
     await exchange.close()
     await update.message.reply_text(reply_text, parse_mode=constants.ParseMode.HTML)
-# --- КОНЕЦ НОВОЙ КОМАНДЫ ---
 
 async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
     app = ctx.application
@@ -146,7 +195,7 @@ async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
         if not state.get("bot_on", False):
             state["bot_on"] = True
         await update.message.reply_text(f"🚀 Запускаю основной цикл (v{BOT_VERSION})...")
-        app._main_loop_task = asyncio.create_task(scanner_main_loop(app, broadcast, TRADE_LOG_WS, state, save_state))
+        app._main_loop_task = asyncio.create_task(scanner_main_loop(app, broadcast, state, save_state))
 
 if __name__ == "__main__":
     load_state()
@@ -157,7 +206,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("info", cmd_info))
-    app.add_handler(CommandHandler("testapi", cmd_testapi)) # Добавляем новую команду
+    app.add_handler(CommandHandler("testapi", cmd_testapi))
     app.add_handler(CommandHandler("run", cmd_run))
+    app.add_handler(CommandHandler("deposit", cmd_deposit))
+    app.add_handler(CommandHandler("leverage", cmd_leverage))
     log.info(f"Bot v{BOT_VERSION} started polling.")
     app.run_polling()
