@@ -1,6 +1,6 @@
 # scanner_engine.py
 # ============================================================================
-# v25.3 - Исправление критических ошибок в логике
+# v25.5 - Возвращена логика экстренного выхода
 # ============================================================================
 import asyncio
 import pandas as pd
@@ -15,7 +15,9 @@ PAIR_TO_SCAN = 'BTC/USDT'
 TOP_N_ORDERS_TO_ANALYZE = 15
 TP_PERCENT = 0.0018
 SL_PERCENT = 0.0012
+# --- ИЗМЕНЕНИЕ: Возвращена константа для экстренного выхода ---
 COUNTER_ORDER_RATIO = 2.0
+# --- КОНЕЦ ИЗМЕНЕНИЯ ---
 PARAMS_CALM_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 1500000, "MIN_IMBALANCE_RATIO": 2.5, "LARGE_ORDER_USD": 250000}
 PARAMS_ACTIVE_MARKET = {"MIN_TOTAL_LIQUIDITY_USD": 3000000, "MIN_IMBALANCE_RATIO": 3.0, "LARGE_ORDER_USD": 500000}
 API_TIMEOUT = 10.0
@@ -24,10 +26,14 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
     active_signals = state.get('monitored_signals')
     if not active_signals: return
     signal = active_signals[0]
+    
+    # --- ИЗМЕНЕНИЕ: Возвращена переменная trigger_order_usd ---
     pair, entry_price, sl_price, tp_price, side, trigger_order_usd = (
         signal.get('Pair'), signal.get('Entry_Price'), signal.get('SL_Price'),
         signal.get('TP_Price'), signal.get('side'), signal.get('Trigger_Order_USD', 0)
     )
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+    
     if not all([pair, entry_price, sl_price, tp_price, side]):
         state['monitored_signals'] = []
         save_state_func()
@@ -51,6 +57,8 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
                 if candle_high >= sl_price: exit_status, exit_price = "SL_HIT", sl_price
                 elif candle_low <= tp_price: exit_status, exit_price = "TP_HIT", tp_price
             if exit_status: break
+        
+        # --- ИЗМЕНЕНИЕ: Возвращена логика экстренного выхода ---
         if not exit_status and trigger_order_usd > 0:
             order_book = await exchange.fetch_order_book(pair, limit=25, params={'type': 'swap'})
             current_price = float(ohlcv[-1][4])
@@ -58,6 +66,8 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
                 exit_status, exit_price = "EMERGENCY_EXIT", current_price
             elif side == 'SHORT' and any((p*a) > (trigger_order_usd * COUNTER_ORDER_RATIO) for p, a in order_book.get('bids', [])):
                 exit_status, exit_price = "EMERGENCY_EXIT", current_price
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+        
         if exit_status:
             leverage = signal.get('Leverage', 100)
             deposit = signal.get('Deposit', 50)
@@ -65,7 +75,9 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
             pnl_usd = deposit * leverage * pnl_percent_raw
             pnl_percent_display = pnl_percent_raw * 100 * leverage
             await update_trade_in_sheet(signal, exit_status, exit_price, pnl_usd, pnl_percent_display)
+            # --- ИЗМЕНЕНИЕ: Возвращен эмодзи для EMERGENCY_EXIT ---
             emoji = "⚠️" if exit_status == "EMERGENCY_EXIT" else ("✅" if pnl_usd > 0 else "❌")
+            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
             msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({exit_status})</b>\n\n"
                    f"<b>Инструмент:</b> <code>{pair}</code>\n"
                    f"<b>Результат: ${pnl_usd:+.2f} ({pnl_percent_display:+.2f}%)</b>")
@@ -134,7 +146,6 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
     imbalance_ratio = (max(total_bids_usd, total_asks_usd) / min(total_bids_usd, total_asks_usd) if total_bids_usd > 0 and total_asks_usd > 0 else float('inf'))
     if imbalance_ratio < min_imbalance_ratio: return
     
-    # --- ИЗМЕНЕНИЕ 2: Восстановлена отправка сообщения о сигнале ---
     dominant_side_is_bids = total_bids_usd > total_asks_usd
     dominant_side = "ПОКУПАТЕЛЕЙ" if dominant_side_is_bids else "ПРОДАВЦОВ"
     largest_order = (large_bids[0] if large_bids else None) if dominant_side_is_bids else (large_asks[0] if large_asks else None)
@@ -147,7 +158,6 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
     signal_msg += f"Ожидание: вероятно движение {expected_direction}."
     
     await broadcast_func(app, signal_msg)
-    # --- КОНЕЦ ИЗМЕНЕНИЯ 2 ---
     
     side = "LONG" if dominant_side_is_bids else "SHORT"
     cvd_analysis = await get_cvd_analysis(exchange, PAIR_TO_SCAN, side)
@@ -167,23 +177,30 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
     sl_delta = current_price * SL_PERCENT
     tp_delta = current_price * TP_PERCENT
 
-    # --- ИЗМЕНЕНИЕ 1: Исправлена ошибка в расчете TP для SHORT ---
     if side == "LONG":
         sl_price = current_price - sl_delta
         tp_price = current_price + tp_delta
     else: # SHORT
         sl_price = current_price + sl_delta
-        tp_price = current_price - tp_delta # Был '+', теперь правильный '-'
-    # --- КОНЕЦ ИЗМЕНЕНИЯ 1 ---
+        tp_price = current_price - tp_delta
 
+    # --- ИЗМЕНЕНИЕ: Возвращен столбец Trigger_Order_USD ---
     decision = {
-        "Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-        "Pair": PAIR_TO_SCAN, "Confidence_Score": 10, "Algorithm_Type": f"Imbalance + CVD (ADX: {adx_value:.1f})",
-        "Strategy_Idea": f"Дисбаланс {imbalance_ratio:.1f}x в пользу {'ПОКУПАТЕЛЕЙ' if dominant_side_is_bids else 'ПРОДАВЦОВ'}",
-        "Entry_Price": current_price, "SL_Price": sl_price, "TP_Price": tp_price, "side": side,
-        "Trigger_Order_USD": (largest_order['value_usd'] if largest_order else 0),
-        "Deposit": state.get('deposit', 50), "Leverage": state.get('leverage', 100)
+        "Signal_ID": f"signal_{int(time.time() * 1000)}",
+        "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+        "Pair": PAIR_TO_SCAN,
+        "Algorithm_Type": f"Imbalance + CVD (ADX: {adx_value:.1f})",
+        "Strategy_Idea": f"Дисбаланс {imbalance_ratio:.1f}x в пользу {dominant_side}",
+        "Entry_Price": current_price,
+        "SL_Price": sl_price,
+        "TP_Price": tp_price,
+        "side": side,
+        "Deposit": state.get('deposit', 50),
+        "Leverage": state.get('leverage', 100),
+        "Trigger_Order_USD": largest_order['value_usd'] if largest_order else 0
     }
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+    
     rr_ratio = TP_PERCENT / SL_PERCENT if SL_PERCENT > 0 else 0
     msg = (f"<b>ВХОД В СДЕЛКУ</b>\n\n<b>Тип:</b> Pure Quant Entry (Fixed %)\n"
            f"<b>Депозит:</b> ${decision['Deposit']} | <b>Плечо:</b> x{decision['Leverage']}\n"
@@ -201,7 +218,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
         await broadcast_func(app, "⚠️ Не удалось сохранить сделку в Google Sheets.")
 
 async def scanner_main_loop(app, broadcast_func, state, save_state_func):
-    bot_version = "25.3"
+    bot_version = "25.5"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}).")
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
