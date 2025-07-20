@@ -1,6 +1,6 @@
 # scanner_engine.py
 # ============================================================================
-# v26.5 - Исправлена критическая ошибка мониторинга открытых сделок
+# v26.7 - Улучшен триггер входа в сделку на основе преобладания агрессии
 # ============================================================================
 import asyncio
 import time
@@ -16,8 +16,10 @@ MIN_IMBALANCE_RATIO = 2.5
 MAX_IMBALANCE_RATIO = 15.0
 LARGE_ORDER_USD = 250000
 TOP_N_ORDERS_TO_ANALYZE = 20
-ABSORPTION_TIMEFRAME_SEC = 10
-ABSORPTION_VOLUME_RATIO = 0.3
+# --- ИЗМЕНЕНИЕ: Новые параметры для триггера по агрессии ---
+AGGRESSION_TIMEFRAME_SEC = 15  # За какой период времени анализировать ленту сделок
+AGGRESSION_RATIO = 2.0         # Во сколько раз покупки должны превышать продажи (или наоборот)
+# --- КОНЕЦ ИЗМЕНЕНИЯ ---
 SL_BUFFER_PERCENT = 0.0005
 TP_BUFFER_PERCENT = 0.0005
 MIN_RR_RATIO = 1.0
@@ -44,7 +46,6 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
         return
 
     try:
-        # --- ИЗМЕНЕНИЕ: Добавлен params={'type': 'swap'} во все запросы мониторинга ---
         params = {'type': 'swap'}
         ticker = await exchange.fetch_ticker(pair, params=params)
         last_price = ticker.get('last')
@@ -79,7 +80,6 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
             if emergency_reason:
                 exit_status, exit_price = "EMERGENCY_EXIT", last_price
                 await broadcast_func(app, f"⚠️ <b>ЭКСТРЕННЫЙ ВЫХОД!</b>\nПричина: {emergency_reason}.")
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
         if exit_status:
             leverage = signal.get('Leverage', 100)
@@ -99,21 +99,35 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
         print(f"CRITICAL MONITORING ERROR: {e}")
         await broadcast_func(app, f"⚠️ <b>Критическая ошибка мониторинга!</b>\n<code>Ошибка: {e}</code>")
 
-async def check_absorption(exchange, pair, side_to_absorb, required_volume):
+# --- ИЗМЕНЕНИЕ: Функция переименована и полностью переписана ---
+async def check_aggression(exchange, pair, side):
+    """Проверяет преобладание агрессии в ленте сделок."""
     try:
-        since = exchange.milliseconds() - ABSORPTION_TIMEFRAME_SEC * 1000
+        since = exchange.milliseconds() - AGGRESSION_TIMEFRAME_SEC * 1000
         trades = await exchange.fetch_trades(pair, since=since, limit=100, params={'type': 'swap'})
-        if not trades: return {'absorbed': False}
+        if not trades: return {'triggered': False}
+
+        buy_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'buy')
+        sell_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'sell')
         
-        absorbing_side = 'buy' if side_to_absorb == 'sell' else 'sell'
-        absorbed_volume = sum(trade['cost'] for trade in trades if trade['side'] == absorbing_side)
-        
-        if absorbed_volume >= required_volume:
-            return {'absorbed': True, 'volume': absorbed_volume, 'entry_price': trades[-1]['price']}
-        return {'absorbed': False}
+        aggression_confirmed = False
+        if side == 'LONG' and buy_volume > sell_volume * AGGRESSION_RATIO:
+            aggression_confirmed = True
+        elif side == 'SHORT' and sell_volume > buy_volume * AGGRESSION_RATIO:
+            aggression_confirmed = True
+
+        if aggression_confirmed:
+            return {
+                'triggered': True, 
+                'entry_price': trades[-1]['price'],
+                'buy_vol': buy_volume,
+                'sell_vol': sell_volume
+            }
+        return {'triggered': False}
     except Exception as e:
-        print(f"Absorption check error: {e}")
-        return {'absorbed': False}
+        print(f"Aggression check error: {e}")
+        return {'triggered': False}
+# --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
 async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_state_func):
     try:
@@ -122,7 +136,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
             signal_age = time.time() - potential_signal.get('timestamp', 0)
             if signal_age > SIGNAL_TIMEOUT_SEC:
                 old_signal_info = f"{potential_signal['side']} {potential_signal['ratio']:.1f}x"
-                await broadcast_func(app, f"⏳ Сигнал {old_signal_info} устарел (нет поглощения > {SIGNAL_TIMEOUT_SEC}с). Возврат к поиску.")
+                await broadcast_func(app, f"⏳ Сигнал {old_signal_info} устарел (нет агрессии > {SIGNAL_TIMEOUT_SEC}с). Возврат к поиску.")
                 state['potential_signal'] = {}
         
         order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100, params={'type': 'swap'})
@@ -152,7 +166,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
 
             if potential_signal.get('key') != new_signal_key:
                 state['potential_signal'] = {'key': new_signal_key, 'side': side, 'ratio': imbalance_ratio, 'timestamp': time.time()}
-                status_msg = f"Обнаружен дисбаланс {imbalance_ratio:.1f}x в пользу {side}. Ожидание поглощения..."
+                status_msg = f"Обнаружен дисбаланс {imbalance_ratio:.1f}x в пользу {side}. Ожидание агрессии..."
                 state['last_status_info'] = status_msg
                 await broadcast_func(app, f"🗣️ {status_msg}")
         else:
@@ -164,26 +178,22 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
             return
         
         if not state.get('potential_signal'): return
-
-        if not large_bids or not large_asks: return
         
-        if side == "LONG":
-            support_wall, resistance_wall = large_bids[0], large_asks[0]
-            side_to_absorb, target_order_to_absorb = 'sell', asks[0]
-        else:
-            support_wall, resistance_wall = large_asks[0], large_bids[0]
-            side_to_absorb, target_order_to_absorb = 'buy', bids[0]
-        
-        required_volume = (target_order_to_absorb[0] * target_order_to_absorb[1]) * ABSORPTION_VOLUME_RATIO
-        absorption_result = await check_absorption(exchange, PAIR_TO_SCAN, side_to_absorb, required_volume)
+        # --- ИЗМЕНЕНИЕ: Вызываем новую функцию проверки агрессии ---
+        aggression_result = await check_aggression(exchange, PAIR_TO_SCAN, side)
 
-        if not absorption_result.get('absorbed'):
+        if not aggression_result.get('triggered'):
             return
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
         state['potential_signal'] = {}
         
-        entry_price = absorption_result['entry_price']
+        entry_price = aggression_result['entry_price']
         
+        if not large_bids or not large_asks: return
+        support_wall = large_bids[0] if side == "LONG" else large_asks[0]
+        resistance_wall = large_asks[0] if side == "LONG" else large_bids[0]
+
         if side == "LONG":
             sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT)
             tp_price = resistance_wall['price'] * (1 - TP_BUFFER_PERCENT)
@@ -200,7 +210,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
             await broadcast_func(app, f"⚠️ Сделка {side} отменена: низкий RR (~{rr_ratio:.1f}:1).")
             return
 
-        idea = f"Дисбаланс {imbalance_ratio:.1f}x, поглощение ${absorption_result.get('volume'):.0f} за {ABSORPTION_TIMEFRAME_SEC}с"
+        idea = f"Дисбаланс {imbalance_ratio:.1f}x, агрессия ${aggression_result.get('buy_vol'):.0f} vs ${aggression_result.get('sell_vol'):.0f}"
         
         decision = {
             "Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
@@ -232,7 +242,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
         state['last_status_info'] = f"Ошибка сканера: {e}"
 
 async def scanner_main_loop(app, broadcast_func, state, save_state_func):
-    bot_version = "26.5"
+    bot_version = "26.7"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}). Strategy: Liquidity Absorption.")
     
