@@ -1,6 +1,6 @@
 # main_bot.py
 # ============================================================================
-# v26.6 - Исправлено "зависание" сигналов, внедрены "умные" уведомления
+# v26.5 - Финальное исправление ошибки API
 # ============================================================================
 
 import os
@@ -19,7 +19,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "26.6"
+BOT_VERSION        = "26.5"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -64,7 +64,7 @@ def setup_sheets():
         TRADE_LOG_WS = None
         trade_executor.TRADE_LOG_WS = None
 
-# === Состояние бота =======================================================
+# === Состояние бота (без изменений) =======================================
 STATE_FILE = "bot_state.json"
 state = {}
 def load_state():
@@ -77,9 +77,7 @@ def load_state():
     state.setdefault("monitored_signals", [])
     state.setdefault("deposit", 50)
     state.setdefault("leverage", 100)
-    # --- ИЗМЕНЕНИЕ: Добавлено состояние для "умных" уведомлений ---
     state.setdefault("potential_signal", {})
-    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
     log.info("State loaded. Active signals: %d. Deposit: %s, Leverage: %s",
              len(state.get("monitored_signals", [])), state.get('deposit'), state.get('leverage'))
 
