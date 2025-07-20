@@ -97,7 +97,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
 
 async def check_absorption(exchange, pair, side_to_absorb, required_volume):
     try:
-        # --- ИЗМЕНЕНИЕ: Убран параметр 'until', который вызывал ошибку ---
+        # --- ИЗМЕНЕНИЕ: Исправлен вызов API для MEXC ---
         since = exchange.milliseconds() - ABSORPTION_TIMEFRAME_SEC * 1000
         trades = await exchange.fetch_trades(pair, since=since, limit=100, params={'type': 'swap'})
         # --- КОНЕЦ ИЗМЕНЕНИЯ ---
@@ -216,7 +216,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
         state['last_status_info'] = f"Ошибка сканера: {e}"
 
 async def scanner_main_loop(app, broadcast_func, state, save_state_func):
-    bot_version = "26.3"
+    bot_version = "26.4"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}). Strategy: Liquidity Absorption.")
     
