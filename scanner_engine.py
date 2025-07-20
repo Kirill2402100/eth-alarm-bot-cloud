@@ -1,6 +1,6 @@
 # scanner_engine.py
 # ============================================================================
-# v26.5 - Финальное исправление ошибки API при запросе сделок
+# v26.5 - Исправлена критическая ошибка мониторинга открытых сделок
 # ============================================================================
 import asyncio
 import time
@@ -44,6 +44,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
         return
 
     try:
+        # --- ИЗМЕНЕНИЕ: Добавлен params={'type': 'swap'} во все запросы мониторинга ---
         params = {'type': 'swap'}
         ticker = await exchange.fetch_ticker(pair, params=params)
         last_price = ticker.get('last')
@@ -78,6 +79,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
             if emergency_reason:
                 exit_status, exit_price = "EMERGENCY_EXIT", last_price
                 await broadcast_func(app, f"⚠️ <b>ЭКСТРЕННЫЙ ВЫХОД!</b>\nПричина: {emergency_reason}.")
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
         if exit_status:
             leverage = signal.get('Leverage', 100)
@@ -99,11 +101,8 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
 
 async def check_absorption(exchange, pair, side_to_absorb, required_volume):
     try:
-        # --- ИЗМЕНЕНИЕ: Возвращен параметр 'until' в правильном формате ---
         since = exchange.milliseconds() - ABSORPTION_TIMEFRAME_SEC * 1000
-        params = {'type': 'swap', 'until': exchange.milliseconds()}
-        trades = await exchange.fetch_trades(pair, since=since, limit=100, params=params)
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+        trades = await exchange.fetch_trades(pair, since=since, limit=100, params={'type': 'swap'})
         if not trades: return {'absorbed': False}
         
         absorbing_side = 'buy' if side_to_absorb == 'sell' else 'sell'
@@ -233,7 +232,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
         state['last_status_info'] = f"Ошибка сканера: {e}"
 
 async def scanner_main_loop(app, broadcast_func, state, save_state_func):
-    bot_version = "26.4"
+    bot_version = "26.5"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}). Strategy: Liquidity Absorption.")
     
