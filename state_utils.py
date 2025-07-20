@@ -1,9 +1,4 @@
 # state_utils.py
-# ============================================================================
-# v28.1 - Утилиты для управления состоянием
-# Вынесены в отдельный модуль для избежания циклических импортов.
-# ============================================================================
-
 import os
 import json
 import logging
@@ -28,6 +23,10 @@ def load_state(app: Application):
     bot_data.setdefault("monitored_signals", [])
     bot_data.setdefault("deposit", 50)
     bot_data.setdefault("leverage", 100)
+    # НОВЫЕ ПЕРЕМЕННЫЕ ДЛЯ ДИАГНОСТИКИ
+    bot_data.setdefault("debug_mode_on", False)
+    bot_data.setdefault("last_debug_message", "")
+
     log.info("State loaded into bot_data. Active signals: %d. Deposit: %s, Leverage: %s",
              len(bot_data.get("monitored_signals", [])), bot_data.get('deposit'), bot_data.get('leverage'))
 
@@ -35,6 +34,10 @@ def save_state(app: Application):
     """Сохраняет app.bot_data в файл."""
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump(app.bot_data, f, indent=2)
+            # Преобразуем set в list для JSON-сериализации, если chat_ids хранятся в bot_data
+            data_to_save = app.bot_data.copy()
+            if 'chat_ids' in data_to_save and isinstance(data_to_save['chat_ids'], set):
+                data_to_save['chat_ids'] = list(data_to_save['chat_ids'])
+            json.dump(data_to_save, f, indent=2)
     except Exception as e:
         log.error(f"Failed to save state: {e}")
