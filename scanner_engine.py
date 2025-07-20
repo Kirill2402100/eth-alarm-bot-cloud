@@ -19,7 +19,7 @@ from state_utils import save_state
 log = logging.getLogger("bot")
 
 # === Конфигурация сканера ==================================================
-PAIR_TO_SCAN = 'BTC/USDT:USDT'
+PAIR_TO_SCAN = BTC/USDT
 LARGE_ORDER_USD = 150000
 TOP_N_ORDERS_TO_ANALYZE = 20
 AGGRESSION_TIMEFRAME_SEC = 15
