@@ -1,9 +1,10 @@
 # scanner_engine.py
 # ============================================================================
-# v29.6 - STABLE
-# - Мониторинг переведен на расчет цены из стакана (mid-price),
-#   чтобы избежать ошибки "Контракт не существует" от биржи MEXC.
-#   Это финальная версия логики.
+# v30.0 - FINAL STABLE
+# - Логика определения цены входа полностью переработана.
+# - Цена теперь берется напрямую из фьючерсного стакана (bid/ask), а не из
+#   ленты сделок. Это гарантирует использование фьючерсной цены и устраняет
+#   все возможные расхождения со спотом.
 # ============================================================================
 import asyncio
 import time
@@ -52,7 +53,7 @@ def get_imbalance_and_walls(order_book):
     imbalance_ratio = (max(top_bids_usd, top_asks_usd) / min(top_bids_usd, top_asks_usd)) if top_bids_usd > 0 and top_asks_usd > 0 else float('inf')
     return imbalance_ratio, large_bids, large_asks, top_bids_usd, top_asks_usd
 
-# === Логика сканирования (без изменений) ====================================
+# === Логика сканирования (ИЗМЕНЕНА) ========================================
 async def scan_for_new_opportunities(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
     status_code = None
@@ -61,8 +62,7 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
         order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100, params={'type': 'swap'})
         imbalance_ratio, large_bids, large_asks, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
         if not large_bids or not large_asks:
-            status_code = "WAIT_LIQUIDITY"
-            status_message = "Ожидание крупных ордеров в стакане..."
+            status_code, status_message = "WAIT_LIQUIDITY", "Ожидание крупных ордеров в стакане..."
         else:
             support_wall = large_bids[0]
             resistance_wall = large_asks[0]
@@ -85,8 +85,15 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
                     sell_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'sell')
                     aggression_side = "LONG" if buy_volume > sell_volume * AGGRESSION_RATIO else "SHORT" if sell_volume > buy_volume * AGGRESSION_RATIO else None
                     if (aggression_side == "LONG" and dominant_side_is_bids) or (aggression_side == "SHORT" and not dominant_side_is_bids):
-                        entry_price = trades[-1]['price']
+                        
+                        # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Берем цену входа из стакана ---
                         side = aggression_side
+                        if side == "LONG":
+                            entry_price = resistance_wall['price'] # Входим по цене ближайшего сопротивления
+                        else: # SHORT
+                            entry_price = support_wall['price'] # Входим по цене ближайшей поддержки
+                        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
                         sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT) if side == "LONG" else resistance_wall['price'] * (1 + SL_BUFFER_PERCENT)
                         idea = f"Режим {market_regime}. Агрессия {side} + Дисбаланс {imbalance_ratio:.1f}x"
                         decision = { "Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), "Pair": PAIR_TO_SCAN, "Algorithm_Type": f"Adaptive Imbalance", "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": None, "side": side, "Deposit": bot_data.get('deposit', 50), "Leverage": bot_data.get('leverage', 100), "Trigger_Order_USD": support_wall['value_usd'] if side == "LONG" else resistance_wall['value_usd'] }
@@ -109,7 +116,7 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
         if bot_data.get('debug_mode_on', False):
             await broadcast_func(app, f"<code>{status_message}</code>")
 
-# === Логика мониторинга (ИСПРАВЛЕНА) ======================================
+# === Мониторинг и главный цикл (без изменений) ==============================
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
     if not bot_data.get('monitored_signals'): return
@@ -117,28 +124,20 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
     pair, entry_price, sl_price, side = (signal['Pair'], signal['Entry_Price'], signal['SL_Price'], signal['side'])
     try:
         order_book = await exchange.fetch_order_book(pair, limit=100, params={'type': 'swap'})
-
-        # Проверяем, что в стакане есть ордера, прежде чем что-то делать
         if not order_book.get('bids') or not order_book['bids'][0] or not order_book.get('asks') or not order_book['asks'][0]:
             log.warning(f"Order book for {pair} is incomplete, skipping monitor cycle.")
             return
-
-        # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Вычисляем цену из стакана, а не через fetch_ticker ---
         best_bid = order_book['bids'][0][0]
         best_ask = order_book['asks'][0][0]
         last_price = (best_bid + best_ask) / 2
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
-
         current_imbalance, _, _, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
         bot_data['monitored_signals'][0]['current_imbalance_ratio'] = current_imbalance
         exit_status, exit_price, reason = None, None, None
-        
         if (side == 'LONG' and last_price <= sl_price) or (side == 'SHORT' and last_price >= sl_price):
             exit_status, exit_price, reason = "SL_HIT", sl_price, "Аварийный стоп-лосс"
         if not exit_status:
             if current_imbalance < FLAT_MARKET_MIN_IMBALANCE or ((side == 'LONG') != (top_bids_usd > top_asks_usd)):
                 exit_status, exit_price, reason = "IMBALANCE_LOST", last_price, f"Дисбаланс упал до {current_imbalance:.1f}x"
-        
         if exit_status:
             pnl_percent_raw = ((exit_price - entry_price) / entry_price) * (-1 if side == 'SHORT' else 1)
             pnl_usd = signal['Deposit'] * signal['Leverage'] * pnl_percent_raw
@@ -153,7 +152,6 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         log.error(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
         await broadcast_func(app, f"⚠️ <b>Критическая ошибка мониторинга!</b>\n<code>Ошибка: {e}</code>")
 
-# === Главный цикл (без изменений) ============================================
 async def scanner_main_loop(app: Application, broadcast_func):
     bot_version = getattr(app, 'bot_version', 'N/A')
     log.info(f"Main Engine loop starting (v{bot_version})...")
