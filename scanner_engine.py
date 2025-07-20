@@ -1,8 +1,8 @@
 # scanner_engine.py
 # ============================================================================
-# v29.3 - HOTFIX
-# - Улучшена обработка данных из стакана. Бот теперь устойчив к некорректным
-#   записям от биржи (игнорирует их), что исправляет ошибку 'too many values to unpack'.
+# v29.4 - HOTFIX
+# - Полностью переписана логика отправки диагностических сообщений.
+# - Исправлена ошибка, из-за которой диагностика "замолкала" после первого сообщения.
 # ============================================================================
 import asyncio
 import time
@@ -30,89 +30,97 @@ LOW_VOLATILITY_THRESHOLD = 0.0025
 FLAT_MARKET_MIN_IMBALANCE = 1.8
 TREND_MARKET_MIN_IMBALANCE = 2.5
 
-# === Функции-помощники (ИЗМЕНЕНА) ==========================================
+# === Функции-помощники (без изменений) =====================================
 def get_imbalance_and_walls(order_book):
     bids, asks = order_book.get('bids', []), order_book.get('asks', [])
     if not bids or not asks: return 1.0, None, None, 0, 0
-
-    # --- ИЗМЕНЕНИЕ: Делаем код устойчивым к "грязным" данным от биржи ---
-    large_bids = []
+    large_bids, large_asks = [], []
     for bid in bids:
-        if len(bid) == 2: # Обрабатываем только корректные записи
+        if len(bid) == 2:
             price, amount = bid
             if price * amount > LARGE_ORDER_USD:
                 large_bids.append({'price': price, 'value_usd': round(price * amount)})
-
-    large_asks = []
     for ask in asks:
-        if len(ask) == 2: # Обрабатываем только корректные записи
+        if len(ask) == 2:
             price, amount = ask
             if price * amount > LARGE_ORDER_USD:
                 large_asks.append({'price': price, 'value_usd': round(price * amount)})
-    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
-
     if not large_bids or not large_asks: return 1.0, None, None, 0, 0
-    
     top_bids_usd = sum(b['value_usd'] for b in large_bids[:TOP_N_ORDERS_TO_ANALYZE])
     top_asks_usd = sum(a['value_usd'] for a in large_asks[:TOP_N_ORDERS_TO_ANALYZE])
     imbalance_ratio = (max(top_bids_usd, top_asks_usd) / min(top_bids_usd, top_asks_usd)) if top_bids_usd > 0 and top_asks_usd > 0 else float('inf')
     return imbalance_ratio, large_bids, large_asks, top_bids_usd, top_asks_usd
 
-
-# === Логика сканирования (без изменений) ====================================
+# === Логика сканирования (ИСПРАВЛЕНА) ========================================
 async def scan_for_new_opportunities(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
-    status_message = ""
-    status_code = ""
+    status_code = None
+    status_message = None
+
     try:
+        # 1. Получаем данные и определяем режим рынка
         order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100, params={'type': 'swap'})
         imbalance_ratio, large_bids, large_asks, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
+
         if not large_bids or not large_asks:
-            status_code, status_message = "WAIT_LIQUIDITY", "Ожидание крупных ордеров в стакане..."
-            return
-        support_wall = large_bids[0]
-        resistance_wall = large_asks[0]
-        zone_width_pct = (resistance_wall['price'] - support_wall['price']) / support_wall['price']
-        market_regime = "ФЛЭТ" if zone_width_pct < LOW_VOLATILITY_THRESHOLD else "ТРЕНД"
-        min_imbalance_needed = FLAT_MARKET_MIN_IMBALANCE if market_regime == "ФЛЭТ" else TREND_MARKET_MIN_IMBALANCE
-        if imbalance_ratio < min_imbalance_needed:
-            status_code = "WAIT_IMBALANCE"
-            status_message = f"Режим: {market_regime}. Дисбаланс ({imbalance_ratio:.1f}x) ниже порога ({min_imbalance_needed}x)."
-            return
-        dominant_side_is_bids = top_bids_usd > top_asks_usd
-        now = exchange.milliseconds()
-        since = now - AGGRESSION_TIMEFRAME_SEC * 1000
-        trades = await exchange.fetch_trades(PAIR_TO_SCAN, since=since, limit=100, params={'type': 'swap', 'until': now})
-        if not trades:
-            status_code = "WAIT_AGGRESSION"
-            status_message = f"Режим: {market_regime}. Дисбаланс ({imbalance_ratio:.1f}x) есть, жду агрессию..."
-            return
-        buy_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'buy')
-        sell_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'sell')
-        aggression_side = "LONG" if buy_volume > sell_volume * AGGRESSION_RATIO else "SHORT" if sell_volume > buy_volume * AGGRESSION_RATIO else None
-        if (aggression_side == "LONG" and dominant_side_is_bids) or (aggression_side == "SHORT" and not dominant_side_is_bids):
-            entry_price = trades[-1]['price']
-            side = aggression_side
-            sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT) if side == "LONG" else resistance_wall['price'] * (1 + SL_BUFFER_PERCENT)
-            idea = f"Режим {market_regime}. Агрессия {side} + Дисбаланс {imbalance_ratio:.1f}x"
-            decision = { "Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), "Pair": PAIR_TO_SCAN, "Algorithm_Type": f"Adaptive Imbalance", "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": None, "side": side, "Deposit": bot_data.get('deposit', 50), "Leverage": bot_data.get('leverage', 100), "Trigger_Order_USD": support_wall['value_usd'] if side == "LONG" else resistance_wall['value_usd'] }
-            msg = f"🔥 <b>ВХОД В СДЕЛКУ ({side})</b>\n\n<b>Тип:</b> <code>{idea}</code>\n<b>Вход:</b> <code>{entry_price:.4f}</code> | <b>SL:</b> <code>{sl_price:.4f}</code>"
-            await broadcast_func(app, msg)
-            await log_trade_to_sheet(decision)
-            bot_data['monitored_signals'].append(decision)
-            save_state(app)
+            status_code = "WAIT_LIQUIDITY"
+            status_message = "Ожидание крупных ордеров в стакане..."
         else:
-            status_code = "WAIT_AGGRESSION_MATCH"
-            status_message = f"Режим: {market_regime}. Дисбаланс ({imbalance_ratio:.1f}x) есть, но агрессия слабая или в другую сторону."
+            support_wall = large_bids[0]
+            resistance_wall = large_asks[0]
+            zone_width_pct = (resistance_wall['price'] - support_wall['price']) / support_wall['price']
+            market_regime = "ФЛЭТ" if zone_width_pct < LOW_VOLATILITY_THRESHOLD else "ТРЕНД"
+            min_imbalance_needed = FLAT_MARKET_MIN_IMBALANCE if market_regime == "ФЛЭТ" else TREND_MARKET_MIN_IMBALANCE
+
+            # 2. Главный фильтр - Дисбаланс
+            if imbalance_ratio < min_imbalance_needed:
+                status_code = "WAIT_IMBALANCE"
+                status_message = f"Режим: {market_regime}. Дисбаланс ({imbalance_ratio:.1f}x) ниже порога ({min_imbalance_needed}x)."
+            else:
+                # 3. Дисбаланс есть, ищем подтверждающую агрессию
+                dominant_side_is_bids = top_bids_usd > top_asks_usd
+                now = exchange.milliseconds()
+                since = now - AGGRESSION_TIMEFRAME_SEC * 1000
+                trades = await exchange.fetch_trades(PAIR_TO_SCAN, since=since, limit=100, params={'type': 'swap', 'until': now})
+                
+                if not trades:
+                    status_code = "WAIT_AGGRESSION"
+                    status_message = f"Режим: {market_regime}. Дисбаланс ({imbalance_ratio:.1f}x) есть, жду агрессию..."
+                else:
+                    buy_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'buy')
+                    sell_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'sell')
+                    aggression_side = "LONG" if buy_volume > sell_volume * AGGRESSION_RATIO else "SHORT" if sell_volume > buy_volume * AGGRESSION_RATIO else None
+
+                    # 4. Проверяем совпадение агрессии и дисбаланса
+                    if (aggression_side == "LONG" and dominant_side_is_bids) or \
+                       (aggression_side == "SHORT" and not dominant_side_is_bids):
+                        # ВСЕ УСЛОВИЯ СОВПАЛИ - ВХОД
+                        entry_price = trades[-1]['price']
+                        side = aggression_side
+                        sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT) if side == "LONG" else resistance_wall['price'] * (1 + SL_BUFFER_PERCENT)
+                        idea = f"Режим {market_regime}. Агрессия {side} + Дисбаланс {imbalance_ratio:.1f}x"
+                        decision = { "Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), "Pair": PAIR_TO_SCAN, "Algorithm_Type": f"Adaptive Imbalance", "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": None, "side": side, "Deposit": bot_data.get('deposit', 50), "Leverage": bot_data.get('leverage', 100), "Trigger_Order_USD": support_wall['value_usd'] if side == "LONG" else resistance_wall['value_usd'] }
+                        msg = f"🔥 <b>ВХОД В СДЕЛКУ ({side})</b>\n\n<b>Тип:</b> <code>{idea}</code>\n<b>Вход:</b> <code>{entry_price:.4f}</code> | <b>SL:</b> <code>{sl_price:.4f}</code>"
+                        await broadcast_func(app, msg)
+                        await log_trade_to_sheet(decision)
+                        bot_data['monitored_signals'].append(decision)
+                        save_state(app)
+                        status_code, status_message = "TRADE_OPENED", f"Сделка {side} открыта."
+                    else:
+                        status_code = "WAIT_AGGRESSION_MATCH"
+                        status_message = f"Режим: {market_regime}. Дисбаланс ({imbalance_ratio:.1f}x) есть, но агрессия слабая или в другую сторону."
+
     except Exception as e:
+        status_code = "SCANNER_ERROR"
         status_message = f"КРИТИЧЕСКАЯ ОШИБКА СКАНЕРА: {e}"
         log.error(status_message, exc_info=True)
-    finally:
-        last_code = bot_data.get('last_debug_code', '')
-        if status_code and status_code != last_code:
-            bot_data['last_debug_code'] = status_code
-            if bot_data.get('debug_mode_on', False):
-                await broadcast_func(app, f"<code>{status_message}</code>")
+
+    # Отправляем сообщение в чат, только если код статуса изменился
+    last_code = bot_data.get('last_debug_code', '')
+    if status_code and status_code != last_code:
+        bot_data['last_debug_code'] = status_code
+        if bot_data.get('debug_mode_on', False):
+            await broadcast_func(app, f"<code>{status_message}</code>")
 
 
 # === Мониторинг и главный цикл (без изменений) ==============================
