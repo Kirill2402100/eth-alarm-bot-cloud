@@ -1,7 +1,7 @@
 # scanner_engine.py
 # ============================================================================
-# v33.1 - HOTFIX
-# - Исправлена ошибка 'bot_data is not defined' в главном цикле.
+# v33.2 - STRESS TEST
+# - Временно отключен анти-спам фильтр в диагностике для проверки работы цикла.
 # ============================================================================
 import asyncio
 import time
@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 import ccxt.async_support as ccxt
 from telegram.ext import Application
 
-# Локальные импорты
 from trade_executor import log_trade_to_sheet, update_trade_in_sheet
 from state_utils import save_state
 
@@ -111,11 +110,12 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
         status_message = f"КРИТИЧЕСКАЯ ОШИБКА СКАНЕРА: {e}"
         log.error(status_message, exc_info=True)
     
-    last_code = bot_data.get('last_debug_code', '')
-    if status_code and status_code != last_code:
-        bot_data['last_debug_code'] = status_code
+    # --- ИЗМЕНЕНИЕ: Временно убираем анти-спам фильтр ---
+    if status_code:
         if bot_data.get('debug_mode_on', False):
-            await broadcast_func(app, f"<code>{status_message}</code>")
+            timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S')
+            await broadcast_func(app, f"<code>{timestamp}: {status_message}</code>")
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
 # === Логика мониторинга =======================================================
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
@@ -169,12 +169,10 @@ async def scanner_main_loop(app: Application, broadcast_func):
         log.info("Exchange connection and markets loaded.")
         while app.bot_data.get("bot_on", False):
             try:
-                # --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ---
                 if not app.bot_data.get('monitored_signals'):
                     await scan_for_new_opportunities(exchange, app, broadcast_func)
                 else:
                     await monitor_active_trades(exchange, app, broadcast_func)
-                # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
                 await asyncio.sleep(SCAN_INTERVAL)
             except asyncio.CancelledError:
                 log.info("Main Engine loop cancelled by command.")
