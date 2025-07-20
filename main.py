@@ -1,6 +1,6 @@
 # main_bot.py
 # ============================================================================
-# v26.9 - Добавлен фильтр минимального потенциала прибыли
+# v26.9 - Новая стратегия "Вход по Агрессии с Поддержкой Дисбаланса"
 # ============================================================================
 
 import os
@@ -77,7 +77,6 @@ def load_state():
     state.setdefault("monitored_signals", [])
     state.setdefault("deposit", 50)
     state.setdefault("leverage", 100)
-    state.setdefault("last_imbalance_ratio", 1.0)
     log.info("State loaded. Active signals: %d. Deposit: %s, Leverage: %s",
              len(state.get("monitored_signals", [])), state.get('deposit'), state.get('leverage'))
 
@@ -99,7 +98,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     state["bot_on"] = True
     save_state()
     await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} запущен.</b>\n"
-                                      f"<b>Стратегия:</b> Прорыв Дисбаланса\n"
+                                      f"<b>Стратегия:</b> Агрессия + Дисбаланс\n"
                                       f"Логирование в лист: <b>{SHEET_NAME}</b>\n"
                                       "Используйте /run для запуска и /status для статуса.",
                                       parse_mode=constants.ParseMode.HTML)
@@ -116,7 +115,7 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     active_signals = state.get('monitored_signals', [])
     
     msg = (f"<b>Состояние бота v{BOT_VERSION}</b>\n"
-           f"<b>Стратегия:</b> Прорыв Дисбаланса\n"
+           f"<b>Стратегия:</b> Агрессия + Дисбаланс\n"
            f"<b>Статус:</b> {'✅ ON' if state.get('bot_on') else '🛑 OFF'}\n"
            f"<b>Основной цикл:</b> {'🚀 RUNNING' if is_running else '🔌 STOPPED'}\n"
            f"<b>Активных сделок:</b> {len(active_signals)}\n"
