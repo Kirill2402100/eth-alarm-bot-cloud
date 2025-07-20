@@ -126,7 +126,9 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
 
 # === Главный цикл ==========================================================
 async def scanner_main_loop(app: Application, broadcast_func):
-    log.info(f"Main Engine loop starting (v{BOT_VERSION})...")
+    # Получаем версию из объекта app и используем её
+    bot_version = getattr(app, 'bot_version', 'N/A') # <--- ИЗМЕНИТЕ ЭТУ СТРОЧКУ
+    log.info(f"Main Engine loop starting (v{bot_version})...") # <--- И ИЗМЕНИТЕ ЭТУ
     exchange = None
     try:
         exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
