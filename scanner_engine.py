@@ -88,11 +88,13 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
         now = exchange.milliseconds()
         since = now - AGGRESSION_TIMEFRAME_SEC * 1000
         trades = await exchange.fetch_trades(
-            PAIR_TO_SCAN, 
-            since=since, 
-            until=now,  # Добавляем обязательный параметр until
-            limit=100, 
-            params={'type': 'swap'}
+            PAIR_TO_SCAN,
+            since=since,
+            limit=100,
+            params={
+                'type': 'swap',
+                'until': now  # Переносим 'until' внутрь словаря params
+            }
         )
         if not trades: return
 
