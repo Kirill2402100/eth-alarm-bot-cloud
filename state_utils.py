@@ -26,6 +26,7 @@ def load_state(app: Application):
     # НОВЫЕ ПЕРЕМЕННЫЕ ДЛЯ ДИАГНОСТИКИ
     bot_data.setdefault("debug_mode_on", False)
     bot_data.setdefault("last_debug_message", "")
+    bot_data.setdefault("stable_walls", {}) # <--- ДОБАВЬТЕ ЭТУ СТРОКУ
 
     log.info("State loaded into bot_data. Active signals: %d. Deposit: %s, Leverage: %s",
              len(bot_data.get("monitored_signals", [])), bot_data.get('deposit'), bot_data.get('leverage'))
