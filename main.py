@@ -1,6 +1,6 @@
 # main_bot.py
 # ============================================================================
-# v26.4 - Исправлена ошибка API при запросе сделок
+# v26.5 - Исправлена критическая ошибка мониторинга открытых сделок
 # ============================================================================
 
 import os
@@ -19,7 +19,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "26.4"
+BOT_VERSION        = "26.5"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# === Google-Sheets =========================================================
+# === Google-Sheets (без изменений) =========================================
 TRADE_LOG_WS = None
 SHEET_NAME   = f"Trading_Log_v{BOT_VERSION}"
 
@@ -90,7 +90,7 @@ async def broadcast(app, txt:str):
         except Exception as e:
             log.error("Send fail %s: %s", cid, e)
 
-# === Команды Telegram =======================================
+# === Команды Telegram (без изменений) =======================================
 async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     if cid not in ctx.application.chat_ids:
