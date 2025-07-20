@@ -1,8 +1,9 @@
 # scanner_engine.py
 # ============================================================================
-# v29.5 - HOTFIX
-# - Возвращен формат PAIR_TO_SCAN к 'BTC/USDT' для исправления "молчащей"
-#   диагностики. Проблема была в некорректной обработке тикера биржей.
+# v29.6 - STABLE
+# - Мониторинг переведен на расчет цены из стакана (mid-price),
+#   чтобы избежать ошибки "Контракт не существует" от биржи MEXC.
+#   Это финальная версия логики.
 # ============================================================================
 import asyncio
 import time
@@ -19,9 +20,7 @@ from state_utils import save_state
 log = logging.getLogger("bot")
 
 # === Конфигурация сканера ==================================================
-# ИЗМЕНЕНИЕ: Возвращаем формат, который корректно обрабатывается биржей
 PAIR_TO_SCAN = 'BTC/USDT'
-
 LARGE_ORDER_USD = 150000
 TOP_N_ORDERS_TO_ANALYZE = 20
 AGGRESSION_TIMEFRAME_SEC = 15
@@ -110,26 +109,36 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
         if bot_data.get('debug_mode_on', False):
             await broadcast_func(app, f"<code>{status_message}</code>")
 
-# === Мониторинг и главный цикл (без изменений) ==============================
+# === Логика мониторинга (ИСПРАВЛЕНА) ======================================
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
     if not bot_data.get('monitored_signals'): return
     signal = bot_data['monitored_signals'][0]
-    # ВАЖНО: Внутри мониторинга мы используем тикер из сигнала, который уже в формате 'BTC/USDT'
     pair, entry_price, sl_price, side = (signal['Pair'], signal['Entry_Price'], signal['SL_Price'], signal['side'])
     try:
         order_book = await exchange.fetch_order_book(pair, limit=100, params={'type': 'swap'})
-        ticker = await exchange.fetch_ticker(pair, params={'type': 'swap'})
-        last_price = ticker.get('last')
-        if not last_price: return
+
+        # Проверяем, что в стакане есть ордера, прежде чем что-то делать
+        if not order_book.get('bids') or not order_book['bids'][0] or not order_book.get('asks') or not order_book['asks'][0]:
+            log.warning(f"Order book for {pair} is incomplete, skipping monitor cycle.")
+            return
+
+        # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Вычисляем цену из стакана, а не через fetch_ticker ---
+        best_bid = order_book['bids'][0][0]
+        best_ask = order_book['asks'][0][0]
+        last_price = (best_bid + best_ask) / 2
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
         current_imbalance, _, _, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
         bot_data['monitored_signals'][0]['current_imbalance_ratio'] = current_imbalance
         exit_status, exit_price, reason = None, None, None
+        
         if (side == 'LONG' and last_price <= sl_price) or (side == 'SHORT' and last_price >= sl_price):
             exit_status, exit_price, reason = "SL_HIT", sl_price, "Аварийный стоп-лосс"
         if not exit_status:
             if current_imbalance < FLAT_MARKET_MIN_IMBALANCE or ((side == 'LONG') != (top_bids_usd > top_asks_usd)):
                 exit_status, exit_price, reason = "IMBALANCE_LOST", last_price, f"Дисбаланс упал до {current_imbalance:.1f}x"
+        
         if exit_status:
             pnl_percent_raw = ((exit_price - entry_price) / entry_price) * (-1 if side == 'SHORT' else 1)
             pnl_usd = signal['Deposit'] * signal['Leverage'] * pnl_percent_raw
@@ -141,9 +150,10 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
             bot_data['monitored_signals'] = []
             save_state(app)
     except Exception as e:
-        log.error(f"CRITICAL MONITORING ERROR: {e}")
+        log.error(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
         await broadcast_func(app, f"⚠️ <b>Критическая ошибка мониторинга!</b>\n<code>Ошибка: {e}</code>")
 
+# === Главный цикл (без изменений) ============================================
 async def scanner_main_loop(app: Application, broadcast_func):
     bot_version = getattr(app, 'bot_version', 'N/A')
     log.info(f"Main Engine loop starting (v{bot_version})...")
