@@ -1,6 +1,6 @@
 # main_bot.py
 # ============================================================================
-# v25.8 - Добавлен фильтр по EMA для подтверждения ценового импульса
+# v26.2 - Добавлена запись причин Emergency Exit в Google Sheets
 # ============================================================================
 
 import os
@@ -19,7 +19,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "25.8"
+BOT_VERSION        = "26.2"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -32,12 +32,14 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 TRADE_LOG_WS = None
 SHEET_NAME   = f"Trading_Log_v{BOT_VERSION}"
 
+# --- ИЗМЕНЕНИЕ: Добавлен столбец Exit_Reason ---
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Algorithm_Type", "Strategy_Idea",
     "Entry_Price", "SL_Price", "TP_Price", "side", "Deposit", "Leverage",
     "Status", "Exit_Time_UTC", "Exit_Price", "PNL_USD", "PNL_Percent",
-    "Trigger_Order_USD"
+    "Trigger_Order_USD", "Exit_Reason"
 ]
+# --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
 def setup_sheets():
     global TRADE_LOG_WS
@@ -98,6 +100,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     state["bot_on"] = True
     save_state()
     await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} запущен.</b>\n"
+                                      f"<b>Стратегия:</b> Поглощение Ликвидности\n"
                                       f"Логирование в лист: <b>{SHEET_NAME}</b>\n"
                                       "Используйте /run для запуска и /status для статуса.",
                                       parse_mode=constants.ParseMode.HTML)
@@ -114,6 +117,7 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     active_signals = state.get('monitored_signals', [])
     
     msg = (f"<b>Состояние бота v{BOT_VERSION}</b>\n"
+           f"<b>Стратегия:</b> Поглощение Ликвидности\n"
            f"<b>Статус:</b> {'✅ ON' if state.get('bot_on') else '🛑 OFF'}\n"
            f"<b>Основной цикл:</b> {'🚀 RUNNING' if is_running else '🔌 STOPPED'}\n"
            f"<b>Активных сделок:</b> {len(active_signals)}\n"
@@ -157,26 +161,6 @@ async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except (IndexError, ValueError):
         await update.message.reply_text("⚠️ Неверный формат. Используйте: <code>/leverage &lt;число&gt;</code>", parse_mode=constants.ParseMode.HTML)
 
-async def cmd_testapi(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Начинаю тест API биржи MEXC для фьючерсов...")
-    exchange = ccxt.mexc({'options': {'defaultType': 'swap'}})
-    symbol = 'BTC/USDT'
-    reply_text = f"<b>Результат теста API для {symbol} фьючерсов на {exchange.id}:</b>\n\n"
-    try:
-        params = {'type': 'swap'}
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe='1m', limit=2, params=params)
-        if ohlcv and len(ohlcv) > 0:
-            reply_text += "✅ <b>УСПЕХ!</b> Данные по свечам получены:\n"
-            for candle in ohlcv:
-                dt_object = datetime.fromtimestamp(candle[0] / 1000)
-                reply_text += f"<pre>  - {dt_object.strftime('%H:%M:%S')}, H: {candle[2]}, L: {candle[3]}</pre>\n"
-        else:
-            reply_text += "❌ <b>ПРОВАЛ!</b> Биржа вернула пустой ответ."
-    except Exception as e:
-        reply_text += f"❌ <b>КРИТИЧЕСКАЯ ОШИБКА:</b>\n<pre>{e}</pre>"
-    await exchange.close()
-    await update.message.reply_text(reply_text, parse_mode=constants.ParseMode.HTML)
-
 async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
     app = ctx.application
     is_running = hasattr(app, '_main_loop_task') and not app._main_loop_task.done()
@@ -197,7 +181,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("info", cmd_info))
-    app.add_handler(CommandHandler("testapi", cmd_testapi))
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("deposit", cmd_deposit))
     app.add_handler(CommandHandler("leverage", cmd_leverage))
