@@ -1,6 +1,6 @@
 # main_bot.py
 # ============================================================================
-# v26.9 - Новая стратегия "Вход по Агрессии с Поддержкой Дисбаланса"
+# v27.0 - Повышена стабильность, улучшена обработка ошибок при запуске
 # ============================================================================
 
 import os
@@ -19,7 +19,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "26.9"
+BOT_VERSION        = "27.0"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -77,6 +77,7 @@ def load_state():
     state.setdefault("monitored_signals", [])
     state.setdefault("deposit", 50)
     state.setdefault("leverage", 100)
+    state.setdefault("last_imbalance_ratio", 1.0)
     log.info("State loaded. Active signals: %d. Deposit: %s, Leverage: %s",
              len(state.get("monitored_signals", [])), state.get('deposit'), state.get('leverage'))
 
