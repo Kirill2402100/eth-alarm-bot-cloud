@@ -1,6 +1,6 @@
 # main_bot.py
 # ============================================================================
-# v27.1 - Исправлена ошибка, приводившая к остановке бота сразу после запуска
+# v27.2 - Повышена стабильность запуска, улучшена обработка ошибок
 # ============================================================================
 
 import os
@@ -19,7 +19,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "27.1"
+BOT_VERSION        = "27.2"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# === Google-Sheets =========================================================
+# === Google-Sheets (без изменений) =========================================
 TRADE_LOG_WS = None
 SHEET_NAME   = f"Trading_Log_v{BOT_VERSION}"
 
@@ -55,9 +55,7 @@ def setup_sheets():
         except gspread.WorksheetNotFound:
             log.info(f"Лист '{SHEET_NAME}' не найден. Создаю новый.")
             TRADE_LOG_WS = ss.add_worksheet(title=SHEET_NAME, rows="1000", cols=len(HEADERS))
-            # --- ИЗМЕНЕНИЕ: Исправлен вызов update для gspread ---
             TRADE_LOG_WS.update(range_name="A1", values=[HEADERS])
-            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
             TRADE_LOG_WS.format(f"A1:{chr(ord('A')+len(HEADERS)-1)}1", {"textFormat":{"bold":True}})
         log.info("Google-Sheets ready. Logging to '%s'.", SHEET_NAME)
         trade_executor.TRADE_LOG_WS = TRADE_LOG_WS
@@ -163,19 +161,19 @@ async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except (IndexError, ValueError):
         await update.message.reply_text("⚠️ Неверный формат. Используйте: <code>/leverage &lt;число&gt;</code>", parse_mode=constants.ParseMode.HTML)
 
+# --- ИЗМЕНЕНИЕ: Упрощена и сделана более надежной логика запуска ---
 async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
     app = ctx.application
     is_running = hasattr(app, '_main_loop_task') and not app._main_loop_task.done()
     if is_running:
         await update.message.reply_text("ℹ️ Основной цикл уже запущен.")
     else:
-        if not state.get("bot_on", False):
-            state["bot_on"] = True
-            # --- ИЗМЕНЕНИЕ: Добавлен save_state() для немедленного сохранения ---
-            save_state()
-            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+        # Всегда устанавливаем флаг и сохраняем перед запуском для надежности
+        state["bot_on"] = True
+        save_state()
         await update.message.reply_text(f"🚀 Запускаю основной цикл (v{BOT_VERSION})...")
         app._main_loop_task = asyncio.create_task(scanner_main_loop(app, broadcast, state, save_state))
+# --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
 if __name__ == "__main__":
     load_state()
