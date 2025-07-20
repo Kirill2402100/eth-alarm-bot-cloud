@@ -1,6 +1,6 @@
 # main_bot.py
 # ============================================================================
-# v26.2 - Добавлена запись причин Emergency Exit в Google Sheets
+# v26.3 - Исправлена ошибка в команде /status
 # ============================================================================
 
 import os
@@ -19,7 +19,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "26.2"
+BOT_VERSION        = "26.3"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -32,14 +32,12 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 TRADE_LOG_WS = None
 SHEET_NAME   = f"Trading_Log_v{BOT_VERSION}"
 
-# --- ИЗМЕНЕНИЕ: Добавлен столбец Exit_Reason ---
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Algorithm_Type", "Strategy_Idea",
     "Entry_Price", "SL_Price", "TP_Price", "side", "Deposit", "Leverage",
     "Status", "Exit_Time_UTC", "Exit_Price", "PNL_USD", "PNL_Percent",
     "Trigger_Order_USD", "Exit_Reason"
 ]
-# --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
 def setup_sheets():
     global TRADE_LOG_WS
@@ -92,7 +90,7 @@ async def broadcast(app, txt:str):
         except Exception as e:
             log.error("Send fail %s: %s", cid, e)
 
-# === Команды Telegram (без изменений) =======================================
+# === Команды Telegram =======================================
 async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     if cid not in ctx.application.chat_ids:
@@ -113,7 +111,9 @@ async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
         ctx.application._main_loop_task.cancel()
 
 async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    is_running = hasattr(update.application, '_main_loop_task') and not update.application._main_loop_task.done()
+    # --- ИЗМЕНЕНИЕ: Исправлена ошибка AttributeError ---
+    is_running = hasattr(ctx.application, '_main_loop_task') and not ctx.application._main_loop_task.done()
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
     active_signals = state.get('monitored_signals', [])
     
     msg = (f"<b>Состояние бота v{BOT_VERSION}</b>\n"
