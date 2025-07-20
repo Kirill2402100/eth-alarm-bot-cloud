@@ -18,14 +18,14 @@ log = logging.getLogger("bot")
 
 # === Конфигурация сканера ==================================================
 PAIR_TO_SCAN = 'BTC/USDT'
-MIN_LIQUIDITY_USD = 2000000
-MIN_IMBALANCE_RATIO = 2.5
-LARGE_ORDER_USD = 250000
-TOP_N_ORDERS_TO_ANALYZE = 20
-AGGRESSION_TIMEFRAME_SEC = 15
-AGGRESSION_RATIO = 2.0
-SL_BUFFER_PERCENT = 0.0005
-MIN_PROFIT_TARGET_PERCENT = 0.0015
+MIN_LIQUIDITY_USD = 2000000          # Оставляем без изменений
+MIN_IMBALANCE_RATIO = 2.0            # <-- СНИЖЕНО (было 2.5)
+LARGE_ORDER_USD = 150000             # <-- СНИЖЕНО (было 250000)
+TOP_N_ORDERS_TO_ANALYZE = 20         # Оставляем без изменений
+AGGRESSION_TIMEFRAME_SEC = 15        # Оставляем без изменений
+AGGRESSION_RATIO = 2.0               # Оставляем без изменений (пока)
+SL_BUFFER_PERCENT = 0.0005           # Оставляем без изменений
+MIN_PROFIT_TARGET_PERCENT = 0.0012   # <-- СНИЖЕНО (было 0.0015)
 SCAN_INTERVAL = 5
 
 # === Функции-помощники (без изменений) =====================================
