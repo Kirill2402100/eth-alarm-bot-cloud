@@ -1,6 +1,6 @@
 # scanner_engine.py
 # ============================================================================
-# v26.9 - Добавлен фильтр минимального потенциала прибыли
+# v26.9 - Новая стратегия "Вход по Агрессии с Поддержкой Дисбаланса"
 # ============================================================================
 import asyncio
 import time
@@ -13,18 +13,17 @@ from trade_executor import log_trade_to_sheet, update_trade_in_sheet
 PAIR_TO_SCAN = 'BTC/USDT'
 MIN_LIQUIDITY_USD = 2000000
 MIN_IMBALANCE_RATIO = 2.5
-MAX_IMBALANCE_RATIO = 15.0
 LARGE_ORDER_USD = 250000
 TOP_N_ORDERS_TO_ANALYZE = 20
+AGGRESSION_TIMEFRAME_SEC = 15
+AGGRESSION_RATIO = 2.0
 SL_BUFFER_PERCENT = 0.0005
-# --- НОВЫЙ ПАРАМЕТР ---
-MIN_PROFIT_TARGET_PERCENT = 0.0015 # 0.15%, минимальный потенциал до первой "стены"
-# --- КОНЕЦ НОВОГО ПАРАМЕТРА ---
+MIN_PROFIT_TARGET_PERCENT = 0.0015
 API_TIMEOUT = 10.0
 SCAN_INTERVAL = 5
 
-def get_imbalance(order_book):
-    """Рассчитывает дисбаланс на основе стакана ордеров."""
+def get_imbalance_and_walls(order_book):
+    """Рассчитывает дисбаланс и находит ключевые "стены" ликвидности."""
     bids, asks = order_book.get('bids', []), order_book.get('asks', [])
     if not bids or not asks: return 1.0, None, None
 
@@ -58,7 +57,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
         last_price = ticker.get('last')
         if not last_price: return
 
-        current_imbalance, _, _ = get_imbalance(order_book)
+        current_imbalance, large_bids, large_asks = get_imbalance_and_walls(order_book)
         
         state['monitored_signals'][0]['current_imbalance_ratio'] = current_imbalance
         
@@ -68,11 +67,11 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
            (side == 'SHORT' and last_price >= sl_price):
             exit_status, exit_price, reason = "SL_HIT", sl_price, "Аварийный стоп-лосс"
 
-        side_is_long = side == 'LONG'
-        dominant_side_is_bids = top_bids_usd > top_asks_usd if 'top_bids_usd' in locals() and 'top_asks_usd' in locals() else order_book['bids'][0][0] > order_book['asks'][0][0]
-
-
         if not exit_status:
+            side_is_long = side == 'LONG'
+            # Определяем текущую доминирующую сторону по дисбалансу
+            dominant_side_is_bids = len(large_bids or []) > len(large_asks or [])
+
             if current_imbalance < MIN_IMBALANCE_RATIO or (side_is_long != dominant_side_is_bids):
                 exit_status, exit_price = "IMBALANCE_LOST", last_price
                 reason = f"Дисбаланс упал до {current_imbalance:.1f}x"
@@ -92,76 +91,89 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
                    f"<b>Результат: ${pnl_usd:+.2f} ({pnl_percent_display:+.2f}%)</b>")
             await broadcast_func(app, msg)
             state['monitored_signals'] = []
-            state['last_imbalance_ratio'] = 1.0
             save_state_func()
     except Exception as e:
         print(f"CRITICAL MONITORING ERROR: {e}")
         await broadcast_func(app, f"⚠️ <b>Критическая ошибка мониторинга!</b>\n<code>Ошибка: {e}</code>")
 
 async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_state_func):
-    """Основная функция сканера по стратегии "Прорыв Дисбаланса"."""
+    """Основная функция сканера по стратегии "Агрессия + Дисбаланс"."""
     try:
+        # 1. Ищем триггер по агрессии в ленте сделок
+        since = exchange.milliseconds() - AGGRESSION_TIMEFRAME_SEC * 1000
+        trades = await exchange.fetch_trades(PAIR_TO_SCAN, since=since, limit=100, params={'type': 'swap'})
+        if not trades: 
+            state['last_status_info'] = "Поиск | Нет сделок в ленте"
+            return
+
+        buy_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'buy')
+        sell_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'sell')
+
+        side = None
+        if buy_volume > sell_volume * AGGRESSION_RATIO:
+            side = "LONG"
+        elif sell_volume > buy_volume * AGGRESSION_RATIO:
+            side = "SHORT"
+        
+        if not side:
+            state['last_status_info'] = f"Поиск | Нет агрессии (Покупки: ${buy_volume:.0f}, Продажи: ${sell_volume:.0f})"
+            return
+
+        # 2. Если агрессия есть, проверяем подтверждение по дисбалансу
         order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100, params={'type': 'swap'})
-        current_imbalance, large_bids, large_asks = get_imbalance(order_book)
-        previous_imbalance = state.get('last_imbalance_ratio', 1.0)
+        current_imbalance, large_bids, large_asks = get_imbalance_and_walls(order_book)
+
+        if not large_bids or not large_asks: return
+
+        dominant_side_is_bids = len(large_bids) > len(large_asks)
+
+        if (side == "LONG" and not dominant_side_is_bids) or \
+           (side == "SHORT" and dominant_side_is_bids) or \
+           (current_imbalance < MIN_IMBALANCE_RATIO):
+            state['last_status_info'] = f"Агрессия {side} отклонена (Дисбаланс: {current_imbalance:.1f}x)"
+            return
+
+        # 3. Все фильтры пройдены, рассчитываем сделку
+        entry_price = trades[-1]['price']
         
-        if previous_imbalance < MIN_IMBALANCE_RATIO and current_imbalance >= MIN_IMBALANCE_RATIO:
-            if current_imbalance > MAX_IMBALANCE_RATIO:
-                state['last_status_info'] = f"Поиск | Дисбаланс {current_imbalance:.1f}x (слишком высокий)"
-                return
+        if side == "LONG":
+            support_wall = large_bids[0]
+            resistance_wall = large_asks[0]
+            sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT)
+        else: # SHORT
+            support_wall = large_asks[0]
+            resistance_wall = large_bids[0]
+            sl_price = support_wall['price'] * (1 + SL_BUFFER_PERCENT)
 
-            if not large_bids or not large_asks:
-                return # Нужны стены с обеих сторон для расчета
-
-            side = "LONG" if len(large_bids) > len(large_asks) else "SHORT"
-            
-            if side == "LONG":
-                support_wall = large_bids[0]
-                resistance_wall = large_asks[0]
-                entry_price = order_book['asks'][0][0]
-                sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT)
-            else: # SHORT
-                support_wall = large_asks[0]
-                resistance_wall = large_bids[0]
-                entry_price = order_book['bids'][0][0]
-                sl_price = support_wall['price'] * (1 + SL_BUFFER_PERCENT)
-
-            # --- НОВЫЙ ФИЛЬТР: Проверка минимального потенциала ---
-            potential_tp = resistance_wall['price']
-            potential_profit_pct = abs(potential_tp - entry_price) / entry_price
-            
-            if potential_profit_pct < MIN_PROFIT_TARGET_PERCENT:
-                state['last_status_info'] = f"Сигнал {side} пропущен (потенциал {potential_profit_pct:.4f} < {MIN_PROFIT_TARGET_PERCENT})"
-                # Обновляем last_imbalance_ratio, чтобы не входить в этот же сигнал повторно
-                state['last_imbalance_ratio'] = current_imbalance
-                return
-            # --- КОНЕЦ НОВОГО ФИЛЬТРА ---
-
-            idea = f"Прорыв дисбаланса с {previous_imbalance:.1f}x до {current_imbalance:.1f}x"
-            
-            decision = {
-                "Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-                "Pair": PAIR_TO_SCAN, "Algorithm_Type": "Imbalance Breakout", "Strategy_Idea": idea,
-                "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": None,
-                "side": side, "Deposit": state.get('deposit', 50), "Leverage": state.get('leverage', 100),
-                "Trigger_Order_USD": support_wall['value_usd']
-            }
-            
-            msg = (f"🔥 <b>ВХОД В СДЕЛКУ (Прорыв Дисбаланса)</b>\n\n"
-                   f"<b>Идея:</b> <code>{idea}</code>\n"
-                   f"<b>Депозит:</b> ${decision['Deposit']} | <b>Плечо:</b> x{decision['Leverage']}\n"
-                   f"<b>План:</b>\n"
-                   f" - Вход (<b>{side}</b>): <code>{entry_price:.4f}</code>\n"
-                   f" - Аварийный SL: <code>{sl_price:.4f}</code> (за стеной {support_wall['price']})\n"
-                   f" - <b>Выход:</b> при ослаблении дисбаланса (< {MIN_IMBALANCE_RATIO}x)")
-            
-            await broadcast_func(app, msg)
-            state['monitored_signals'].append(decision)
-            save_state_func()
-            await log_trade_to_sheet(decision)
+        potential_tp = resistance_wall['price']
+        potential_profit_pct = abs(potential_tp - entry_price) / entry_price
         
-        state['last_imbalance_ratio'] = current_imbalance
-        state['last_status_info'] = f"Поиск | Текущий дисбаланс {current_imbalance:.1f}x"
+        if potential_profit_pct < MIN_PROFIT_TARGET_PERCENT:
+            state['last_status_info'] = f"Сигнал {side} пропущен (потенциал {potential_profit_pct:.4f} < {MIN_PROFIT_TARGET_PERCENT})"
+            return
+
+        idea = f"Агрессия ${buy_volume:.0f} vs ${sell_volume:.0f}, поддержка дисбаланса {current_imbalance:.1f}x"
+        
+        decision = {
+            "Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+            "Pair": PAIR_TO_SCAN, "Algorithm_Type": "Aggression + Imbalance", "Strategy_Idea": idea,
+            "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": None, # TP динамический
+            "side": side, "Deposit": state.get('deposit', 50), "Leverage": state.get('leverage', 100),
+            "Trigger_Order_USD": support_wall['value_usd']
+        }
+        
+        msg = (f"🔥 <b>ВХОД В СДЕЛКУ (Агрессия + Дисбаланс)</b>\n\n"
+               f"<b>Идея:</b> <code>{idea}</code>\n"
+               f"<b>Депозит:</b> ${decision['Deposit']} | <b>Плечо:</b> x{decision['Leverage']}\n"
+               f"<b>План:</b>\n"
+               f" - Вход (<b>{side}</b>): <code>{entry_price:.4f}</code>\n"
+               f" - Аварийный SL: <code>{sl_price:.4f}</code> (за стеной {support_wall['price']})\n"
+               f" - <b>Выход:</b> при ослаблении дисбаланса (< {MIN_IMBALANCE_RATIO}x)")
+        
+        await broadcast_func(app, msg)
+        state['monitored_signals'].append(decision)
+        save_state_func()
+        await log_trade_to_sheet(decision)
 
     except Exception as e:
         print(f"CRITICAL SCANNER ERROR: {e}", exc_info=True)
@@ -170,7 +182,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
 async def scanner_main_loop(app, broadcast_func, state, save_state_func):
     bot_version = "26.9"
     app.bot_version = bot_version
-    print(f"Main Engine loop started (v{bot_version}). Strategy: Imbalance Breakout.")
+    print(f"Main Engine loop started (v{bot_version}). Strategy: Aggression + Imbalance.")
     
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     
