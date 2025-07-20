@@ -1,6 +1,6 @@
 # main_bot.py
 # ============================================================================
-# v27.0 - Повышена стабильность, улучшена обработка ошибок при запуске
+# v27.1 - Исправлена ошибка, приводившая к остановке бота сразу после запуска
 # ============================================================================
 
 import os
@@ -19,7 +19,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "27.0"
+BOT_VERSION        = "27.1"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# === Google-Sheets (без изменений) =========================================
+# === Google-Sheets =========================================================
 TRADE_LOG_WS = None
 SHEET_NAME   = f"Trading_Log_v{BOT_VERSION}"
 
@@ -55,7 +55,9 @@ def setup_sheets():
         except gspread.WorksheetNotFound:
             log.info(f"Лист '{SHEET_NAME}' не найден. Создаю новый.")
             TRADE_LOG_WS = ss.add_worksheet(title=SHEET_NAME, rows="1000", cols=len(HEADERS))
-            TRADE_LOG_WS.update("A1", [HEADERS])
+            # --- ИЗМЕНЕНИЕ: Исправлен вызов update для gspread ---
+            TRADE_LOG_WS.update(range_name="A1", values=[HEADERS])
+            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
             TRADE_LOG_WS.format(f"A1:{chr(ord('A')+len(HEADERS)-1)}1", {"textFormat":{"bold":True}})
         log.info("Google-Sheets ready. Logging to '%s'.", SHEET_NAME)
         trade_executor.TRADE_LOG_WS = TRADE_LOG_WS
@@ -91,7 +93,7 @@ async def broadcast(app, txt:str):
         except Exception as e:
             log.error("Send fail %s: %s", cid, e)
 
-# === Команды Telegram (без изменений) =======================================
+# === Команды Telegram =======================================
 async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     if cid not in ctx.application.chat_ids:
@@ -169,6 +171,9 @@ async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
     else:
         if not state.get("bot_on", False):
             state["bot_on"] = True
+            # --- ИЗМЕНЕНИЕ: Добавлен save_state() для немедленного сохранения ---
+            save_state()
+            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         await update.message.reply_text(f"🚀 Запускаю основной цикл (v{BOT_VERSION})...")
         app._main_loop_task = asyncio.create_task(scanner_main_loop(app, broadcast, state, save_state))
 
