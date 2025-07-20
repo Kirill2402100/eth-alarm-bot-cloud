@@ -1,6 +1,6 @@
 # scanner_engine.py
 # ============================================================================
-# v27.0 - Повышена стабильность, улучшена обработка ошибок при запуске
+# v27.1 - Исправлена ошибка мониторинга, повышена стабильность
 # ============================================================================
 import asyncio
 import time
@@ -67,7 +67,9 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
 
         if not exit_status:
             side_is_long = side == 'LONG'
+            # --- ИЗМЕНЕНИЕ: Исправлена ошибка NameError ---
             dominant_side_is_bids = len(large_bids or []) > len(large_asks or [])
+            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
             if current_imbalance < MIN_IMBALANCE_RATIO or (side_is_long != dominant_side_is_bids):
                 exit_status, exit_price = "IMBALANCE_LOST", last_price
@@ -173,7 +175,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
         state['last_status_info'] = f"Ошибка сканера: {e}"
 
 async def scanner_main_loop(app, broadcast_func, state, save_state_func):
-    bot_version = "27.0"
+    bot_version = "27.1"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}). Strategy: Aggression + Imbalance.")
     
