@@ -1,7 +1,6 @@
-# main_bot.py
+# main.py
 # ============================================================================
-# v28.1 - СТАБИЛЬНАЯ ВЕРСИЯ
-# Исправлен циклический импорт через вынос state_utils.
+# v28.2 - Добавлена система диагностики в реальном времени (ВКЛ/ВЫКЛ)
 # ============================================================================
 
 import os
@@ -16,10 +15,10 @@ from oauth2client.service_account import ServiceAccountCredentials
 # Локальные импорты
 import trade_executor
 from scanner_engine import scanner_main_loop
-from state_utils import load_state, save_state # <--- ИЗМЕНЕНИЕ
+from state_utils import load_state, save_state
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "28.1"
+BOT_VERSION        = "28.2"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -28,9 +27,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# === Google-Sheets (без изменений) =======================================
+# === Google-Sheets =========================================================
 TRADE_LOG_WS = None
-SHEET_NAME   = f"Trading_Log_v27.2"
+# ИСПРАВЛЕНО: Имя листа теперь создается динамически из версии бота
+SHEET_NAME   = f"Trading_Log_v{BOT_VERSION}"
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Algorithm_Type", "Strategy_Idea",
     "Entry_Price", "SL_Price", "TP_Price", "side", "Deposit", "Leverage",
@@ -72,15 +72,25 @@ async def broadcast(app: Application, txt:str):
             log.error("Send fail %s: %s", cid, e)
 
 # === Команды Telegram =====================================================
-# (Все команды остаются без изменений, они уже используют save_state)
+async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Включает и выключает режим детальной диагностики."""
+    # Переключаем значение флага
+    current_state = ctx.bot_data.get("debug_mode_on", False)
+    new_state = not current_state
+    ctx.bot_data["debug_mode_on"] = new_state
+    save_state(ctx.application)
+
+    if new_state:
+        await update.message.reply_text("✅ **Диагностика в реальном времени ВКЛЮЧЕНА.**\n\nБот будет присылать свой статус в чат при каждом изменении.", parse_mode=constants.ParseMode.HTML)
+    else:
+        await update.message.reply_text("❌ **Диагностика ВЫКЛЮЧЕНА.**", parse_mode=constants.ParseMode.HTML)
+
+# (остальные команды без изменений)
 async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(update.effective_chat.id)
     ctx.bot_data["bot_on"] = True
     save_state(ctx.application)
-    await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} запущен.</b>\n"
-                                      f"<b>Стратегия:</b> Агрессия + Дисбаланс\n"
-                                      "Используйте /run для запуска и /status для статуса.",
-                                      parse_mode=constants.ParseMode.HTML)
+    await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} запущен.</b>\nИспользуйте /run для запуска и /status для статуса.", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     ctx.bot_data["bot_on"] = False
@@ -94,6 +104,7 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     msg = (f"<b>Состояние бота v{BOT_VERSION}</b>\n"
            f"<b>Статус:</b> {'✅ ON' if bot_data.get('bot_on') else '🛑 OFF'}\n"
            f"<b>Основной цикл:</b> {'🚀 RUNNING' if is_running else '🔌 STOPPED'}\n"
+           f"<b>Диагностика:</b> {'ВКЛ' if bot_data.get('debug_mode_on') else 'ВЫКЛ'}\n"
            f"<b>Активных сделок:</b> {len(active_signals)}\n"
            f"<b>Депозит:</b> ${bot_data.get('deposit', 50)}\n"
            f"<b>Плечо:</b> x{bot_data.get('leverage', 100)}\n")
@@ -133,17 +144,20 @@ async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
 
 # === Точка входа =========================================================
 if __name__ == "__main__":
-    # Создаем приложение
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.chat_ids = set(CHAT_IDS)
-    app.bot_version = BOT_VERSION # <--- ДОБАВЬТЕ ЭТУ СТРОЧКУ
+    app.bot_version = BOT_VERSION
+    
     load_state(app)
     setup_sheets()
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("info", cmd_info))
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("deposit", cmd_deposit))
     app.add_handler(CommandHandler("leverage", cmd_leverage))
+    
     log.info(f"Bot v{BOT_VERSION} started polling.")
     app.run_polling()
