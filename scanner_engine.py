@@ -1,6 +1,6 @@
 # scanner_engine.py
 # ============================================================================
-# v26.4 - Финальное исправление ошибки API при запросе сделок
+# v26.5 - Исправлена критическая ошибка мониторинга открытых сделок
 # ============================================================================
 import asyncio
 import time
@@ -43,7 +43,9 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
         return
 
     try:
-        ticker = await exchange.fetch_ticker(pair, params={'type': 'swap'})
+        # --- ИЗМЕНЕНИЕ: Добавлен params={'type': 'swap'} во все запросы мониторинга ---
+        params = {'type': 'swap'}
+        ticker = await exchange.fetch_ticker(pair, params=params)
         last_price = ticker.get('last')
         if not last_price: return
 
@@ -58,7 +60,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
             elif last_price <= tp_price: exit_status, exit_price = "TP_HIT", tp_price
 
         if not exit_status:
-            order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=50, params={'type': 'swap'})
+            order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=50, params=params)
             large_bids = [{'price': p, 'value_usd': round(p*a)} for p, a in order_book.get('bids', []) if p*a > LARGE_ORDER_USD]
             large_asks = [{'price': p, 'value_usd': round(p*a)} for p, a in order_book.get('asks', []) if p*a > LARGE_ORDER_USD]
 
@@ -76,6 +78,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
             if emergency_reason:
                 exit_status, exit_price = "EMERGENCY_EXIT", last_price
                 await broadcast_func(app, f"⚠️ <b>ЭКСТРЕННЫЙ ВЫХОД!</b>\nПричина: {emergency_reason}.")
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
         if exit_status:
             leverage = signal.get('Leverage', 100)
@@ -97,11 +100,8 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
 
 async def check_absorption(exchange, pair, side_to_absorb, required_volume):
     try:
-        # --- ИЗМЕНЕНИЕ: Возвращен параметр 'until' для совместимости с API MEXC ---
         since = exchange.milliseconds() - ABSORPTION_TIMEFRAME_SEC * 1000
-        params = {'until': exchange.milliseconds()}
-        trades = await exchange.fetch_trades(pair, since=since, limit=100, params=params)
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+        trades = await exchange.fetch_trades(pair, since=since, limit=100, params={'type': 'swap'})
         if not trades: return {'absorbed': False}
         
         absorbing_side = 'buy' if side_to_absorb == 'sell' else 'sell'
@@ -137,20 +137,25 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
             return
 
         dominant_side_is_bids = top_bids_usd > top_asks_usd
+        side = "LONG" if dominant_side_is_bids else "SHORT"
+        
+        status_msg = f"Обнаружен дисбаланс {imbalance_ratio:.1f}x в пользу {side}. Ожидание поглощения..."
+        state['last_status_info'] = status_msg
+        
+        if state.get('last_signal_broadcast') != status_msg:
+            await broadcast(app, f"🗣️ {status_msg}")
+            state['last_signal_broadcast'] = status_msg
+
         if dominant_side_is_bids:
-            side = "LONG"
             support_wall = large_bids[0]
             resistance_wall = large_asks[0]
             side_to_absorb = 'sell'
             target_order_to_absorb = asks[0]
         else:
-            side = "SHORT"
             support_wall = large_asks[0]
             resistance_wall = large_bids[0]
             side_to_absorb = 'buy'
             target_order_to_absorb = bids[0]
-
-        state['last_status_info'] = f"Обнаружен дисбаланс {imbalance_ratio:.1f}x в пользу {side}. Ожидание поглощения..."
         
         required_volume = (target_order_to_absorb[0] * target_order_to_absorb[1]) * ABSORPTION_VOLUME_RATIO
         absorption_result = await check_absorption(exchange, PAIR_TO_SCAN, side_to_absorb, required_volume)
@@ -158,6 +163,8 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
         if not absorption_result.get('absorbed'):
             return
 
+        state['last_signal_broadcast'] = None
+        
         entry_price = absorption_result['entry_price']
         
         if side == "LONG":
@@ -169,12 +176,12 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
         
         if (side == "LONG" and entry_price >= tp_price) or \
            (side == "SHORT" and entry_price <= tp_price):
-            await broadcast_func(app, f"⚠️ Сделка {side} отменена: цена входа слишком близко к TP.")
+            await broadcast(app, f"⚠️ Сделка {side} отменена: цена входа слишком близко к TP.")
             return
         
         rr_ratio = abs(tp_price - entry_price) / abs(sl_price - entry_price) if abs(sl_price - entry_price) > 0 else 0
         if rr_ratio < MIN_RR_RATIO:
-            await broadcast_func(app, f"⚠️ Сделка {side} отменена: низкий RR (~{rr_ratio:.1f}:1). Риск выше потенциальной прибыли.")
+            await broadcast(app, f"⚠️ Сделка {side} отменена: низкий RR (~{rr_ratio:.1f}:1). Риск выше потенциальной прибыли.")
             return
 
         idea = f"Дисбаланс {imbalance_ratio:.1f}x, поглощение ${absorption_result.get('volume'):.0f} за {ABSORPTION_TIMEFRAME_SEC}с"
@@ -203,7 +210,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
                f" - SL: <code>{sl_price:.4f}</code> (за стеной {support_wall['price']})\n"
                f" - TP: <code>{tp_price:.4f}</code> (перед стеной {resistance_wall['price']})")
         
-        await broadcast_func(app, msg)
+        await broadcast(app, msg)
         state['monitored_signals'].append(decision)
         save_state_func()
         
@@ -217,7 +224,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
         state['last_status_info'] = f"Ошибка сканера: {e}"
 
 async def scanner_main_loop(app, broadcast_func, state, save_state_func):
-    bot_version = "26.4"
+    bot_version = "26.5"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}). Strategy: Liquidity Absorption.")
     
