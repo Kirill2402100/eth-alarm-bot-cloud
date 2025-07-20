@@ -1,6 +1,6 @@
 # scanner_engine.py
 # ============================================================================
-# v26.2 - Добавлена запись причин Emergency Exit в Google Sheets
+# v26.3 - Исправлена ошибка API при запросе сделок
 # ============================================================================
 import asyncio
 import time
@@ -48,9 +48,8 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
         if not last_price: return
 
         exit_status, exit_price = None, None
-        emergency_reason = None # --- ИЗМЕНЕНИЕ: Инициализируем причину здесь ---
+        emergency_reason = None
         
-        # 1. Проверка SL/TP
         if side == 'LONG':
             if last_price <= sl_price: exit_status, exit_price = "SL_HIT", sl_price
             elif last_price >= tp_price: exit_status, exit_price = "TP_HIT", tp_price
@@ -58,7 +57,6 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
             if last_price >= sl_price: exit_status, exit_price = "SL_HIT", sl_price
             elif last_price <= tp_price: exit_status, exit_price = "TP_HIT", tp_price
 
-        # 2. Проверка Emergency Exit
         if not exit_status:
             order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=50, params={'type': 'swap'})
             large_bids = [{'price': p, 'value_usd': round(p*a)} for p, a in order_book.get('bids', []) if p*a > LARGE_ORDER_USD]
@@ -79,16 +77,13 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
                 exit_status, exit_price = "EMERGENCY_EXIT", last_price
                 await broadcast_func(app, f"⚠️ <b>ЭКСТРЕННЫЙ ВЫХОД!</b>\nПричина: {emergency_reason}.")
 
-        # 3. Логика закрытия сделки
         if exit_status:
             leverage = signal.get('Leverage', 100)
             deposit = signal.get('Deposit', 50)
             pnl_percent_raw = ((exit_price - entry_price) / entry_price) * (-1 if side == 'SHORT' else 1)
             pnl_usd = deposit * leverage * pnl_percent_raw
             pnl_percent_display = pnl_percent_raw * 100 * leverage
-            # --- ИЗМЕНЕНИЕ: Передаем причину в функцию обновления таблицы ---
             await update_trade_in_sheet(signal, exit_status, exit_price, pnl_usd, pnl_percent_display, reason=emergency_reason)
-            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
             emoji = "⚠️" if exit_status == "EMERGENCY_EXIT" else ("✅" if pnl_usd > 0 else "❌")
             msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({exit_status})</b>\n\n"
                    f"<b>Инструмент:</b> <code>{pair}</code>\n"
@@ -102,8 +97,11 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
 
 async def check_absorption(exchange, pair, side_to_absorb, required_volume):
     try:
+        # --- ИЗМЕНЕНИЕ: Добавлен параметр 'until' для совместимости с API MEXC ---
         since = exchange.milliseconds() - ABSORPTION_TIMEFRAME_SEC * 1000
-        trades = await exchange.fetch_trades(pair, since=since, limit=100, params={'type': 'swap'})
+        until = exchange.milliseconds()
+        trades = await exchange.fetch_trades(pair, since=since, until=until, limit=100, params={'type': 'swap'})
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         if not trades: return {'absorbed': False}
         
         absorbing_side = 'buy' if side_to_absorb == 'sell' else 'sell'
@@ -219,7 +217,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
         state['last_status_info'] = f"Ошибка сканера: {e}"
 
 async def scanner_main_loop(app, broadcast_func, state, save_state_func):
-    bot_version = "26.2"
+    bot_version = "26.3"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}). Strategy: Liquidity Absorption.")
     
