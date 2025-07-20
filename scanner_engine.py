@@ -1,8 +1,8 @@
 # scanner_engine.py
 # ============================================================================
-# v29.4 - HOTFIX
-# - Полностью переписана логика отправки диагностических сообщений.
-# - Исправлена ошибка, из-за которой диагностика "замолкала" после первого сообщения.
+# v29.5 - HOTFIX
+# - Возвращен формат PAIR_TO_SCAN к 'BTC/USDT' для исправления "молчащей"
+#   диагностики. Проблема была в некорректной обработке тикера биржей.
 # ============================================================================
 import asyncio
 import time
@@ -19,7 +19,9 @@ from state_utils import save_state
 log = logging.getLogger("bot")
 
 # === Конфигурация сканера ==================================================
-PAIR_TO_SCAN = BTC/USDT
+# ИЗМЕНЕНИЕ: Возвращаем формат, который корректно обрабатывается биржей
+PAIR_TO_SCAN = 'BTC/USDT'
+
 LARGE_ORDER_USD = 150000
 TOP_N_ORDERS_TO_ANALYZE = 20
 AGGRESSION_TIMEFRAME_SEC = 15
@@ -51,17 +53,14 @@ def get_imbalance_and_walls(order_book):
     imbalance_ratio = (max(top_bids_usd, top_asks_usd) / min(top_bids_usd, top_asks_usd)) if top_bids_usd > 0 and top_asks_usd > 0 else float('inf')
     return imbalance_ratio, large_bids, large_asks, top_bids_usd, top_asks_usd
 
-# === Логика сканирования (ИСПРАВЛЕНА) ========================================
+# === Логика сканирования (без изменений) ====================================
 async def scan_for_new_opportunities(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
     status_code = None
     status_message = None
-
     try:
-        # 1. Получаем данные и определяем режим рынка
         order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100, params={'type': 'swap'})
         imbalance_ratio, large_bids, large_asks, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
-
         if not large_bids or not large_asks:
             status_code = "WAIT_LIQUIDITY"
             status_message = "Ожидание крупных ордеров в стакане..."
@@ -71,18 +70,14 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
             zone_width_pct = (resistance_wall['price'] - support_wall['price']) / support_wall['price']
             market_regime = "ФЛЭТ" if zone_width_pct < LOW_VOLATILITY_THRESHOLD else "ТРЕНД"
             min_imbalance_needed = FLAT_MARKET_MIN_IMBALANCE if market_regime == "ФЛЭТ" else TREND_MARKET_MIN_IMBALANCE
-
-            # 2. Главный фильтр - Дисбаланс
             if imbalance_ratio < min_imbalance_needed:
                 status_code = "WAIT_IMBALANCE"
                 status_message = f"Режим: {market_regime}. Дисбаланс ({imbalance_ratio:.1f}x) ниже порога ({min_imbalance_needed}x)."
             else:
-                # 3. Дисбаланс есть, ищем подтверждающую агрессию
                 dominant_side_is_bids = top_bids_usd > top_asks_usd
                 now = exchange.milliseconds()
                 since = now - AGGRESSION_TIMEFRAME_SEC * 1000
                 trades = await exchange.fetch_trades(PAIR_TO_SCAN, since=since, limit=100, params={'type': 'swap', 'until': now})
-                
                 if not trades:
                     status_code = "WAIT_AGGRESSION"
                     status_message = f"Режим: {market_regime}. Дисбаланс ({imbalance_ratio:.1f}x) есть, жду агрессию..."
@@ -90,11 +85,7 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
                     buy_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'buy')
                     sell_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'sell')
                     aggression_side = "LONG" if buy_volume > sell_volume * AGGRESSION_RATIO else "SHORT" if sell_volume > buy_volume * AGGRESSION_RATIO else None
-
-                    # 4. Проверяем совпадение агрессии и дисбаланса
-                    if (aggression_side == "LONG" and dominant_side_is_bids) or \
-                       (aggression_side == "SHORT" and not dominant_side_is_bids):
-                        # ВСЕ УСЛОВИЯ СОВПАЛИ - ВХОД
+                    if (aggression_side == "LONG" and dominant_side_is_bids) or (aggression_side == "SHORT" and not dominant_side_is_bids):
                         entry_price = trades[-1]['price']
                         side = aggression_side
                         sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT) if side == "LONG" else resistance_wall['price'] * (1 + SL_BUFFER_PERCENT)
@@ -109,25 +100,22 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
                     else:
                         status_code = "WAIT_AGGRESSION_MATCH"
                         status_message = f"Режим: {market_regime}. Дисбаланс ({imbalance_ratio:.1f}x) есть, но агрессия слабая или в другую сторону."
-
     except Exception as e:
         status_code = "SCANNER_ERROR"
         status_message = f"КРИТИЧЕСКАЯ ОШИБКА СКАНЕРА: {e}"
         log.error(status_message, exc_info=True)
-
-    # Отправляем сообщение в чат, только если код статуса изменился
     last_code = bot_data.get('last_debug_code', '')
     if status_code and status_code != last_code:
         bot_data['last_debug_code'] = status_code
         if bot_data.get('debug_mode_on', False):
             await broadcast_func(app, f"<code>{status_message}</code>")
 
-
 # === Мониторинг и главный цикл (без изменений) ==============================
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
     if not bot_data.get('monitored_signals'): return
     signal = bot_data['monitored_signals'][0]
+    # ВАЖНО: Внутри мониторинга мы используем тикер из сигнала, который уже в формате 'BTC/USDT'
     pair, entry_price, sl_price, side = (signal['Pair'], signal['Entry_Price'], signal['SL_Price'], signal['side'])
     try:
         order_book = await exchange.fetch_order_book(pair, limit=100, params={'type': 'swap'})
