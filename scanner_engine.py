@@ -1,6 +1,6 @@
 # scanner_engine.py
 # ============================================================================
-# v26.5 - Исправлена критическая ошибка мониторинга открытых сделок
+# v26.6 - Исправлено "зависание" сигналов, внедрены "умные" уведомления
 # ============================================================================
 import asyncio
 import time
@@ -24,6 +24,9 @@ MIN_RR_RATIO = 1.0
 COUNTER_WALL_RATIO = 1.5
 API_TIMEOUT = 10.0
 SCAN_INTERVAL = 5
+# --- НОВЫЙ ПАРАМЕТР ---
+SIGNAL_TIMEOUT_SEC = 60 # Время в секундах, после которого "зависший" сигнал считается устаревшим
+# --- КОНЕЦ НОВОГО ПАРАМЕТРА ---
 
 async def monitor_active_trades(exchange, app, broadcast_func, state, save_state_func):
     if not state.get('monitored_signals'):
@@ -43,7 +46,6 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
         return
 
     try:
-        # --- ИЗМЕНЕНИЕ: Добавлен params={'type': 'swap'} во все запросы мониторинга ---
         params = {'type': 'swap'}
         ticker = await exchange.fetch_ticker(pair, params=params)
         last_price = ticker.get('last')
@@ -78,7 +80,6 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
             if emergency_reason:
                 exit_status, exit_price = "EMERGENCY_EXIT", last_price
                 await broadcast_func(app, f"⚠️ <b>ЭКСТРЕННЫЙ ВЫХОД!</b>\nПричина: {emergency_reason}.")
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
         if exit_status:
             leverage = signal.get('Leverage', 100)
@@ -116,46 +117,69 @@ async def check_absorption(exchange, pair, side_to_absorb, required_volume):
 
 async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_state_func):
     try:
-        order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100, params={'type': 'swap'})
+        # --- ИЗМЕНЕНИЕ: Логика "умных" уведомлений и таймаута сигнала ---
+        # 1. Проверяем, не "завис" ли старый сигнал
+        potential_signal = state.get('potential_signal', {})
+        if potential_signal:
+            signal_age = time.time() - potential_signal.get('timestamp', 0)
+            if signal_age > SIGNAL_TIMEOUT_SEC:
+                old_signal_info = f"{potential_signal['side']} {potential_signal['ratio']:.1f}x"
+                await broadcast_func(app, f"⏳ Сигнал {old_signal_info} устарел (нет поглощения > {SIGNAL_TIMEOUT_SEC}с). Возврат к поиску.")
+                state['potential_signal'] = {} # Сбрасываем зависший сигнал
         
+        # 2. Получаем свежие данные с биржи
+        order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100, params={'type': 'swap'})
         bids, asks = order_book.get('bids', []), order_book.get('asks', [])
         if not bids or not asks: return
 
+        # 3. Анализируем стакан
         large_bids = [{'price': p, 'value_usd': round(p*a)} for p, a in bids if p and a and (p*a > LARGE_ORDER_USD)]
         large_asks = [{'price': p, 'value_usd': round(p*a)} for p, a in asks if p and a and (p*a > LARGE_ORDER_USD)]
-        if not large_bids or not large_asks: return
-
+        
         top_bids_usd = sum(b['value_usd'] for b in large_bids[:TOP_N_ORDERS_TO_ANALYZE])
         top_asks_usd = sum(a['value_usd'] for a in large_asks[:TOP_N_ORDERS_TO_ANALYZE])
 
-        if (top_bids_usd + top_asks_usd) < MIN_LIQUIDITY_USD: return
-
-        imbalance_ratio = (max(top_bids_usd, top_asks_usd) / min(top_bids_usd, top_asks_usd)) if top_bids_usd > 0 and top_asks_usd > 0 else float('inf')
-
-        if not (MIN_IMBALANCE_RATIO <= imbalance_ratio <= MAX_IMBALANCE_RATIO):
-            state['last_status_info'] = f"Поиск | Дисбаланс {imbalance_ratio:.1f}x (вне коридора)"
+        if (top_bids_usd + top_asks_usd) < MIN_LIQUIDITY_USD:
+            # Если ликвидности мало, а до этого был сигнал, сообщаем о его исчезновении
+            if potential_signal:
+                await broadcast_func(app, f"🔄 Дисбаланс исчез (низкая ликвидность). Возврат к поиску.")
+                state['potential_signal'] = {}
+            state['last_status_info'] = "Поиск | Низкая ликвидность"
             return
 
-        dominant_side_is_bids = top_bids_usd > top_asks_usd
-        side = "LONG" if dominant_side_is_bids else "SHORT"
+        imbalance_ratio = (max(top_bids_usd, top_asks_usd) / min(top_bids_usd, top_asks_usd)) if top_bids_usd > 0 and top_asks_usd > 0 else float('inf')
         
-        status_msg = f"Обнаружен дисбаланс {imbalance_ratio:.1f}x в пользу {side}. Ожидание поглощения..."
-        state['last_status_info'] = status_msg
+        # 4. Логика уведомлений и состояний
+        is_in_corridor = MIN_IMBALANCE_RATIO <= imbalance_ratio <= MAX_IMBALANCE_RATIO
         
-        if state.get('last_signal_broadcast') != status_msg:
-            await broadcast(app, f"🗣️ {status_msg}")
-            state['last_signal_broadcast'] = status_msg
+        if is_in_corridor:
+            side = "LONG" if top_bids_usd > top_asks_usd else "SHORT"
+            new_signal_key = f"{side}-{imbalance_ratio:.1f}"
 
-        if dominant_side_is_bids:
-            support_wall = large_bids[0]
-            resistance_wall = large_asks[0]
-            side_to_absorb = 'sell'
-            target_order_to_absorb = asks[0]
+            if potential_signal.get('key') != new_signal_key:
+                state['potential_signal'] = {'key': new_signal_key, 'side': side, 'ratio': imbalance_ratio, 'timestamp': time.time()}
+                status_msg = f"Обнаружен дисбаланс {imbalance_ratio:.1f}x в пользу {side}. Ожидание поглощения..."
+                state['last_status_info'] = status_msg
+                await broadcast_func(app, f"🗣️ {status_msg}")
         else:
-            support_wall = large_asks[0]
-            resistance_wall = large_bids[0]
-            side_to_absorb = 'buy'
-            target_order_to_absorb = bids[0]
+            if potential_signal:
+                old_signal_info = f"{potential_signal['side']} {potential_signal['ratio']:.1f}x"
+                await broadcast_func(app, f"🔄 Дисбаланс {old_signal_info} исчез. Возврат к поиску.")
+                state['potential_signal'] = {}
+            state['last_status_info'] = f"Поиск | Дисбаланс {imbalance_ratio:.1f}x (вне коридора)"
+            return
+        
+        # 5. Если есть активный сигнал, проверяем поглощение
+        if not potential_signal: return # На всякий случай
+
+        if not large_bids or not large_asks: return # Нужны стены с обеих сторон
+        
+        if side == "LONG":
+            support_wall, resistance_wall = large_bids[0], large_asks[0]
+            side_to_absorb, target_order_to_absorb = 'sell', asks[0]
+        else:
+            support_wall, resistance_wall = large_asks[0], large_bids[0]
+            side_to_absorb, target_order_to_absorb = 'buy', bids[0]
         
         required_volume = (target_order_to_absorb[0] * target_order_to_absorb[1]) * ABSORPTION_VOLUME_RATIO
         absorption_result = await check_absorption(exchange, PAIR_TO_SCAN, side_to_absorb, required_volume)
@@ -163,43 +187,35 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
         if not absorption_result.get('absorbed'):
             return
 
-        state['last_signal_broadcast'] = None
+        # 6. Вход в сделку
+        state['potential_signal'] = {} # Сбрасываем сигнал, так как он отработал
         
         entry_price = absorption_result['entry_price']
         
         if side == "LONG":
             sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT)
             tp_price = resistance_wall['price'] * (1 - TP_BUFFER_PERCENT)
-        else: # SHORT
+        else:
             sl_price = support_wall['price'] * (1 + SL_BUFFER_PERCENT)
             tp_price = resistance_wall['price'] * (1 + TP_BUFFER_PERCENT)
         
-        if (side == "LONG" and entry_price >= tp_price) or \
-           (side == "SHORT" and entry_price <= tp_price):
-            await broadcast(app, f"⚠️ Сделка {side} отменена: цена входа слишком близко к TP.")
+        if (side == "LONG" and entry_price >= tp_price) or (side == "SHORT" and entry_price <= tp_price):
+            await broadcast_func(app, f"⚠️ Сделка {side} отменена: цена входа слишком близко к TP.")
             return
         
         rr_ratio = abs(tp_price - entry_price) / abs(sl_price - entry_price) if abs(sl_price - entry_price) > 0 else 0
         if rr_ratio < MIN_RR_RATIO:
-            await broadcast(app, f"⚠️ Сделка {side} отменена: низкий RR (~{rr_ratio:.1f}:1). Риск выше потенциальной прибыли.")
+            await broadcast_func(app, f"⚠️ Сделка {side} отменена: низкий RR (~{rr_ratio:.1f}:1).")
             return
 
         idea = f"Дисбаланс {imbalance_ratio:.1f}x, поглощение ${absorption_result.get('volume'):.0f} за {ABSORPTION_TIMEFRAME_SEC}с"
         
         decision = {
-            "Signal_ID": f"signal_{int(time.time() * 1000)}",
-            "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-            "Pair": PAIR_TO_SCAN,
-            "Algorithm_Type": "Liquidity Absorption",
-            "Strategy_Idea": idea,
-            "Entry_Price": entry_price,
-            "SL_Price": sl_price,
-            "TP_Price": tp_price,
-            "side": side,
-            "Deposit": state.get('deposit', 50),
-            "Leverage": state.get('leverage', 100),
-            "Trigger_Order_USD": support_wall['value_usd'],
-            "support_wall_price": support_wall['price']
+            "Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+            "Pair": PAIR_TO_SCAN, "Algorithm_Type": "Liquidity Absorption", "Strategy_Idea": idea,
+            "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": tp_price, "side": side,
+            "Deposit": state.get('deposit', 50), "Leverage": state.get('leverage', 100),
+            "Trigger_Order_USD": support_wall['value_usd'], "support_wall_price": support_wall['price']
         }
         
         msg = (f"<b>ВХОД В СДЕЛКУ (Поглощение Ликвидности)</b>\n\n"
@@ -210,7 +226,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
                f" - SL: <code>{sl_price:.4f}</code> (за стеной {support_wall['price']})\n"
                f" - TP: <code>{tp_price:.4f}</code> (перед стеной {resistance_wall['price']})")
         
-        await broadcast(app, msg)
+        await broadcast_func(app, msg)
         state['monitored_signals'].append(decision)
         save_state_func()
         
@@ -224,7 +240,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
         state['last_status_info'] = f"Ошибка сканера: {e}"
 
 async def scanner_main_loop(app, broadcast_func, state, save_state_func):
-    bot_version = "26.5"
+    bot_version = "26.6"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}). Strategy: Liquidity Absorption.")
     
@@ -232,6 +248,7 @@ async def scanner_main_loop(app, broadcast_func, state, save_state_func):
     
     while state.get("bot_on", True):
         try:
+            # --- ИЗМЕНЕНИЕ: Убрана повторная инициализация exchange ---
             if not state.get('monitored_signals'):
                 await scan_for_new_opportunities(exchange, app, broadcast_func, state, save_state_func)
             else:
