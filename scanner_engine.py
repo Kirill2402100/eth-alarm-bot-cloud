@@ -21,9 +21,9 @@ log = logging.getLogger("bot")
 
 # === Конфигурация сканера ==================================================
 PAIR_TO_SCAN = 'BTC/USDT'
-LARGE_ORDER_USD = 150000
+LARGE_ORDER_USD = 200000
 TOP_N_ORDERS_TO_ANALYZE = 20
-AGGRESSION_TIMEFRAME_SEC = 15
+AGGRESSION_TIMEFRAME_SEC = 45
 AGGRESSION_RATIO = 2.0
 SL_BUFFER_PERCENT = 0.0005
 SCAN_INTERVAL = 5
@@ -34,7 +34,7 @@ FLAT_MARKET_MIN_IMBALANCE = 1.8
 TREND_MARKET_MIN_IMBALANCE = 2.5
 
 # НОВЫЙ ПАРАМЕТР РИСК-МЕНЕДЖМЕНТА
-MIN_SL_DISTANCE_PCT = 0.0004  # 0.04% - минимальное расстояние от входа до стопа
+MIN_SL_DISTANCE_PCT = 0.0008  # 0.08% - минимальное расстояние от входа до стопа
 
 
 # === Функции-помощники (без изменений) =====================================
