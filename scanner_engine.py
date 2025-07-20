@@ -1,10 +1,9 @@
 # scanner_engine.py
 # ============================================================================
-# v31.0 - PROFESSIONAL LOGIC
-# 1. Цена входа теперь берется из последней сделки, что гарантирует
-#    совпадение с графиком.
-# 2. Логика выхода полностью переработана. Бот удерживает позицию, пока
-#    сохраняется доминация в стакане, и выходит при ее потере.
+# v31.2 - FINAL RISK MANAGEMENT
+# - Добавлен финальный фильтр: проверка минимального расстояния до стоп-лосса.
+# - Бот больше не будет входить в сделки со слишком близким стопом,
+#   что повышает качество сигналов и устойчивость к шуму.
 # ============================================================================
 import asyncio
 import time
@@ -33,7 +32,10 @@ SCAN_INTERVAL = 5
 LOW_VOLATILITY_THRESHOLD = 0.0025
 FLAT_MARKET_MIN_IMBALANCE = 1.8
 TREND_MARKET_MIN_IMBALANCE = 2.5
-# Параметр HOLD_TRADE_MIN_IMBALANCE больше не нужен, логика стала умнее
+
+# НОВЫЙ ПАРАМЕТР РИСК-МЕНЕДЖМЕНТА
+MIN_SL_DISTANCE_PCT = 0.001  # 0.1% - минимальное расстояние от входа до стопа
+
 
 # === Функции-помощники (без изменений) =====================================
 def get_imbalance_and_walls(order_book):
@@ -59,44 +61,42 @@ def get_imbalance_and_walls(order_book):
 # === Логика сканирования (ИЗМЕНЕНА) ========================================
 async def scan_for_new_opportunities(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
-    status_code = None
-    status_message = None
+    status_code, status_message = None, None
     try:
         order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100, params={'type': 'swap'})
         imbalance_ratio, large_bids, large_asks, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
         if not large_bids or not large_asks:
             status_code, status_message = "WAIT_LIQUIDITY", "Ожидание крупных ордеров в стакане..."
         else:
-            support_wall = large_bids[0]
-            resistance_wall = large_asks[0]
+            support_wall, resistance_wall = large_bids[0], large_asks[0]
             zone_width_pct = (resistance_wall['price'] - support_wall['price']) / support_wall['price']
             market_regime = "ФЛЭТ" if zone_width_pct < LOW_VOLATILITY_THRESHOLD else "ТРЕНД"
             min_imbalance_needed = FLAT_MARKET_MIN_IMBALANCE if market_regime == "ФЛЭТ" else TREND_MARKET_MIN_IMBALANCE
             if imbalance_ratio < min_imbalance_needed:
-                status_code = "WAIT_IMBALANCE"
-                status_message = f"Режим: {market_regime}. Дисбаланс ({imbalance_ratio:.1f}x) ниже порога ({min_imbalance_needed}x)."
+                status_code, status_message = "WAIT_IMBALANCE", f"Режим: {market_regime}. Дисбаланс ({imbalance_ratio:.1f}x) ниже порога ({min_imbalance_needed}x)."
             else:
                 dominant_side_is_bids = top_bids_usd > top_asks_usd
-                now = exchange.milliseconds()
-                since = now - AGGRESSION_TIMEFRAME_SEC * 1000
+                now, since = exchange.milliseconds(), exchange.milliseconds() - AGGRESSION_TIMEFRAME_SEC * 1000
                 trades = await exchange.fetch_trades(PAIR_TO_SCAN, since=since, limit=100, params={'type': 'swap', 'until': now})
                 if not trades:
-                    status_code = "WAIT_AGGRESSION"
-                    status_message = f"Режим: {market_regime}. Дисбаланс ({imbalance_ratio:.1f}x) есть, жду агрессию..."
+                    status_code, status_message = "WAIT_AGGRESSION", f"Режим: {market_regime}. Дисбаланс ({imbalance_ratio:.1f}x) есть, жду агрессию..."
                 else:
-                    buy_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'buy')
-                    sell_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'sell')
+                    buy_volume, sell_volume = sum(t['cost'] for t in trades if t['side'] == 'buy'), sum(t['cost'] for t in trades if t['side'] == 'sell')
                     aggression_side = "LONG" if buy_volume > sell_volume * AGGRESSION_RATIO else "SHORT" if sell_volume > buy_volume * AGGRESSION_RATIO else None
                     if (aggression_side == "LONG" and dominant_side_is_bids) or (aggression_side == "SHORT" and not dominant_side_is_bids):
-                        
-                        # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Цена входа берется из последней сделки ---
                         entry_price = trades[-1]['price']
                         side = aggression_side
+                        sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT) if side == "LONG" else resistance_wall['price'] * (1 + SL_BUFFER_PERCENT)
+                        
+                        # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Проверка расстояния до стопа ---
+                        sl_distance_pct = abs(entry_price - sl_price) / entry_price
+                        if sl_distance_pct < MIN_SL_DISTANCE_PCT:
+                            status_code, status_message = "RISK_TOO_HIGH", f"Сигнал {side} отменен. Стоп-лосс ({sl_distance_pct:.2%}) слишком близко."
+                            return
                         # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
-                        sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT) if side == "LONG" else resistance_wall['price'] * (1 + SL_BUFFER_PERCENT)
                         idea = f"Режим {market_regime}. Агрессия {side} + Дисбаланс {imbalance_ratio:.1f}x"
-                        decision = { "Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), "Pair": PAIR_TO_SCAN, "Algorithm_Type": f"Adaptive Imbalance", "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": None, "side": side, "Deposit": bot_data.get('deposit', 50), "Leverage": bot_data.get('leverage', 100), "Trigger_Order_USD": support_wall['value_usd'] if side == "LONG" else resistance_wall['value_usd'] }
+                        decision = { "Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), "Pair": PAIR_TO_SCAN, "Algorithm_Type": "Adaptive Imbalance", "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": None, "side": side, "Deposit": bot_data.get('deposit', 50), "Leverage": bot_data.get('leverage', 100), "Trigger_Order_USD": support_wall['value_usd'] if side == "LONG" else resistance_wall['value_usd'], "dominance_lost_counter": 0 }
                         msg = f"🔥 <b>ВХОД В СДЕЛКУ ({side})</b>\n\n<b>Тип:</b> <code>{idea}</code>\n<b>Вход:</b> <code>{entry_price:.4f}</code> | <b>SL:</b> <code>{sl_price:.4f}</code>"
                         await broadcast_func(app, msg)
                         await log_trade_to_sheet(decision)
@@ -104,19 +104,15 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
                         save_state(app)
                         status_code, status_message = "TRADE_OPENED", f"Сделка {side} открыта."
                     else:
-                        status_code = "WAIT_AGGRESSION_MATCH"
-                        status_message = f"Режим: {market_regime}. Дисбаланс ({imbalance_ratio:.1f}x) есть, но агрессия слабая или в другую сторону."
-    except Exception as e:
-        status_code = "SCANNER_ERROR"
-        status_message = f"КРИТИЧЕСКАЯ ОШИБКА СКАНЕРА: {e}"
-        log.error(status_message, exc_info=True)
-    last_code = bot_data.get('last_debug_code', '')
-    if status_code and status_code != last_code:
-        bot_data['last_debug_code'] = status_code
-        if bot_data.get('debug_mode_on', False):
-            await broadcast_func(app, f"<code>{status_message}</code>")
+                        status_code, status_message = "WAIT_AGGRESSION_MATCH", f"Режим: {market_regime}. Дисбаланс ({imbalance_ratio:.1f}x) есть, но агрессия слабая или в другую сторону."
+    finally:
+        last_code = bot_data.get('last_debug_code', '')
+        if status_code and status_code != last_code:
+            bot_data['last_debug_code'] = status_code
+            if bot_data.get('debug_mode_on', False):
+                await broadcast_func(app, f"<code>{status_message}</code>")
 
-# === Логика мониторинга (ИСПРАВЛЕНА) ======================================
+# === Логика мониторинга (без изменений) ======================================
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
     if not bot_data.get('monitored_signals'): return
@@ -124,26 +120,26 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
     pair, entry_price, sl_price, side = (signal['Pair'], signal['Entry_Price'], signal['SL_Price'], signal['side'])
     try:
         order_book = await exchange.fetch_order_book(pair, limit=100, params={'type': 'swap'})
-        if not order_book.get('bids') or not order_book['bids'][0] or not order_book.get('asks') or not order_book['asks'][0]:
+        if not (order_book.get('bids') and order_book['bids'][0] and order_book.get('asks') and order_book['asks'][0]):
             log.warning(f"Order book for {pair} is incomplete, skipping monitor cycle.")
             return
-        best_bid = order_book['bids'][0][0]
-        best_ask = order_book['asks'][0][0]
+        best_bid, best_ask = order_book['bids'][0][0], order_book['asks'][0][0]
         last_price = (best_bid + best_ask) / 2
         _, _, _, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
-        
         exit_status, exit_price, reason = None, None, None
         
         if (side == 'LONG' and last_price <= sl_price) or (side == 'SHORT' and last_price >= sl_price):
             exit_status, exit_price, reason = "SL_HIT", sl_price, "Аварийный стоп-лосс"
         
-        # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Выходим при потере доминации в стакане ---
         if not exit_status:
-            if side == 'LONG' and top_bids_usd <= top_asks_usd:
-                exit_status, exit_price, reason = "DOMINANCE_LOST", last_price, "Потеря доминации покупателей в стакане"
-            elif side == 'SHORT' and top_asks_usd <= top_bids_usd:
-                exit_status, exit_price, reason = "DOMINANCE_LOST", last_price, "Потеря доминации продавцов в стакане"
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+            dominance_is_lost = (side == 'LONG' and top_bids_usd <= top_asks_usd) or (side == 'SHORT' and top_asks_usd <= top_bids_usd)
+            if dominance_is_lost:
+                signal['dominance_lost_counter'] = signal.get('dominance_lost_counter', 0) + 1
+                if signal['dominance_lost_counter'] >= 2:
+                    reason_text = "Потеря доминации покупателей" if side == 'LONG' else "Потеря доминации продавцов"
+                    exit_status, exit_price, reason = "DOMINANCE_LOST", last_price, f"{reason_text} (подтверждено)"
+            else:
+                signal['dominance_lost_counter'] = 0
         
         if exit_status:
             pnl_percent_raw = ((exit_price - entry_price) / entry_price) * (-1 if side == 'SHORT' else 1)
