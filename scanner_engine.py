@@ -1,6 +1,6 @@
 # scanner_engine.py
 # ============================================================================
-# v27.1 - Исправлена ошибка мониторинга, повышена стабильность
+# v27.2 - Повышена стабильность, улучшена обработка ошибок
 # ============================================================================
 import asyncio
 import time
@@ -24,7 +24,7 @@ SCAN_INTERVAL = 5
 
 def get_imbalance_and_walls(order_book):
     bids, asks = order_book.get('bids', []), order_book.get('asks', [])
-    if not bids or not asks: return 1.0, None, None
+    if not bids or not asks: return 1.0, None, None, 0, 0
 
     large_bids = [{'price': p, 'value_usd': round(p*a)} for p, a in bids if p*a > LARGE_ORDER_USD]
     large_asks = [{'price': p, 'value_usd': round(p*a)} for p, a in asks if p*a > LARGE_ORDER_USD]
@@ -33,11 +33,11 @@ def get_imbalance_and_walls(order_book):
     top_asks_usd = sum(a['value_usd'] for a in large_asks[:TOP_N_ORDERS_TO_ANALYZE])
 
     if (top_bids_usd + top_asks_usd) < MIN_LIQUIDITY_USD:
-        return 1.0, None, None
+        return 1.0, None, None, top_bids_usd, top_asks_usd
 
     imbalance_ratio = (max(top_bids_usd, top_asks_usd) / min(top_bids_usd, top_asks_usd)) if top_bids_usd > 0 and top_asks_usd > 0 else float('inf')
     
-    return imbalance_ratio, large_bids, large_asks
+    return imbalance_ratio, large_bids, large_asks, top_bids_usd, top_asks_usd
 
 async def monitor_active_trades(exchange, app, broadcast_func, state, save_state_func):
     if not state.get('monitored_signals'): return
@@ -55,7 +55,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
         last_price = ticker.get('last')
         if not last_price: return
 
-        current_imbalance, large_bids, large_asks = get_imbalance_and_walls(order_book)
+        current_imbalance, _, _, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
         
         state['monitored_signals'][0]['current_imbalance_ratio'] = current_imbalance
         
@@ -67,8 +67,8 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
 
         if not exit_status:
             side_is_long = side == 'LONG'
-            # --- ИЗМЕНЕНИЕ: Исправлена ошибка NameError ---
-            dominant_side_is_bids = len(large_bids or []) > len(large_asks or [])
+            # --- ИЗМЕНЕНИЕ: Исправлена логика определения доминирующей стороны ---
+            dominant_side_is_bids = top_bids_usd > top_asks_usd
             # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
             if current_imbalance < MIN_IMBALANCE_RATIO or (side_is_long != dominant_side_is_bids):
@@ -117,11 +117,11 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
             return
 
         order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100, params={'type': 'swap'})
-        current_imbalance, large_bids, large_asks = get_imbalance_and_walls(order_book)
+        current_imbalance, large_bids, large_asks, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
 
         if not large_bids or not large_asks: return
 
-        dominant_side_is_bids = len(large_bids) > len(large_asks)
+        dominant_side_is_bids = top_bids_usd > top_asks_usd
 
         if (side == "LONG" and not dominant_side_is_bids) or \
            (side == "SHORT" and dominant_side_is_bids) or \
@@ -183,7 +183,11 @@ async def scanner_main_loop(app, broadcast_func, state, save_state_func):
     try:
         exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
         
-        while state.get("bot_on", True):
+        # --- ИЗМЕНЕНИЕ: Добавлено логирование для диагностики ---
+        print(f"Loop starting. Bot status (bot_on): {state.get('bot_on')}")
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
+        while state.get("bot_on", False): # Используем False как дефолт для большей безопасности
             try:
                 if not state.get('monitored_signals'):
                     await scan_for_new_opportunities(exchange, app, broadcast_func, state, save_state_func)
