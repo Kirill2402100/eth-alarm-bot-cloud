@@ -1,10 +1,10 @@
 # scanner_engine.py
 # ============================================================================
-# v30.0 - FINAL STABLE
-# - Логика определения цены входа полностью переработана.
-# - Цена теперь берется напрямую из фьючерсного стакана (bid/ask), а не из
-#   ленты сделок. Это гарантирует использование фьючерсной цены и устраняет
-#   все возможные расхождения со спотом.
+# v31.0 - PROFESSIONAL LOGIC
+# 1. Цена входа теперь берется из последней сделки, что гарантирует
+#    совпадение с графиком.
+# 2. Логика выхода полностью переработана. Бот удерживает позицию, пока
+#    сохраняется доминация в стакане, и выходит при ее потере.
 # ============================================================================
 import asyncio
 import time
@@ -28,9 +28,12 @@ AGGRESSION_TIMEFRAME_SEC = 15
 AGGRESSION_RATIO = 2.0
 SL_BUFFER_PERCENT = 0.0005
 SCAN_INTERVAL = 5
+
+# АДАПТИВНЫЕ НАСТРОЙКИ
 LOW_VOLATILITY_THRESHOLD = 0.0025
 FLAT_MARKET_MIN_IMBALANCE = 1.8
 TREND_MARKET_MIN_IMBALANCE = 2.5
+# Параметр HOLD_TRADE_MIN_IMBALANCE больше не нужен, логика стала умнее
 
 # === Функции-помощники (без изменений) =====================================
 def get_imbalance_and_walls(order_book):
@@ -86,12 +89,9 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
                     aggression_side = "LONG" if buy_volume > sell_volume * AGGRESSION_RATIO else "SHORT" if sell_volume > buy_volume * AGGRESSION_RATIO else None
                     if (aggression_side == "LONG" and dominant_side_is_bids) or (aggression_side == "SHORT" and not dominant_side_is_bids):
                         
-                        # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Берем цену входа из стакана ---
+                        # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Цена входа берется из последней сделки ---
+                        entry_price = trades[-1]['price']
                         side = aggression_side
-                        if side == "LONG":
-                            entry_price = resistance_wall['price'] # Входим по цене ближайшего сопротивления
-                        else: # SHORT
-                            entry_price = support_wall['price'] # Входим по цене ближайшей поддержки
                         # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
                         sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT) if side == "LONG" else resistance_wall['price'] * (1 + SL_BUFFER_PERCENT)
@@ -116,7 +116,7 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
         if bot_data.get('debug_mode_on', False):
             await broadcast_func(app, f"<code>{status_message}</code>")
 
-# === Мониторинг и главный цикл (без изменений) ==============================
+# === Логика мониторинга (ИСПРАВЛЕНА) ======================================
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
     if not bot_data.get('monitored_signals'): return
@@ -130,14 +130,21 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         best_bid = order_book['bids'][0][0]
         best_ask = order_book['asks'][0][0]
         last_price = (best_bid + best_ask) / 2
-        current_imbalance, _, _, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
-        bot_data['monitored_signals'][0]['current_imbalance_ratio'] = current_imbalance
+        _, _, _, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
+        
         exit_status, exit_price, reason = None, None, None
+        
         if (side == 'LONG' and last_price <= sl_price) or (side == 'SHORT' and last_price >= sl_price):
             exit_status, exit_price, reason = "SL_HIT", sl_price, "Аварийный стоп-лосс"
+        
+        # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Выходим при потере доминации в стакане ---
         if not exit_status:
-            if current_imbalance < FLAT_MARKET_MIN_IMBALANCE or ((side == 'LONG') != (top_bids_usd > top_asks_usd)):
-                exit_status, exit_price, reason = "IMBALANCE_LOST", last_price, f"Дисбаланс упал до {current_imbalance:.1f}x"
+            if side == 'LONG' and top_bids_usd <= top_asks_usd:
+                exit_status, exit_price, reason = "DOMINANCE_LOST", last_price, "Потеря доминации покупателей в стакане"
+            elif side == 'SHORT' and top_asks_usd <= top_bids_usd:
+                exit_status, exit_price, reason = "DOMINANCE_LOST", last_price, "Потеря доминации продавцов в стакане"
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+        
         if exit_status:
             pnl_percent_raw = ((exit_price - entry_price) / entry_price) * (-1 if side == 'SHORT' else 1)
             pnl_usd = signal['Deposit'] * signal['Leverage'] * pnl_percent_raw
@@ -152,6 +159,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         log.error(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
         await broadcast_func(app, f"⚠️ <b>Критическая ошибка мониторинга!</b>\n<code>Ошибка: {e}</code>")
 
+# === Главный цикл (без изменений) ============================================
 async def scanner_main_loop(app: Application, broadcast_func):
     bot_version = getattr(app, 'bot_version', 'N/A')
     log.info(f"Main Engine loop starting (v{bot_version})...")
