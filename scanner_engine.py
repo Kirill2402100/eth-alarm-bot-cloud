@@ -1,7 +1,8 @@
 # scanner_engine.py
 # ============================================================================
-# v33.2 - STRESS TEST
-# - Временно отключен анти-спам фильтр в диагностике для проверки работы цикла.
+# v33.3 - FINAL
+# - Восстановлена логика анти-спама для диагностических сообщений.
+# - Бот готов к работе.
 # ============================================================================
 import asyncio
 import time
@@ -110,11 +111,12 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
         status_message = f"КРИТИЧЕСКАЯ ОШИБКА СКАНЕРА: {e}"
         log.error(status_message, exc_info=True)
     
-    # --- ИЗМЕНЕНИЕ: Временно убираем анти-спам фильтр ---
-    if status_code:
+    # --- ИЗМЕНЕНИЕ: Возвращаем анти-спам фильтр ---
+    last_code = bot_data.get('last_debug_code', '')
+    if status_code and status_code != last_code:
+        bot_data['last_debug_code'] = status_code
         if bot_data.get('debug_mode_on', False):
-            timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S')
-            await broadcast_func(app, f"<code>{timestamp}: {status_message}</code>")
+            await broadcast_func(app, f"<code>{status_message}</code>")
     # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
 # === Логика мониторинга =======================================================
