@@ -1,6 +1,6 @@
 # main.py
 # ============================================================================
-# v28.2 - Добавлена система диагностики в реальном времени (ВКЛ/ВЫКЛ)
+# v33.0 - FINAL STABLE
 # ============================================================================
 
 import os
@@ -13,23 +13,22 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # Локальные импорты
+log = logging.getLogger("bot")
 import trade_executor
 from scanner_engine import scanner_main_loop
 from state_utils import load_state, save_state
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "28.2"
+BOT_VERSION        = "33.0"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # === Google-Sheets =========================================================
 TRADE_LOG_WS = None
-# ИСПРАВЛЕНО: Имя листа теперь создается динамически из версии бота
 SHEET_NAME   = f"Trading_Log_v{BOT_VERSION}"
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Algorithm_Type", "Strategy_Idea",
@@ -60,8 +59,7 @@ def setup_sheets():
         trade_executor.TRADE_LOG_WS = TRADE_LOG_WS
     except Exception as e:
         log.error("Sheets init failed: %s", e)
-        TRADE_LOG_WS = None
-        trade_executor.TRADE_LOG_WS = None
+        TRADE_LOG_WS, trade_executor.TRADE_LOG_WS = None, None
 
 # === Общие функции =========================================================
 async def broadcast(app: Application, txt:str):
@@ -73,24 +71,20 @@ async def broadcast(app: Application, txt:str):
 
 # === Команды Telegram =====================================================
 async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Включает и выключает режим детальной диагностики."""
-    # Переключаем значение флага
     current_state = ctx.bot_data.get("debug_mode_on", False)
     new_state = not current_state
     ctx.bot_data["debug_mode_on"] = new_state
     save_state(ctx.application)
-
     if new_state:
-        await update.message.reply_text("✅ **Диагностика в реальном времени ВКЛЮЧЕНА.**\n\nБот будет присылать свой статус в чат при каждом изменении.", parse_mode=constants.ParseMode.HTML)
+        await update.message.reply_text("✅ **Диагностика в реальном времени ВКЛЮЧЕНА.**", parse_mode=constants.ParseMode.HTML)
     else:
         await update.message.reply_text("❌ **Диагностика ВЫКЛЮЧЕНА.**", parse_mode=constants.ParseMode.HTML)
 
-# (остальные команды без изменений)
 async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(update.effective_chat.id)
     ctx.bot_data["bot_on"] = True
     save_state(ctx.application)
-    await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} запущен.</b>\nИспользуйте /run для запуска и /status для статуса.", parse_mode=constants.ParseMode.HTML)
+    await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} запущен.</b>\nИспользуйте /run для запуска.", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     ctx.bot_data["bot_on"] = False
@@ -110,8 +104,7 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
            f"<b>Плечо:</b> x{bot_data.get('leverage', 100)}\n")
     if active_signals:
         signal = active_signals[0]
-        msg += (f"<b>Активная сделка:</b> <code>{signal.get('Pair')} {signal.get('side')}</code>\n"
-                f"<b>Вход:</b> {signal.get('Entry_Price')}\n")
+        msg += f"<b>Активная сделка:</b> <code>{signal.get('Pair')} {signal.get('side')}</code>\n"
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
 async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -147,10 +140,8 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.chat_ids = set(CHAT_IDS)
     app.bot_version = BOT_VERSION
-    
     load_state(app)
     setup_sheets()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
@@ -158,6 +149,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("deposit", cmd_deposit))
     app.add_handler(CommandHandler("leverage", cmd_leverage))
-    
     log.info(f"Bot v{BOT_VERSION} started polling.")
     app.run_polling()
