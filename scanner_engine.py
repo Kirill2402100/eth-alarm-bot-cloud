@@ -84,7 +84,16 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 async def scan_for_new_opportunities(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
     try:
-        trades = await exchange.fetch_trades(PAIR_TO_SCAN, since=exchange.milliseconds() - AGGRESSION_TIMEFRAME_SEC * 1000, limit=100, params={'type': 'swap'})
+        # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
+        now = exchange.milliseconds()
+        since = now - AGGRESSION_TIMEFRAME_SEC * 1000
+        trades = await exchange.fetch_trades(
+            PAIR_TO_SCAN, 
+            since=since, 
+            until=now,  # Добавляем обязательный параметр until
+            limit=100, 
+            params={'type': 'swap'}
+        )
         if not trades: return
 
         buy_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'buy')
