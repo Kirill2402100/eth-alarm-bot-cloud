@@ -1,7 +1,6 @@
 # scanner_engine.py
 # ============================================================================
-# v28.1 - СТАБИЛЬНАЯ ВЕРСИЯ
-# Исправлен циклический импорт.
+# v28.2 - Добавлена отправка статусов в чат в режиме диагностики
 # ============================================================================
 import asyncio
 import time
@@ -13,7 +12,7 @@ from telegram.ext import Application
 
 # Локальные импорты
 from trade_executor import log_trade_to_sheet, update_trade_in_sheet
-from state_utils import save_state # <--- ИЗМЕНЕНИЕ
+from state_utils import save_state
 
 log = logging.getLogger("bot")
 
@@ -42,29 +41,99 @@ def get_imbalance_and_walls(order_book):
     imbalance_ratio = (max(top_bids_usd, top_asks_usd) / min(top_bids_usd, top_asks_usd)) if top_bids_usd > 0 and top_asks_usd > 0 else float('inf')
     return imbalance_ratio, large_bids, large_asks, top_bids_usd, top_asks_usd
 
-# === Логика мониторинга и сканирования (без изменений в логике) =============
+# === Логика сканирования с диагностикой =====================================
+async def scan_for_new_opportunities(exchange, app: Application, broadcast_func):
+    bot_data = app.bot_data
+    status_message = "" # Переменная для текущего статуса
+
+    try:
+        now = exchange.milliseconds()
+        since = now - AGGRESSION_TIMEFRAME_SEC * 1000
+        trades = await exchange.fetch_trades(
+            PAIR_TO_SCAN, since=since, limit=100, params={'type': 'swap', 'until': now}
+        )
+        if not trades:
+            status_message = "Ожидание активности в ленте сделок..."
+            return # Выходим из функции в конце, где происходит отправка
+
+        buy_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'buy')
+        sell_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'sell')
+        side = "LONG" if buy_volume > sell_volume * AGGRESSION_RATIO else "SHORT" if sell_volume > buy_volume * AGGRESSION_RATIO else None
+        if not side:
+            status_message = f"Поиск агрессии... Покупки: ${buy_volume:,.0f} | Продажи: ${sell_volume:,.0f}"
+            return
+
+        order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100, params={'type': 'swap'})
+        current_imbalance, large_bids, large_asks, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
+        if not large_bids or not large_asks:
+            status_message = "Агрессия есть, но в стакане нет крупных ордеров для анализа."
+            return
+
+        dominant_side_is_bids = top_bids_usd > top_asks_usd
+        if (side == "LONG" and not dominant_side_is_bids) or (side == "SHORT" and dominant_side_is_bids):
+            status_message = f"Агрессия {side} найдена, но стакан смотрит в обратную сторону. Отмена."
+            return
+
+        if current_imbalance < MIN_IMBALANCE_RATIO:
+            status_message = f"Агрессия {side} найдена, но дисбаланс ({current_imbalance:.1f}x) ниже порога ({MIN_IMBALANCE_RATIO}x). Отмена."
+            return
+        
+        entry_price = trades[-1]['price']
+        resistance_wall = large_asks[0] if side == "LONG" else large_bids[0]
+        potential_profit_pct = abs(resistance_wall['price'] - entry_price) / entry_price
+        if potential_profit_pct < MIN_PROFIT_TARGET_PERCENT:
+            status_message = f"Сигнал {side} найден, но потенциал ({potential_profit_pct:.2%}) ниже порога ({MIN_PROFIT_TARGET_PERCENT:.2%}). Отмена."
+            return
+        
+        # Если дошли до сюда - есть сигнал
+        idea = f"Агрессия ${buy_volume:,.0f} vs ${sell_volume:,.0f}, дисбаланс {current_imbalance:.1f}x"
+        decision = {
+            "Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+            "Pair": PAIR_TO_SCAN, "Algorithm_Type": "Aggression + Imbalance", "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": 0, # SL рассчитывается позже
+            "side": side, "Deposit": bot_data.get('deposit', 50), "Leverage": bot_data.get('leverage', 100),
+            "Trigger_Order_USD": (large_bids[0] if side == "LONG" else large_asks[0])['value_usd']
+        }
+        support_wall = large_bids[0] if side == "LONG" else large_asks[0]
+        decision['SL_Price'] = support_wall['price'] * (1 - SL_BUFFER_PERCENT) if side == "LONG" else support_wall['price'] * (1 + SL_BUFFER_PERCENT)
+
+        msg = (f"🔥 <b>ВХОД В СДЕЛКУ</b>\n\n<b>Идея:</b> <code>{idea}</code>\n"
+               f"<b>План:</b> Вход(<b>{side}</b>):<code>{decision['Entry_Price']:.4f}</code>, SL:<code>{decision['SL_Price']:.4f}</code>")
+        await broadcast_func(app, msg)
+        await log_trade_to_sheet(decision)
+        bot_data['monitored_signals'].append(decision)
+        save_state(app)
+
+    except Exception as e:
+        status_message = f"КРИТИЧЕСКАЯ ОШИБКА СКАНЕРА: {e}"
+        log.error(status_message, exc_info=True)
+
+    finally:
+        # Отправляем сообщение в чат, только если оно изменилось и режим диагностики включен
+        last_message = bot_data.get('last_debug_message', '')
+        if status_message and status_message != last_message:
+            bot_data['last_debug_message'] = status_message
+            if bot_data.get('debug_mode_on', False):
+                await broadcast_func(app, f"<code>{status_message}</code>")
+
+# (остальные функции monitor_active_trades и scanner_main_loop без изменений)
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
     if not bot_data.get('monitored_signals'): return
     signal = bot_data['monitored_signals'][0]
     pair, entry_price, sl_price, side = (signal['Pair'], signal['Entry_Price'], signal['SL_Price'], signal['side'])
-
     try:
         order_book = await exchange.fetch_order_book(pair, limit=100, params={'type': 'swap'})
         ticker = await exchange.fetch_ticker(pair, params={'type': 'swap'})
         last_price = ticker.get('last')
         if not last_price: return
-
         current_imbalance, _, _, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
         bot_data['monitored_signals'][0]['current_imbalance_ratio'] = current_imbalance
-
         exit_status, exit_price, reason = None, None, None
         if (side == 'LONG' and last_price <= sl_price) or (side == 'SHORT' and last_price >= sl_price):
             exit_status, exit_price, reason = "SL_HIT", sl_price, "Аварийный стоп-лосс"
         if not exit_status:
             if current_imbalance < MIN_IMBALANCE_RATIO or ((side == 'LONG') != (top_bids_usd > top_asks_usd)):
                 exit_status, exit_price, reason = "IMBALANCE_LOST", last_price, f"Дисбаланс упал до {current_imbalance:.1f}x"
-
         if exit_status:
             pnl_percent_raw = ((exit_price - entry_price) / entry_price) * (-1 if side == 'SHORT' else 1)
             pnl_usd = signal['Deposit'] * signal['Leverage'] * pnl_percent_raw
@@ -81,65 +150,9 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         log.error(f"CRITICAL MONITORING ERROR: {e}")
         await broadcast_func(app, f"⚠️ <b>Критическая ошибка мониторинга!</b>\n<code>Ошибка: {e}</code>")
 
-async def scan_for_new_opportunities(exchange, app: Application, broadcast_func):
-    bot_data = app.bot_data
-    try:
-        # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
-        now = exchange.milliseconds()
-        since = now - AGGRESSION_TIMEFRAME_SEC * 1000
-        trades = await exchange.fetch_trades(
-            PAIR_TO_SCAN,
-            since=since,
-            limit=100,
-            params={
-                'type': 'swap',
-                'until': now  # Переносим 'until' внутрь словаря params
-            }
-        )
-        if not trades: return
-
-        buy_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'buy')
-        sell_volume = sum(trade['cost'] for trade in trades if trade['side'] == 'sell')
-        side = "LONG" if buy_volume > sell_volume * AGGRESSION_RATIO else "SHORT" if sell_volume > buy_volume * AGGRESSION_RATIO else None
-        if not side: return
-
-        order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100, params={'type': 'swap'})
-        current_imbalance, large_bids, large_asks, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
-        if not large_bids or not large_asks: return
-
-        if (side == "LONG" and not (top_bids_usd > top_asks_usd)) or \
-           (side == "SHORT" and (top_bids_usd > top_asks_usd)) or \
-           (current_imbalance < MIN_IMBALANCE_RATIO):
-            return
-
-        entry_price = trades[-1]['price']
-        support_wall = large_bids[0] if side == "LONG" else large_asks[0]
-        resistance_wall = large_asks[0] if side == "LONG" else large_bids[0]
-        sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT) if side == "LONG" else support_wall['price'] * (1 + SL_BUFFER_PERCENT)
-
-        if abs(resistance_wall['price'] - entry_price) / entry_price < MIN_PROFIT_TARGET_PERCENT: return
-
-        idea = f"Агрессия ${buy_volume:.0f} vs ${sell_volume:.0f}, дисбаланс {current_imbalance:.1f}x"
-        decision = {
-            "Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-            "Pair": PAIR_TO_SCAN, "Algorithm_Type": "Aggression + Imbalance", "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": None,
-            "side": side, "Deposit": bot_data.get('deposit', 50), "Leverage": bot_data.get('leverage', 100),
-            "Trigger_Order_USD": support_wall['value_usd']
-        }
-        msg = (f"🔥 <b>ВХОД В СДЕЛКУ</b>\n\n<b>Идея:</b> <code>{idea}</code>\n"
-               f"<b>План:</b> Вход(<b>{side}</b>):<code>{entry_price:.4f}</code>, SL:<code>{sl_price:.4f}</code>")
-        await broadcast_func(app, msg)
-        await log_trade_to_sheet(decision)
-        bot_data['monitored_signals'].append(decision)
-        save_state(app)
-    except Exception as e:
-        log.error(f"CRITICAL SCANNER ERROR: {e}", exc_info=True)
-
-# === Главный цикл ==========================================================
 async def scanner_main_loop(app: Application, broadcast_func):
-    # Получаем версию из объекта app и используем её
-    bot_version = getattr(app, 'bot_version', 'N/A') # <--- ИЗМЕНИТЕ ЭТУ СТРОЧКУ
-    log.info(f"Main Engine loop starting (v{bot_version})...") # <--- И ИЗМЕНИТЕ ЭТУ
+    bot_version = getattr(app, 'bot_version', 'N/A')
+    log.info(f"Main Engine loop starting (v{bot_version})...")
     exchange = None
     try:
         exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
