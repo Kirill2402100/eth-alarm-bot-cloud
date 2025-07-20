@@ -1,6 +1,6 @@
 # main_bot.py
 # ============================================================================
-# v26.7 - Улучшен триггер входа в сделку на основе преобладания агрессии
+# v26.9 - Добавлен фильтр минимального потенциала прибыли
 # ============================================================================
 
 import os
@@ -19,7 +19,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "26.7"
+BOT_VERSION        = "26.9"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -77,7 +77,7 @@ def load_state():
     state.setdefault("monitored_signals", [])
     state.setdefault("deposit", 50)
     state.setdefault("leverage", 100)
-    state.setdefault("potential_signal", {})
+    state.setdefault("last_imbalance_ratio", 1.0)
     log.info("State loaded. Active signals: %d. Deposit: %s, Leverage: %s",
              len(state.get("monitored_signals", [])), state.get('deposit'), state.get('leverage'))
 
@@ -99,7 +99,7 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     state["bot_on"] = True
     save_state()
     await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} запущен.</b>\n"
-                                      f"<b>Стратегия:</b> Поглощение Ликвидности\n"
+                                      f"<b>Стратегия:</b> Прорыв Дисбаланса\n"
                                       f"Логирование в лист: <b>{SHEET_NAME}</b>\n"
                                       "Используйте /run для запуска и /status для статуса.",
                                       parse_mode=constants.ParseMode.HTML)
@@ -116,7 +116,7 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     active_signals = state.get('monitored_signals', [])
     
     msg = (f"<b>Состояние бота v{BOT_VERSION}</b>\n"
-           f"<b>Стратегия:</b> Поглощение Ликвидности\n"
+           f"<b>Стратегия:</b> Прорыв Дисбаланса\n"
            f"<b>Статус:</b> {'✅ ON' if state.get('bot_on') else '🛑 OFF'}\n"
            f"<b>Основной цикл:</b> {'🚀 RUNNING' if is_running else '🔌 STOPPED'}\n"
            f"<b>Активных сделок:</b> {len(active_signals)}\n"
@@ -127,7 +127,8 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
         signal = active_signals[0]
         msg += (f"<b>Активная сделка:</b> <code>{signal.get('Pair')} {signal.get('side')}</code>\n"
                 f"<b>Вход:</b> {signal.get('Entry_Price')}\n"
-                f"<b>SL:</b> {signal.get('SL_Price')} | <b>TP:</b> {signal.get('TP_Price')}\n")
+                f"<b>SL:</b> {signal.get('SL_Price')}\n"
+                f"<b>Текущий дисбаланс:</b> {signal.get('current_imbalance_ratio', 'N/A'):.1f}x\n")
 
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
