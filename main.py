@@ -1,6 +1,6 @@
 # main_bot.py
 # ============================================================================
-# v26.5 - Исправлена критическая ошибка мониторинга открытых сделок
+# v26.7 - Улучшен триггер входа в сделку на основе преобладания агрессии
 # ============================================================================
 
 import os
@@ -19,7 +19,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "26.5"
+BOT_VERSION        = "26.7"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
