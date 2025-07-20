@@ -1,6 +1,6 @@
 # scanner_engine.py
 # ============================================================================
-# v26.3 - Исправлена ошибка API при запросе сделок
+# v26.4 - Исправлена ошибка API при запросе сделок
 # ============================================================================
 import asyncio
 import time
@@ -97,10 +97,9 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
 
 async def check_absorption(exchange, pair, side_to_absorb, required_volume):
     try:
-        # --- ИЗМЕНЕНИЕ: Добавлен параметр 'until' для совместимости с API MEXC ---
+        # --- ИЗМЕНЕНИЕ: Убран параметр 'until', который вызывал ошибку ---
         since = exchange.milliseconds() - ABSORPTION_TIMEFRAME_SEC * 1000
-        until = exchange.milliseconds()
-        trades = await exchange.fetch_trades(pair, since=since, until=until, limit=100, params={'type': 'swap'})
+        trades = await exchange.fetch_trades(pair, since=since, limit=100, params={'type': 'swap'})
         # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         if not trades: return {'absorbed': False}
         
