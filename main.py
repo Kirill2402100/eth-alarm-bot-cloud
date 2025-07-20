@@ -71,16 +71,27 @@ def load_state():
     global state
     if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE, 'r') as f: state = json.load(f)
-        except json.JSONDecodeError: state = {}
+            with open(STATE_FILE, 'r') as f:
+                loaded_state = json.load(f)
+                # --- ИЗМЕНЕНИЕ: Не пересоздаем объект, а обновляем существующий ---
+                state.clear()
+                state.update(loaded_state)
+                # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+        except json.JSONDecodeError:
+            # Если файл поврежден, оставляем state пустым,
+            # чтобы он заполнился значениями по умолчанию.
+            state.clear() 
+
+    # Значения по умолчанию для ключей, которых нет в файле
     state.setdefault("bot_on", False)
     state.setdefault("monitored_signals", [])
     state.setdefault("deposit", 50)
     state.setdefault("leverage", 100)
     state.setdefault("last_imbalance_ratio", 1.0)
+    
     log.info("State loaded. Active signals: %d. Deposit: %s, Leverage: %s",
              len(state.get("monitored_signals", [])), state.get('deposit'), state.get('leverage'))
-
+    
 def save_state():
     with open(STATE_FILE,"w") as f: json.dump(state, f, indent=2)
 
