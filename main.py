@@ -133,8 +133,10 @@ async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
 
 # === Точка входа =========================================================
 if __name__ == "__main__":
+    # Создаем приложение
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.chat_ids = set(CHAT_IDS)
+    app.bot_version = BOT_VERSION # <--- ДОБАВЬТЕ ЭТУ СТРОЧКУ
     load_state(app)
     setup_sheets()
     app.add_handler(CommandHandler("start", cmd_start))
