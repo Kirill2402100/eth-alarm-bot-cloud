@@ -21,7 +21,7 @@ log = logging.getLogger("bot")
 
 # === Конфигурация сканера ==================================================
 # ОБЩИЕ ПАРАМЕТРЫ
-PAIR_TO_SCAN = 'BTC/USDT'
+PAIR_TO_SCAN = 'BTC/USDT:USDT'
 LARGE_ORDER_USD = 150000
 TOP_N_ORDERS_TO_ANALYZE = 20
 AGGRESSION_TIMEFRAME_SEC = 15
