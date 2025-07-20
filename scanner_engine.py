@@ -1,8 +1,7 @@
 # scanner_engine.py
 # ============================================================================
-# v33.0 - FINAL STABLE
-# - Интегрированы все лучшие решения: анализ стабильности уровней,
-#   адаптация к рынку, риск-менеджмент и надежный мониторинг.
+# v33.1 - HOTFIX
+# - Исправлена ошибка 'bot_data is not defined' в главном цикле.
 # ============================================================================
 import asyncio
 import time
@@ -27,7 +26,7 @@ AGGRESSION_RATIO = 2.0
 SL_BUFFER_PERCENT = 0.0005
 SCAN_INTERVAL = 5
 MIN_WALL_STABILITY_SEC = 90
-MIN_SL_DISTANCE_PCT = 0.0008  # 0.08%
+MIN_SL_DISTANCE_PCT = 0.0008
 
 # === Функции-помощники =====================================================
 def get_imbalance_and_walls(order_book):
@@ -170,10 +169,12 @@ async def scanner_main_loop(app: Application, broadcast_func):
         log.info("Exchange connection and markets loaded.")
         while app.bot_data.get("bot_on", False):
             try:
-                if not bot_data.get('monitored_signals'):
+                # --- КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ---
+                if not app.bot_data.get('monitored_signals'):
                     await scan_for_new_opportunities(exchange, app, broadcast_func)
                 else:
                     await monitor_active_trades(exchange, app, broadcast_func)
+                # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
                 await asyncio.sleep(SCAN_INTERVAL)
             except asyncio.CancelledError:
                 log.info("Main Engine loop cancelled by command.")
