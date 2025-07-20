@@ -1,6 +1,6 @@
 # main_bot.py
 # ============================================================================
-# v26.3 - Исправлена ошибка в команде /status
+# v26.4 - Исправлена ошибка API при запросе сделок
 # ============================================================================
 
 import os
@@ -19,7 +19,7 @@ import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "26.3"
+BOT_VERSION        = "26.4"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -111,9 +111,7 @@ async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
         ctx.application._main_loop_task.cancel()
 
 async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    # --- ИЗМЕНЕНИЕ: Исправлена ошибка AttributeError ---
     is_running = hasattr(ctx.application, '_main_loop_task') and not ctx.application._main_loop_task.done()
-    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
     active_signals = state.get('monitored_signals', [])
     
     msg = (f"<b>Состояние бота v{BOT_VERSION}</b>\n"
