@@ -1,6 +1,6 @@
 # scanner_engine.py
 # ============================================================================
-# v26.9 - Новая стратегия "Вход по Агрессии с Поддержкой Дисбаланса"
+# v27.0 - Повышена стабильность, улучшена обработка ошибок при запуске
 # ============================================================================
 import asyncio
 import time
@@ -23,7 +23,6 @@ API_TIMEOUT = 10.0
 SCAN_INTERVAL = 5
 
 def get_imbalance_and_walls(order_book):
-    """Рассчитывает дисбаланс и находит ключевые "стены" ликвидности."""
     bids, asks = order_book.get('bids', []), order_book.get('asks', [])
     if not bids or not asks: return 1.0, None, None
 
@@ -41,7 +40,6 @@ def get_imbalance_and_walls(order_book):
     return imbalance_ratio, large_bids, large_asks
 
 async def monitor_active_trades(exchange, app, broadcast_func, state, save_state_func):
-    """Мониторит открытые сделки по логике "Трейлинг по Дисбалансу"."""
     if not state.get('monitored_signals'): return
     signal = state['monitored_signals'][0]
     
@@ -69,7 +67,6 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
 
         if not exit_status:
             side_is_long = side == 'LONG'
-            # Определяем текущую доминирующую сторону по дисбалансу
             dominant_side_is_bids = len(large_bids or []) > len(large_asks or [])
 
             if current_imbalance < MIN_IMBALANCE_RATIO or (side_is_long != dominant_side_is_bids):
@@ -97,9 +94,7 @@ async def monitor_active_trades(exchange, app, broadcast_func, state, save_state
         await broadcast_func(app, f"⚠️ <b>Критическая ошибка мониторинга!</b>\n<code>Ошибка: {e}</code>")
 
 async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_state_func):
-    """Основная функция сканера по стратегии "Агрессия + Дисбаланс"."""
     try:
-        # 1. Ищем триггер по агрессии в ленте сделок
         since = exchange.milliseconds() - AGGRESSION_TIMEFRAME_SEC * 1000
         trades = await exchange.fetch_trades(PAIR_TO_SCAN, since=since, limit=100, params={'type': 'swap'})
         if not trades: 
@@ -119,7 +114,6 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
             state['last_status_info'] = f"Поиск | Нет агрессии (Покупки: ${buy_volume:.0f}, Продажи: ${sell_volume:.0f})"
             return
 
-        # 2. Если агрессия есть, проверяем подтверждение по дисбалансу
         order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100, params={'type': 'swap'})
         current_imbalance, large_bids, large_asks = get_imbalance_and_walls(order_book)
 
@@ -133,14 +127,13 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
             state['last_status_info'] = f"Агрессия {side} отклонена (Дисбаланс: {current_imbalance:.1f}x)"
             return
 
-        # 3. Все фильтры пройдены, рассчитываем сделку
         entry_price = trades[-1]['price']
         
         if side == "LONG":
             support_wall = large_bids[0]
             resistance_wall = large_asks[0]
             sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT)
-        else: # SHORT
+        else:
             support_wall = large_asks[0]
             resistance_wall = large_bids[0]
             sl_price = support_wall['price'] * (1 + SL_BUFFER_PERCENT)
@@ -157,7 +150,7 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
         decision = {
             "Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
             "Pair": PAIR_TO_SCAN, "Algorithm_Type": "Aggression + Imbalance", "Strategy_Idea": idea,
-            "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": None, # TP динамический
+            "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": None,
             "side": side, "Deposit": state.get('deposit', 50), "Leverage": state.get('leverage', 100),
             "Trigger_Order_USD": support_wall['value_usd']
         }
@@ -180,27 +173,38 @@ async def scan_for_new_opportunities(exchange, app, broadcast_func, state, save_
         state['last_status_info'] = f"Ошибка сканера: {e}"
 
 async def scanner_main_loop(app, broadcast_func, state, save_state_func):
-    bot_version = "26.9"
+    bot_version = "27.0"
     app.bot_version = bot_version
     print(f"Main Engine loop started (v{bot_version}). Strategy: Aggression + Imbalance.")
     
-    exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
+    exchange = None
+    try:
+        exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
+        
+        while state.get("bot_on", True):
+            try:
+                if not state.get('monitored_signals'):
+                    await scan_for_new_opportunities(exchange, app, broadcast_func, state, save_state_func)
+                else:
+                    await monitor_active_trades(exchange, app, broadcast_func, state, save_state_func)
+                
+                await asyncio.sleep(SCAN_INTERVAL)
+            except asyncio.CancelledError:
+                print("Main Engine loop cancelled.")
+                break
+            except Exception as e:
+                print(f"CRITICAL Error in Main Engine loop: {e}", exc_info=True)
+                await broadcast_func(app, f"Критическая ошибка в главном цикле: {e}")
+                await asyncio.sleep(60)
     
-    while state.get("bot_on", True):
-        try:
-            if not state.get('monitored_signals'):
-                await scan_for_new_opportunities(exchange, app, broadcast_func, state, save_state_func)
-            else:
-                await monitor_active_trades(exchange, app, broadcast_func, state, save_state_func)
+    except Exception as e:
+        print(f"CRITICAL STARTUP ERROR in Main Engine: {e}", exc_info=True)
+        await broadcast_func(app, f"<b>КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА!</b>\nБот не может подключиться к бирже.\n<code>Ошибка: {e}</code>")
+        state['bot_on'] = False
+        save_state_func()
             
-            await asyncio.sleep(SCAN_INTERVAL)
-        except asyncio.CancelledError:
-            print("Main Engine loop cancelled.")
-            break
-        except Exception as e:
-            print(f"CRITICAL Error in Main Engine loop: {e}", exc_info=True)
-            await broadcast_func(app, f"Критическая ошибка в главном цикле: {e}")
-            await asyncio.sleep(60)
-            
-    print("Main Engine loop stopped.")
-    await exchange.close()
+    finally:
+        if exchange:
+            print("Closing exchange connection.")
+            await exchange.close()
+        print("Main Engine loop stopped.")
