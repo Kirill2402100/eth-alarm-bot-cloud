@@ -1,6 +1,8 @@
 # main_bot.py
 # ============================================================================
-# v27.2 - Повышена стабильность запуска, улучшена обработка ошибок
+# v28.0 - СТАБИЛЬНАЯ ВЕРСИЯ
+# Архитектура переведена на встроенный механизм состояния `app.bot_data`
+# для максимальной надежности в асинхронной среде.
 # ============================================================================
 
 import os
@@ -11,26 +13,25 @@ from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import ccxt.async_support as ccxt
-from datetime import datetime
 
 # Локальные импорты
 import trade_executor
 from scanner_engine import scanner_main_loop
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "27.2"
+BOT_VERSION        = "28.0"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
+STATE_FILE         = "bot_state.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# === Google-Sheets (без изменений) =========================================
+# === Google-Sheets =========================================================
 TRADE_LOG_WS = None
-SHEET_NAME   = f"Trading_Log_v{BOT_VERSION}"
+SHEET_NAME   = f"Trading_Log_v27.2" # Оставим старое имя, чтобы продолжить лог
 
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Algorithm_Type", "Strategy_Idea",
@@ -64,51 +65,49 @@ def setup_sheets():
         TRADE_LOG_WS = None
         trade_executor.TRADE_LOG_WS = None
 
-# === Состояние бота (без изменений) =======================================
-STATE_FILE = "bot_state.json"
-state = {}
-def load_state():
-    global state
+
+# === Управление состоянием (Новая архитектура) ============================
+def load_state(app: Application):
+    """Загружает состояние из файла в app.bot_data."""
+    bot_data = app.bot_data
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, 'r') as f:
                 loaded_state = json.load(f)
-                # --- ИЗМЕНЕНИЕ: Не пересоздаем объект, а обновляем существующий ---
-                state.clear()
-                state.update(loaded_state)
-                # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+                bot_data.update(loaded_state)
         except json.JSONDecodeError:
-            # Если файл поврежден, оставляем state пустым,
-            # чтобы он заполнился значениями по умолчанию.
-            state.clear() 
+            log.error("Ошибка чтения bot_state.json, использую значения по умолчанию.")
 
-    # Значения по умолчанию для ключей, которых нет в файле
-    state.setdefault("bot_on", False)
-    state.setdefault("monitored_signals", [])
-    state.setdefault("deposit", 50)
-    state.setdefault("leverage", 100)
-    state.setdefault("last_imbalance_ratio", 1.0)
-    
-    log.info("State loaded. Active signals: %d. Deposit: %s, Leverage: %s",
-             len(state.get("monitored_signals", [])), state.get('deposit'), state.get('leverage'))
-    
-def save_state():
-    with open(STATE_FILE,"w") as f: json.dump(state, f, indent=2)
+    # Устанавливаем значения по умолчанию, если их нет
+    bot_data.setdefault("bot_on", False)
+    bot_data.setdefault("monitored_signals", [])
+    bot_data.setdefault("deposit", 50)
+    bot_data.setdefault("leverage", 100)
+    log.info("State loaded into bot_data. Active signals: %d. Deposit: %s, Leverage: %s",
+             len(bot_data.get("monitored_signals", [])), bot_data.get('deposit'), bot_data.get('leverage'))
 
-async def broadcast(app, txt:str):
+def save_state(app: Application):
+    """Сохраняет app.bot_data в файл."""
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(app.bot_data, f, indent=2)
+    except Exception as e:
+        log.error(f"Failed to save state: {e}")
+
+
+# === Общие функции =========================================================
+async def broadcast(app: Application, txt:str):
     for cid in getattr(app,"chat_ids", CHAT_IDS):
         try:
             await app.bot.send_message(chat_id=cid, text=txt, parse_mode=constants.ParseMode.HTML)
         except Exception as e:
             log.error("Send fail %s: %s", cid, e)
 
-# === Команды Telegram =======================================
+# === Команды Telegram (Работают через bot_data) ============================
 async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    if cid not in ctx.application.chat_ids:
-        ctx.application.chat_ids.add(cid)
-    state["bot_on"] = True
-    save_state()
+    ctx.application.chat_ids.add(update.effective_chat.id)
+    ctx.bot_data["bot_on"] = True
+    save_state(ctx.application)
     await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} запущен.</b>\n"
                                       f"<b>Стратегия:</b> Агрессия + Дисбаланс\n"
                                       f"Логирование в лист: <b>{SHEET_NAME}</b>\n"
@@ -116,23 +115,27 @@ async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
                                       parse_mode=constants.ParseMode.HTML)
 
 async def cmd_stop(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    state["bot_on"] = False
-    save_state()
-    await update.message.reply_text("🛑 <b>Бот остановлен.</b>", parse_mode=constants.ParseMode.HTML)
+    ctx.bot_data["bot_on"] = False
+    save_state(ctx.application)
+    await update.message.reply_text("🛑 <b>Бот остановлен.</b> Основной цикл завершится после текущей итерации.",
+                                      parse_mode=constants.ParseMode.HTML)
     if hasattr(ctx.application, '_main_loop_task'):
-        ctx.application._main_loop_task.cancel()
+        # Мягкая остановка - цикл сам завершится по флагу bot_on = False
+        # Принудительная отмена: ctx.application._main_loop_task.cancel()
+        pass
 
 async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    bot_data = ctx.bot_data
     is_running = hasattr(ctx.application, '_main_loop_task') and not ctx.application._main_loop_task.done()
-    active_signals = state.get('monitored_signals', [])
-    
+    active_signals = bot_data.get('monitored_signals', [])
+
     msg = (f"<b>Состояние бота v{BOT_VERSION}</b>\n"
            f"<b>Стратегия:</b> Агрессия + Дисбаланс\n"
-           f"<b>Статус:</b> {'✅ ON' if state.get('bot_on') else '🛑 OFF'}\n"
+           f"<b>Статус:</b> {'✅ ON' if bot_data.get('bot_on') else '🛑 OFF'}\n"
            f"<b>Основной цикл:</b> {'🚀 RUNNING' if is_running else '🔌 STOPPED'}\n"
            f"<b>Активных сделок:</b> {len(active_signals)}\n"
-           f"<b>Депозит:</b> ${state.get('deposit', 50)}\n"
-           f"<b>Плечо:</b> x{state.get('leverage', 100)}\n\n")
+           f"<b>Депозит:</b> ${bot_data.get('deposit', 50)}\n"
+           f"<b>Плечо:</b> x{bot_data.get('leverage', 100)}\n\n")
 
     if active_signals:
         signal = active_signals[0]
@@ -143,19 +146,14 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
-async def cmd_info(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    status_info = "Мониторинг активной сделки" if state.get('monitored_signals') else state.get('last_status_info', 'инициализация...')
-    msg = f"<b>Детальный статус сканера (v{BOT_VERSION}):</b>\n\n▶️ {status_info}"
-    await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
-
 async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         new_deposit = float(ctx.args[0])
         if new_deposit <= 0:
             await update.message.reply_text("❌ Депозит должен быть положительным числом.")
             return
-        state['deposit'] = new_deposit
-        save_state()
+        ctx.bot_data['deposit'] = new_deposit
+        save_state(ctx.application)
         await update.message.reply_text(f"✅ Депозит установлен: <b>${new_deposit}</b>", parse_mode=constants.ParseMode.HTML)
     except (IndexError, ValueError):
         await update.message.reply_text("⚠️ Неверный формат. Используйте: <code>/deposit &lt;сумма&gt;</code>", parse_mode=constants.ParseMode.HTML)
@@ -166,37 +164,38 @@ async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not 1 <= new_leverage <= 200:
             await update.message.reply_text("❌ Плечо должно быть целым числом от 1 до 200.")
             return
-        state['leverage'] = new_leverage
-        save_state()
+        ctx.bot_data['leverage'] = new_leverage
+        save_state(ctx.application)
         await update.message.reply_text(f"✅ Плечо установлено: <b>x{new_leverage}</b>", parse_mode=constants.ParseMode.HTML)
     except (IndexError, ValueError):
         await update.message.reply_text("⚠️ Неверный формат. Используйте: <code>/leverage &lt;число&gt;</code>", parse_mode=constants.ParseMode.HTML)
 
-# --- ИЗМЕНЕНИЕ: Упрощена и сделана более надежной логика запуска ---
 async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
     app = ctx.application
-    is_running = hasattr(app, '_main_loop_task') and not app._main_loop_task.done()
-    if is_running:
+    if hasattr(app, '_main_loop_task') and not app._main_loop_task.done():
         await update.message.reply_text("ℹ️ Основной цикл уже запущен.")
     else:
-        # Всегда устанавливаем флаг и сохраняем перед запуском для надежности
-        state["bot_on"] = True
-        save_state()
+        app.bot_data["bot_on"] = True
+        save_state(app)
         await update.message.reply_text(f"🚀 Запускаю основной цикл (v{BOT_VERSION})...")
-        app._main_loop_task = asyncio.create_task(scanner_main_loop(app, broadcast, state, save_state))
-# --- КОНЕЦ ИЗМЕНЕНИЯ ---
+        app._main_loop_task = asyncio.create_task(scanner_main_loop(app, broadcast))
 
+# === Точка входа =========================================================
 if __name__ == "__main__":
-    load_state()
-    setup_sheets()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.chat_ids = set(CHAT_IDS)
+
+    # Сначала инициализируем bot_data, потом загружаем состояние из файла
+    load_state(app)
+    setup_sheets()
+
+    # Регистрация команд
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("info", cmd_info))
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("deposit", cmd_deposit))
     app.add_handler(CommandHandler("leverage", cmd_leverage))
+
     log.info(f"Bot v{BOT_VERSION} started polling.")
     app.run_polling()
