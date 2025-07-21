@@ -1,7 +1,7 @@
 # scanner_engine.py
 # ============================================================================
-# v37.1 - VERBOSE DEBUG MODE
-# - В debug_mode_on: Сообщения каждый цикл + детали (PDI/MDI, imbalance, почему пропущен).
+# v37.2 - РАСШИРЕННОЕ ЛОГИРОВАНИЕ
+# - Добавлены в decision: ADX, PDI, MDI, Imbalance_Ratio, Aggression_Side, Trigger_Order_USD.
 # ============================================================================
 import asyncio
 import time
@@ -66,10 +66,10 @@ def calculate_indicators(ohlcv):
         return None, None, None
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df.ta.adx(length=ADX_PERIOD, append=True)
-    indicators = df[['ADX_14', 'DMP_14', 'DMN_14']].iloc[-1]
+    indicators = df[['ADX_14', 'DMP_14', 'DMN_14']].iloc[-1]  # Изменено: Возвращаем ADX, +DI, -DI
     return indicators['ADX_14'], indicators['DMP_14'], indicators['DMN_14']
 
-# === Логика сканирования (ИЗМЕНЕНА: Verbose debug) =============================================
+# === Логика сканирования (ИЗМЕНЕНА: Verbose debug + новые поля) =============================================
 async def scan_for_new_opportunities(exchange, app: Application, broadcast_func, adx, pdi, mdi):
     bot_data = app.bot_data
     status_code, status_message = None, None
@@ -128,7 +128,11 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func,
                                                 "Pair": PAIR_TO_SCAN, "Algorithm_Type": "Directional ADX Imbalance", 
                                                 "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": sl_price, 
                                                 "TP_Price": tp_price, "side": side_to_trade, "Deposit": bot_data.get('deposit', 50), 
-                                                "Leverage": bot_data.get('leverage', 100), "dominance_lost_counter": 0}
+                                                "Leverage": bot_data.get('leverage', 100), "dominance_lost_counter": 0,
+                                                "ADX": adx, "PDI": pdi, "MDI": mdi,  # Новые
+                                                "Imbalance_Ratio": imbalance_ratio, "Aggression_Side": aggression_side,  # Новые
+                                                "Trigger_Order_USD": max(top_bids_usd, top_asks_usd)  # Новый: доминирующая сторона
+                                                }
                                     msg = f"🔥 <b>ВХОД В СДЕЛКУ ({side_to_trade})</b>\n\n<b>Тип:</b> <code>{idea}</code>\n<b>Вход:</b> <code>{entry_price:.2f}</code> | <b>SL:</b> <code>{sl_price:.2f}</code> | <b>TP:</b> <code>{tp_price:.2f}</code>"
                                     await broadcast_func(app, msg)
                                     await log_trade_to_sheet(decision)
@@ -150,7 +154,7 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func,
         if status_code and status_code != last_code:
             bot_data['last_debug_code'] = status_code
             await broadcast_func(app, f"<code>{status_message}</code>")
-            
+
 # === Логика мониторинга (ИЗМЕНЕНА: Добавлен TP) ==============================
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
