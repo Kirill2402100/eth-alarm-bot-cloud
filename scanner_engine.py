@@ -25,7 +25,7 @@ AGGRESSION_TIMEFRAME_SEC = 30
 AGGRESSION_RATIO = 1.2
 SL_BUFFER_PERCENT = 0.0005
 SCAN_INTERVAL = 5
-MIN_WALL_STABILITY_SEC = 25
+MIN_WALL_STABILITY_SEC = 15
 MIN_SL_DISTANCE_PCT = 0.0006
 
 # === Функции-помощники =====================================================
