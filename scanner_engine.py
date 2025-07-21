@@ -1,7 +1,8 @@
 # scanner_engine.py
 # ============================================================================
-# v37.2 - РАСШИРЕННОЕ ЛОГИРОВАНИЕ
-# - Добавлены в decision: ADX, PDI, MDI, Imbalance_Ratio, Aggression_Side, Trigger_Order_USD.
+# v37.3 - ADAPTIVE TP ON ATR
+# - TP теперь на ATR * 1.5 (адаптивно к волатильности).
+# - Добавлено логирование ATR в Sheets.
 # ============================================================================
 import asyncio
 import time
@@ -31,13 +32,14 @@ MIN_SL_DISTANCE_PCT = 0.0008
 MIN_IMBALANCE_RATIO = 2.0  # Базовый; динамически повышается во флэте
 AGGRESSION_TIMEFRAME_SEC = 30
 AGGRESSION_RATIO = 1.5
-RISK_REWARD_RATIO = 1.5  # Новый: RR для TP
-DOMINANCE_LOST_MAX_COUNTER = 3  # Новый: Увеличено для подтверждения потери доминации
+TP_ATR_MULTIPLIER = 1.5  # Новый: Множитель для ATR в TP (RR~1.5)
+DOMINANCE_LOST_MAX_COUNTER = 3
 
 # --- Параметры режимного фильтра ---
 ADX_PERIOD = 14
-ADX_TREND_THRESHOLD = 20  # Изменено: Захватываем серую зону
-ADX_FLAT_THRESHOLD = 15   # Изменено: Избегаем ультра-флэта
+ATR_PERIOD = 14  # Новый: Период для ATR (синхронизирован с ADX)
+ADX_TREND_THRESHOLD = 20
+ADX_FLAT_THRESHOLD = 15
 
 # === Функции-помощники =====================================================
 def get_imbalance_and_walls(order_book):
@@ -61,16 +63,17 @@ def get_imbalance_and_walls(order_book):
     return imbalance_ratio, large_bids, large_asks, top_bids_usd, top_asks_usd
 
 def calculate_indicators(ohlcv):
-    """Рассчитывает ADX, +DI (DMP), -DI (DMN) по данным свечей."""
-    if not ohlcv or len(ohlcv) < ADX_PERIOD:
-        return None, None, None
+    """Рассчитывает ADX, +DI (DMP), -DI (DMN), ATR по данным свечей."""
+    if not ohlcv or len(ohlcv) < max(ADX_PERIOD, ATR_PERIOD):
+        return None, None, None, None
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df.ta.adx(length=ADX_PERIOD, append=True)
-    indicators = df[['ADX_14', 'DMP_14', 'DMN_14']].iloc[-1]  # Изменено: Возвращаем ADX, +DI, -DI
-    return indicators['ADX_14'], indicators['DMP_14'], indicators['DMN_14']
+    df.ta.atr(length=ATR_PERIOD, append=True)  # Новый: ATR
+    indicators = df[['ADX_14', 'DMP_14', 'DMN_14', 'ATRr_14']].iloc[-1]
+    return indicators['ADX_14'], indicators['DMP_14'], indicators['DMN_14'], indicators['ATRr_14']
 
-# === Логика сканирования (ИЗМЕНЕНА: Verbose debug + новые поля) =============================================
-async def scan_for_new_opportunities(exchange, app: Application, broadcast_func, adx, pdi, mdi):
+# === Логика сканирования (ИЗМЕНЕНА: ATR для TP + новые поля) =============================================
+async def scan_for_new_opportunities(exchange, app: Application, broadcast_func, adx, pdi, mdi, atr):
     bot_data = app.bot_data
     status_code, status_message = None, None
     extended_message = ""  # Для деталей
@@ -78,7 +81,7 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func,
         if adx is None:
             status_code, status_message = "WAIT_ADX", "Ожидание данных для расчета ADX..."
         else:
-            extended_message = f"PDI: {pdi:.1f}, MDI: {mdi:.1f}. "
+            extended_message = f"PDI: {pdi:.1f}, MDI: {mdi:.1f}. ATR: {atr:.2f}. "
             if adx < ADX_FLAT_THRESHOLD:
                 status_code, status_message = "MARKET_IS_FLAT", f"ADX ({adx:.1f}) < {ADX_FLAT_THRESHOLD}. Рынок во флэте, торговля на паузе."
             elif adx < ADX_TREND_THRESHOLD:
@@ -119,8 +122,7 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func,
                                 if abs(entry_price - sl_price) / entry_price < MIN_SL_DISTANCE_PCT:
                                     extended_message += f"SL distance: {abs(entry_price - sl_price) / entry_price:.4f} < {MIN_SL_DISTANCE_PCT}. Пропущен по SL."
                                 else:
-                                    sl_distance = abs(entry_price - sl_price)
-                                    tp_price = entry_price + sl_distance * RISK_REWARD_RATIO if side_to_trade == "LONG" else entry_price - sl_distance * RISK_REWARD_RATIO
+                                    tp_price = entry_price + atr * TP_ATR_MULTIPLIER if side_to_trade == "LONG" else entry_price - atr * TP_ATR_MULTIPLIER  # Новый: TP на ATR
                                     
                                     idea = f"ADX {adx:.1f} (Dir: {trend_dir}). Дисбаланс {imbalance_ratio:.1f}x + Агрессия {side_to_trade}"
                                     decision = {"Signal_ID": f"signal_{int(time.time() * 1000)}", 
@@ -129,9 +131,10 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func,
                                                 "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": sl_price, 
                                                 "TP_Price": tp_price, "side": side_to_trade, "Deposit": bot_data.get('deposit', 50), 
                                                 "Leverage": bot_data.get('leverage', 100), "dominance_lost_counter": 0,
-                                                "ADX": adx, "PDI": pdi, "MDI": mdi,  # Новые
-                                                "Imbalance_Ratio": imbalance_ratio, "Aggression_Side": aggression_side,  # Новые
-                                                "Trigger_Order_USD": max(top_bids_usd, top_asks_usd)  # Новый: доминирующая сторона
+                                                "ADX": adx, "PDI": pdi, "MDI": mdi, 
+                                                "Imbalance_Ratio": imbalance_ratio, "Aggression_Side": aggression_side, 
+                                                "Trigger_Order_USD": max(top_bids_usd, top_asks_usd),
+                                                "ATR": atr  # Новый для логирования
                                                 }
                                     msg = f"🔥 <b>ВХОД В СДЕЛКУ ({side_to_trade})</b>\n\n<b>Тип:</b> <code>{idea}</code>\n<b>Вход:</b> <code>{entry_price:.2f}</code> | <b>SL:</b> <code>{sl_price:.2f}</code> | <b>TP:</b> <code>{tp_price:.2f}</code>"
                                     await broadcast_func(app, msg)
@@ -155,12 +158,12 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func,
             bot_data['last_debug_code'] = status_code
             await broadcast_func(app, f"<code>{status_message}</code>")
 
-# === Логика мониторинга (ИЗМЕНЕНА: Добавлен TP) ==============================
+# === Логика мониторинга (без изменений) ==============================
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
     if not bot_data.get('monitored_signals'): return
     signal = bot_data['monitored_signals'][0]
-    pair, entry_price, sl_price, tp_price, side = (signal['Pair'], signal['Entry_Price'], signal['SL_Price'], signal.get('TP_Price'), signal['side'])  # Новый: tp_price
+    pair, entry_price, sl_price, tp_price, side = (signal['Pair'], signal['Entry_Price'], signal['SL_Price'], signal.get('TP_Price'), signal['side'])
     try:
         order_book = await exchange.fetch_order_book(pair, limit=100, params={'type': 'swap'})
         if not (order_book.get('bids') and order_book['bids'][0] and order_book.get('asks') and order_book['asks'][0]): return
@@ -169,7 +172,6 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         _, _, _, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
         exit_status, exit_price, reason = None, None, None
         
-        # Новый: Проверка TP перед SL
         if (side == 'LONG' and last_price >= tp_price) or (side == 'SHORT' and last_price <= tp_price):
             exit_status, exit_price, reason = "TP_HIT", tp_price if side == 'LONG' else tp_price, "Take Profit достигнут"
         
@@ -181,7 +183,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
             dominance_is_lost = (side == 'LONG' and top_bids_usd <= top_asks_usd) or (side == 'SHORT' and top_asks_usd <= top_bids_usd)
             if dominance_is_lost:
                 signal['dominance_lost_counter'] = signal.get('dominance_lost_counter', 0) + 1
-                if signal['dominance_lost_counter'] >= DOMINANCE_LOST_MAX_COUNTER:  # Изменено: >=3
+                if signal['dominance_lost_counter'] >= DOMINANCE_LOST_MAX_COUNTER:
                     reason_text = "Потеря доминации покупателей" if side == 'LONG' else "Потеря доминации продавцов"
                     exit_status, exit_price, reason = "DOMINANCE_LOST", last_price, f"{reason_text} (подтверждено)"
             else:
@@ -201,12 +203,12 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         log.error(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
         await broadcast_func(app, f"⚠️ <b>Критическая ошибка мониторинга!</b>\n<code>Ошибка: {e}</code>")
 
-# === Главный цикл (ИЗМЕНЕН: Передаем pdi, mdi) ============================================
+# === Главный цикл (ИЗМЕНЕН: Добавлен ATR) ============================================
 async def scanner_main_loop(app: Application, broadcast_func):
     bot_version = getattr(app, 'bot_version', 'N/A')
     log.info(f"Main Engine loop starting (v{bot_version})...")
     exchange = None
-    adx, pdi, mdi = None, None, None  # Новый: pdi, mdi
+    adx, pdi, mdi, atr = None, None, None, None  # Новый: atr
     last_adx_update_time = 0
 
     try:
@@ -216,15 +218,14 @@ async def scanner_main_loop(app: Application, broadcast_func):
 
         while app.bot_data.get("bot_on", False):
             try:
-                # Обновляем ADX раз в минуту, чтобы не нагружать API
+                # Обновляем индикаторы раз в минуту
                 if time.time() - last_adx_update_time > 60:
                     ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=50)
-                    adx, pdi, mdi = calculate_indicators(ohlcv)  # Изменено: Получаем adx, pdi, mdi
+                    adx, pdi, mdi, atr = calculate_indicators(ohlcv)  # Изменено: Получаем + ATR
                     last_adx_update_time = time.time()
                 
                 if not app.bot_data.get('monitored_signals'):
-                    # Передаем adx, pdi, mdi в сканер
-                    await scan_for_new_opportunities(exchange, app, broadcast_func, adx, pdi, mdi)
+                    await scan_for_new_opportunities(exchange, app, broadcast_func, adx, pdi, mdi, atr)
                 else:
                     await monitor_active_trades(exchange, app, broadcast_func)
 
