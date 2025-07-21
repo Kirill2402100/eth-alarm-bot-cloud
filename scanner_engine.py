@@ -30,7 +30,7 @@ MIN_SL_DISTANCE_PCT = 0.0008
 # --- Параметры стратегии ---
 MIN_IMBALANCE_RATIO = 1.5  # Уменьшено по вашему запросу
 AGGRESSION_TIMEFRAME_SEC = 30
-AGGRESSION_RATIO = 1.5
+AGGRESSION_RATIO = 1.2
 TP_ATR_MULTIPLIER = 1.5
 DOMINANCE_LOST_MAX_COUNTER = 3
 DI_DIFF_THRESHOLD = 5.0  # Новый: Порог для слабого тренда (нейтральный если |PDI-MDI|<5)
