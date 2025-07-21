@@ -29,7 +29,7 @@ SL_BUFFER_PERCENT = 0.0005
 MIN_SL_DISTANCE_PCT = 0.0008
 
 # --- Параметры стратегии ---
-MIN_IMBALANCE_RATIO = 2.0  # Базовый; динамически повышается во флэте
+MIN_IMBALANCE_RATIO = 1.5  # Базовый; динамически повышается во флэте
 AGGRESSION_TIMEFRAME_SEC = 30
 AGGRESSION_RATIO = 1.5
 TP_ATR_MULTIPLIER = 1.5  # Новый: Множитель для ATR в TP (RR~1.5)
