@@ -1,8 +1,8 @@
 # scanner_engine.py
 # ============================================================================
-# v33.3 - FINAL
-# - Восстановлена логика анти-спама для диагностических сообщений.
-# - Бот готов к работе.
+# v33.5 - TEST: AGGRESSION FILTER DISABLED
+# - Полностью отключена проверка агрессии в ленте сделок.
+# - Бот входит в сделку сразу после обнаружения стабильного уровня.
 # ============================================================================
 import asyncio
 import time
@@ -21,8 +21,10 @@ log = logging.getLogger("bot")
 PAIR_TO_SCAN = 'BTC/USDT'
 LARGE_ORDER_USD = 200000
 TOP_N_ORDERS_TO_ANALYZE = 20
-AGGRESSION_TIMEFRAME_SEC = 60
-AGGRESSION_RATIO = 1.2
+# --- ПАРАМЕТРЫ АГРЕССИИ БОЛЬШЕ НЕ ИСПОЛЬЗУЮТСЯ В ЭТОЙ ВЕРСИИ ---
+# AGGRESSION_TIMEFRAME_SEC = 60
+# AGGRESSION_RATIO = 1.2
+# --------------------------------------------------------------------
 SL_BUFFER_PERCENT = 0.0005
 SCAN_INTERVAL = 5
 MIN_WALL_STABILITY_SEC = 60
@@ -82,42 +84,36 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
             if not side:
                 status_code, status_message = "WAIT_STABILITY", f"Поиск стабильного уровня... S: {support_stability:.0f}с, R: {resistance_stability:.0f}с"
             else:
-                now_ms, since = exchange.milliseconds(), exchange.milliseconds() - AGGRESSION_TIMEFRAME_SEC * 1000
-                trades = await exchange.fetch_trades(PAIR_TO_SCAN, since=since, limit=100, params={'type': 'swap', 'until': now_ms})
+                # --- ИЗМЕНЕНИЕ: Убираем проверку агрессии, входим сразу ---
+                # Нам все еще нужны последние сделки, чтобы получить актуальную цену входа
+                trades = await exchange.fetch_trades(PAIR_TO_SCAN, limit=1, params={'type': 'swap'})
                 if not trades:
-                    status_code, status_message = "WAIT_AGGRESSION", f"Стабильный уровень {side} ({stable_wall['price']:.2f}) найден, жду агрессию..."
+                    status_code, status_message = "WAIT_TRADES", "Стабильный уровень есть, но лента сделок пуста."
                 else:
-                    buy_volume = sum(t['cost'] for t in trades if t['side'] == 'buy')
-                    sell_volume = sum(t['cost'] for t in trades if t['side'] == 'sell')
-                    aggression_side = "LONG" if buy_volume > sell_volume * AGGRESSION_RATIO else "SHORT" if sell_volume > buy_volume * AGGRESSION_RATIO else None
-                    if aggression_side == side:
-                        entry_price = trades[-1]['price']
-                        sl_price = current_support['price'] * (1 - SL_BUFFER_PERCENT) if side == "LONG" else current_resistance['price'] * (1 + SL_BUFFER_PERCENT)
-                        if abs(entry_price - sl_price) / entry_price < MIN_SL_DISTANCE_PCT:
-                            status_code, status_message = "RISK_TOO_HIGH", f"Сигнал {side} отменен. Стоп-лосс слишком близко."
-                        else:
-                            idea = f"Торговля от стабильного уровня {side} ({stable_wall['price']:.2f})"
-                            decision = {"Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), "Pair": PAIR_TO_SCAN, "Algorithm_Type": "Stable Level", "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": sl_price, "side": side, "Deposit": bot_data.get('deposit', 50), "Leverage": bot_data.get('leverage', 100), "dominance_lost_counter": 0}
-                            msg = f"🔥 <b>ВХОД В СДЕЛКУ ({side})</b>\n\n<b>Тип:</b> <code>{idea}</code>\n<b>Вход:</b> <code>{entry_price:.2f}</code> | <b>SL:</b> <code>{sl_price:.2f}</code>"
-                            await broadcast_func(app, msg)
-                            await log_trade_to_sheet(decision)
-                            bot_data['monitored_signals'].append(decision)
-                            save_state(app)
-                            status_code, status_message = "TRADE_OPENED", f"Сделка {side} открыта."
+                    entry_price = trades[-1]['price']
+                    sl_price = current_support['price'] * (1 - SL_BUFFER_PERCENT) if side == "LONG" else current_resistance['price'] * (1 + SL_BUFFER_PERCENT)
+                    if abs(entry_price - sl_price) / entry_price < MIN_SL_DISTANCE_PCT:
+                        status_code, status_message = "RISK_TOO_HIGH", f"Сигнал {side} отменен. Стоп-лосс слишком близко."
                     else:
-                        status_code, status_message = "WAIT_AGGRESSION_MATCH", f"Стабильный уровень {side} ({stable_wall['price']:.2f}) есть, но агрессия слабая."
+                        idea = f"Торговля от стабильного уровня {side} ({stable_wall['price']:.2f})"
+                        decision = {"Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%м-%d %H:%M:%S'), "Pair": PAIR_TO_SCAN, "Algorithm_Type": "Stable Level", "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": sl_price, "side": side, "Deposit": bot_data.get('deposit', 50), "Leverage": bot_data.get('leverage', 100), "dominance_lost_counter": 0}
+                        msg = f"🔥 <b>ВХОД В СДЕЛКУ ({side})</b>\n\n<b>Тип:</b> <code>{idea}</code>\n<b>Вход:</b> <code>{entry_price:.2f}</code> | <b>SL:</b> <code>{sl_price:.2f}</code>"
+                        await broadcast_func(app, msg)
+                        await log_trade_to_sheet(decision)
+                        bot_data['monitored_signals'].append(decision)
+                        save_state(app)
+                        status_code, status_message = "TRADE_OPENED", f"Сделка {side} открыта."
+                # --- КОНЕЦ ИЗМЕНЕНИЯ ---
     except Exception as e:
         status_code = "SCANNER_ERROR"
         status_message = f"КРИТИЧЕСКАЯ ОШИБКА СКАНЕРА: {e}"
         log.error(status_message, exc_info=True)
     
-    # --- ИЗМЕНЕНИЕ: Возвращаем анти-спам фильтр ---
     last_code = bot_data.get('last_debug_code', '')
     if status_code and status_code != last_code:
         bot_data['last_debug_code'] = status_code
         if bot_data.get('debug_mode_on', False):
             await broadcast_func(app, f"<code>{status_message}</code>")
-    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
 # === Логика мониторинга =======================================================
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
@@ -162,7 +158,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 
 # === Главный цикл =============================================================
 async def scanner_main_loop(app: Application, broadcast_func):
-    bot_version = getattr(app, 'bot_version', 'N/A')
+    bot_version = getattr(app, 'bot_version', 'N_A')
     log.info(f"Main Engine loop starting (v{bot_version})...")
     exchange = None
     try:
