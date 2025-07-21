@@ -1,8 +1,8 @@
 # scanner_engine.py
 # ============================================================================
-# v33.5 - TEST: AGGRESSION FILTER DISABLED
-# - Полностью отключена проверка агрессии в ленте сделок.
-# - Бот входит в сделку сразу после обнаружения стабильного уровня.
+# v34.0 - FINAL RELIABLE DIAGNOSTICS
+# - Возвращена простая и надежная система диагностики ("стресс-тест"),
+#   которая гарантированно присылает статус в чат на каждом цикле.
 # ============================================================================
 import asyncio
 import time
@@ -21,14 +21,12 @@ log = logging.getLogger("bot")
 PAIR_TO_SCAN = 'BTC/USDT'
 LARGE_ORDER_USD = 200000
 TOP_N_ORDERS_TO_ANALYZE = 20
-# --- ПАРАМЕТРЫ АГРЕССИИ БОЛЬШЕ НЕ ИСПОЛЬЗУЮТСЯ В ЭТОЙ ВЕРСИИ ---
-# AGGRESSION_TIMEFRAME_SEC = 60
-# AGGRESSION_RATIO = 1.2
-# --------------------------------------------------------------------
+AGGRESSION_TIMEFRAME_SEC = 30
+AGGRESSION_RATIO = 1.2
 SL_BUFFER_PERCENT = 0.0005
 SCAN_INTERVAL = 5
 MIN_WALL_STABILITY_SEC = 60
-MIN_SL_DISTANCE_PCT = 0.0008
+MIN_SL_DISTANCE_PCT = 0.0006
 
 # === Функции-помощники =====================================================
 def get_imbalance_and_walls(order_book):
@@ -54,13 +52,13 @@ def get_imbalance_and_walls(order_book):
 # === Логика сканирования ====================================================
 async def scan_for_new_opportunities(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
-    status_code, status_message = None, None
+    status_message = None
     try:
         order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100, params={'type': 'swap'})
         _, large_bids, large_asks, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
         
         if not large_bids or not large_asks:
-            status_code, status_message = "WAIT_LIQUIDITY", "Ожидание крупных ордеров в стакане..."
+            status_message = "Ожидание крупных ордеров в стакане..."
         else:
             now_ts = time.time()
             current_support, current_resistance = large_bids[0], large_asks[0]
@@ -82,18 +80,16 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
                 side, stable_wall = "SHORT", stable_walls['resistance']
             
             if not side:
-                status_code, status_message = "WAIT_STABILITY", f"Поиск стабильного уровня... S: {support_stability:.0f}с, R: {resistance_stability:.0f}с"
+                status_message = f"Поиск стабильного уровня... S: {support_stability:.0f}с, R: {resistance_stability:.0f}с"
             else:
-                # --- ИЗМЕНЕНИЕ: Убираем проверку агрессии, входим сразу ---
-                # Нам все еще нужны последние сделки, чтобы получить актуальную цену входа
                 trades = await exchange.fetch_trades(PAIR_TO_SCAN, limit=1, params={'type': 'swap'})
                 if not trades:
-                    status_code, status_message = "WAIT_TRADES", "Стабильный уровень есть, но лента сделок пуста."
+                    status_message = "Стабильный уровень есть, но лента сделок пуста."
                 else:
                     entry_price = trades[-1]['price']
                     sl_price = current_support['price'] * (1 - SL_BUFFER_PERCENT) if side == "LONG" else current_resistance['price'] * (1 + SL_BUFFER_PERCENT)
                     if abs(entry_price - sl_price) / entry_price < MIN_SL_DISTANCE_PCT:
-                        status_code, status_message = "RISK_TOO_HIGH", f"Сигнал {side} отменен. Стоп-лосс слишком близко."
+                        status_message = f"Сигнал {side} отменен. Стоп-лосс слишком близко."
                     else:
                         idea = f"Торговля от стабильного уровня {side} ({stable_wall['price']:.2f})"
                         decision = {"Signal_ID": f"signal_{int(time.time() * 1000)}", "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%м-%d %H:%M:%S'), "Pair": PAIR_TO_SCAN, "Algorithm_Type": "Stable Level", "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": sl_price, "side": side, "Deposit": bot_data.get('deposit', 50), "Leverage": bot_data.get('leverage', 100), "dominance_lost_counter": 0}
@@ -102,18 +98,17 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func)
                         await log_trade_to_sheet(decision)
                         bot_data['monitored_signals'].append(decision)
                         save_state(app)
-                        status_code, status_message = "TRADE_OPENED", f"Сделка {side} открыта."
-                # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+                        status_message = f"Сделка {side} открыта."
     except Exception as e:
-        status_code = "SCANNER_ERROR"
         status_message = f"КРИТИЧЕСКАЯ ОШИБКА СКАНЕРА: {e}"
         log.error(status_message, exc_info=True)
     
-    last_code = bot_data.get('last_debug_code', '')
-    if status_code and status_code != last_code:
-        bot_data['last_debug_code'] = status_code
+    # --- НАДЕЖНАЯ ЛОГИКА ОТПРАВКИ (без анти-спама) ---
+    if status_message:
         if bot_data.get('debug_mode_on', False):
-            await broadcast_func(app, f"<code>{status_message}</code>")
+            timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S')
+            await broadcast_func(app, f"<code>{timestamp}: {status_message}</code>")
+    # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
 # === Логика мониторинга =======================================================
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
@@ -158,7 +153,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 
 # === Главный цикл =============================================================
 async def scanner_main_loop(app: Application, broadcast_func):
-    bot_version = getattr(app, 'bot_version', 'N_A')
+    bot_version = getattr(app, 'bot_version', 'N/A')
     log.info(f"Main Engine loop starting (v{bot_version})...")
     exchange = None
     try:
