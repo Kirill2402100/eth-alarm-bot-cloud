@@ -1,6 +1,6 @@
 # main.py
 # ============================================================================
-# v33.0 - FINAL STABLE
+# v37.0 - DIRECTIONAL ADX FILTER + TAKE PROFIT
 # ============================================================================
 
 import os
@@ -19,7 +19,7 @@ from scanner_engine import scanner_main_loop
 from state_utils import load_state, save_state
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "33.0"
+BOT_VERSION        = "37.0"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -114,7 +114,7 @@ async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_state(ctx.application)
         await update.message.reply_text(f"✅ Депозит установлен: <b>${new_deposit}</b>", parse_mode=constants.ParseMode.HTML)
     except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ /deposit &lt;сумма&gt;", parse_mode=constants.ParseMode.HTML)
+        await update.message.reply_text("⚠️ /deposit <сумма>", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
@@ -123,7 +123,7 @@ async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_state(ctx.application)
         await update.message.reply_text(f"✅ Плечо установлено: <b>x{new_leverage}</b>", parse_mode=constants.ParseMode.HTML)
     except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ /leverage &lt;число&gt;", parse_mode=constants.ParseMode.HTML)
+        await update.message.reply_text("⚠️ /leverage <число>", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
     app = ctx.application
