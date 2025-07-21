@@ -45,7 +45,6 @@ ADX_FLAT_THRESHOLD = 15   # Изменено: Избегаем ультра-фл
 
 # === Функции-помощники =====================================================
 def get_imbalance_and_walls(order_book):
-    # ... (код этой функции остается без изменений) ...
     bids, asks = order_book.get('bids', []), order_book.get('asks', [])
     if not bids or not asks: return 1.0, None, None, 0, 0
     large_bids, large_asks = [], []
@@ -62,7 +61,7 @@ def get_imbalance_and_walls(order_book):
     if not large_bids or not large_asks: return 1.0, None, None, 0, 0
     top_bids_usd = sum(b['value_usd'] for b in large_bids[:TOP_N_ORDERS_TO_ANALYZE])
     top_asks_usd = sum(a['value_usd'] for a in large_asks[:TOP_N_ORDERS_TO_ANALYZE])
-    imbalance_ratio = (max(top_bids_usd, top_asks_usd)) / min(top_bids_usd, top_asks_usd)) if top_bids_usd > 0 and top_asks_usd > 0 else float('inf')
+    imbalance_ratio = (max(top_bids_usd, top_asks_usd) / min(top_bids_usd, top_asks_usd)) if top_bids_usd > 0 and top_asks_usd > 0 else float('inf')
     return imbalance_ratio, large_bids, large_asks, top_bids_usd, top_asks_usd
 
 def calculate_indicators(ohlcv):
