@@ -1,6 +1,7 @@
 # trade_executor.py
 # ============================================================================
-# v26.2 - Добавлена запись причин Emergency Exit в Google Sheets
+# v37.2 - РАСШИРЕННОЕ ЛОГИРОВАНИЕ
+# - Добавлены поля: ADX, PDI, MDI, Imbalance_Ratio, Aggression_Side, Time_In_Trade.
 # ============================================================================
 import asyncio
 from datetime import datetime, timezone
@@ -11,16 +12,16 @@ TRADE_LOG_WS = None
 async def log_trade_to_sheet(decision: dict):
     if not TRADE_LOG_WS: return False
     try:
-        # --- ИЗМЕНЕНИЕ: Добавлено пустое поле для Exit_Reason при открытии ---
         row_data = [
             decision.get("Signal_ID"), decision.get("Timestamp_UTC"), decision.get("Pair"),
             decision.get("Algorithm_Type"), decision.get("Strategy_Idea"),
             decision.get("Entry_Price"), decision.get("SL_Price"), decision.get("TP_Price"),
             decision.get("side"), decision.get("Deposit"), decision.get("Leverage"),
+            decision.get("ADX"), decision.get("PDI"), decision.get("MDI"),  # Новые
+            decision.get("Imbalance_Ratio"), decision.get("Aggression_Side"),  # Новые
             "OPEN", None, None, None, None, decision.get("Trigger_Order_USD"),
-            None # Exit_Reason
+            None, None  # Exit_Reason, Time_In_Trade
         ]
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: TRADE_LOG_WS.append_row(row_data, value_input_option='USER_ENTERED'))
         return True
@@ -38,14 +39,16 @@ async def update_trade_in_sheet(signal: dict, status: str, exit_price: float, pn
         if not cell: return False
         exit_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         
-        # --- ИЗМЕНЕНИЕ: Добавлено обновление для столбца Exit_Reason (R) ---
+        # Новый: Расчёт Time_In_Trade (минуты)
+        entry_time = datetime.fromisoformat(signal.get("Timestamp_UTC"))
+        time_in_trade = round((datetime.fromisoformat(exit_time) - entry_time).total_seconds() / 60, 2)
+        
         update_tasks = [
-            (f'L{cell.row}', status), (f'M{cell.row}', exit_time), (f'N{cell.row}', exit_price),
-            (f'O{cell.row}', pnl_usd), (f'P{cell.row}', pnl_percent),
+            (f'Q{cell.row}', status),  # Status теперь Q (после новых полей)
+            (f'R{cell.row}', exit_time), (f'S{cell.row}', exit_price),
+            (f'T{cell.row}', pnl_usd), (f'U{cell.row}', pnl_percent),
+            (f'W{cell.row}', reason), (f'X{cell.row}', time_in_trade)  # Exit_Reason W, Time_In_Trade X
         ]
-        if reason:
-            update_tasks.append((f'R{cell.row}', reason))
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
             
         await loop.run_in_executor(None, lambda: TRADE_LOG_WS.batch_update([{'range': r, 'values': [[v]]} for r, v in update_tasks]))
         return True
