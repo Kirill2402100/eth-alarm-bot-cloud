@@ -1,6 +1,7 @@
 # main.py
 # ============================================================================
-# v37.0 - DIRECTIONAL ADX FILTER + TAKE PROFIT
+# v37.2 - РАСШИРЕННОЕ ЛОГИРОВАНИЕ
+# - Добавлены поля: ADX, PDI, MDI, Imbalance_Ratio, Aggression_Side, Time_In_Trade.
 # ============================================================================
 
 import os
@@ -19,7 +20,7 @@ from scanner_engine import scanner_main_loop
 from state_utils import load_state, save_state
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "37.0"
+BOT_VERSION        = "37.2"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -33,8 +34,9 @@ SHEET_NAME   = f"Trading_Log_v{BOT_VERSION}"
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Algorithm_Type", "Strategy_Idea",
     "Entry_Price", "SL_Price", "TP_Price", "side", "Deposit", "Leverage",
+    "ADX", "PDI", "MDI", "Imbalance_Ratio", "Aggression_Side",  # Новые
     "Status", "Exit_Time_UTC", "Exit_Price", "PNL_USD", "PNL_Percent",
-    "Trigger_Order_USD", "Exit_Reason"
+    "Trigger_Order_USD", "Exit_Reason", "Time_In_Trade"  # Time_In_Trade новый
 ]
 
 def setup_sheets():
@@ -79,6 +81,11 @@ async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ **Диагностика в реальном времени ВКЛЮЧЕНА.**", parse_mode=constants.ParseMode.HTML)
     else:
         await update.message.reply_text("❌ **Диагностика ВЫКЛЮЧЕНА.**", parse_mode=constants.ParseMode.HTML)
+
+async def cmd_debug_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.bot_data['last_debug_code'] = ''
+    save_state(ctx.application)
+    await update.message.reply_text("✅ Последний код диагностики сброшен. Теперь вы увидите текущее сообщение статуса.", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(update.effective_chat.id)
@@ -146,6 +153,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("info", cmd_info))
+    app.add_handler(CommandHandler("debug_reset", cmd_debug_reset))
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("deposit", cmd_deposit))
     app.add_handler(CommandHandler("leverage", cmd_leverage))
