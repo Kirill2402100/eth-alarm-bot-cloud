@@ -278,4 +278,3 @@ async def scanner_main_loop(app: Application, broadcast_func):
         if exchange:
             await exchange.close()
         log.info("Main Engine loop stopped.")
-```
