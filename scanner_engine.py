@@ -1,7 +1,11 @@
 # scanner_engine.py
 # ============================================================================
-# v37.7 - DEBUG LOG SHEET
-# - Логируем потенциальные в debug_mode через log_debug_data.
+# v37.8 - КОРРЕКТИРОВКИ ДЛЯ SOL
+# - MIN_IMBALANCE_RATIO = 1.2
+# - TP_ATR_MULTIPLIER = 2.0
+# - Aggression optional при ATR >1.5 (AGGRESSION_ATR_MIN = 1.5)
+# - ATR_MIN = 1.0 (сигналы только при движении)
+# - MIN_SL_DISTANCE_PCT = 0.005 (0.5%)
 # ============================================================================
 import asyncio
 import time
@@ -25,15 +29,17 @@ LARGE_ORDER_USD = 150000
 TOP_N_ORDERS_TO_ANALYZE = 20
 SCAN_INTERVAL = 5
 SL_BUFFER_PERCENT = 0.0005
-MIN_SL_DISTANCE_PCT = 0.0008
+MIN_SL_DISTANCE_PCT = 0.005  # Увеличено до 0.5%
 
 # --- Параметры стратегии ---
-MIN_IMBALANCE_RATIO = 1.5
+MIN_IMBALANCE_RATIO = 1.2  # Снижено для частоты
 AGGRESSION_TIMEFRAME_SEC = 30
 AGGRESSION_RATIO = 1.5
-TP_ATR_MULTIPLIER = 1.5
+TP_ATR_MULTIPLIER = 2.0  # Увеличено для захвата движения
 DOMINANCE_LOST_MAX_COUNTER = 3
 DI_DIFF_THRESHOLD = 5.0
+ATR_MIN = 1.0  # Новый: Мин ATR для сигнала
+AGGRESSION_ATR_MIN = 1.5  # Новый: Optional aggression при ATR > этого
 
 # --- Параметры режимного фильтра ---
 ADX_PERIOD = 14
@@ -72,17 +78,17 @@ def calculate_indicators(ohlcv):
     indicators = df[['ADX_14', 'DMP_14', 'DMN_14', 'ATRr_14']].iloc[-1]
     return indicators['ADX_14'], indicators['DMP_14'], indicators['DMN_14'], indicators['ATRr_14']
 
-# === Логика сканирования (ИЗМЕНЕНА: Debug log) =============================================
+# === Логика сканирования (ИЗМЕНЕНА: Корректировки) =============================================
 async def scan_for_new_opportunities(exchange, app: Application, broadcast_func, adx, pdi, mdi, atr):
     bot_data = app.bot_data
     status_code, status_message = None, None
     extended_message = "" 
-    reason_prop = ""  # Для debug log
-    side = ""  # Для debug
-    trend_dir = ""  # Для debug
-    di_diff = 0  # Для debug
-    aggression_side = ""  # Для debug
-    imbalance_ratio = 0  # Для debug
+    reason_prop = ""
+    side = ""
+    trend_dir = ""
+    di_diff = 0
+    aggression_side = ""
+    imbalance_ratio = 0
     try:
         if adx is None:
             status_code, status_message = "WAIT_ADX", "Ожидание данных для расчета ADX..."
@@ -126,41 +132,47 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func,
                         sell_volume = sum(t['cost'] for t in trades if t['side'] == 'sell')
                         aggression_side = "LONG" if buy_volume > sell_volume * AGGRESSION_RATIO else "SHORT" if sell_volume > buy_volume * AGGRESSION_RATIO else None
                         extended_message += f"Aggression side: {aggression_side}. "
-                        if aggression_side != side:
+                        if aggression_side == side or (atr > AGGRESSION_ATR_MIN and aggression_side is None):  # Новый: Optional при high ATR
+                            pass
+                        else:
                             extended_message += "Пропущен по aggression."
                             reason_prop = "AGGRESSION_MISMATCH"
+                            return
+                        entry_price = trades[-1]['price']
+                        support_wall, resistance_wall = large_bids[0], large_asks[0]
+                        sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT) if side == "LONG" else resistance_wall['price'] * (1 + SL_BUFFER_PERCENT)
+                        
+                        if abs(entry_price - sl_price) / entry_price < MIN_SL_DISTANCE_PCT:
+                            extended_message += f"SL distance: {abs(entry_price - sl_price) / entry_price:.4f} < {MIN_SL_DISTANCE_PCT}. Пропущен по SL."
+                            reason_prop = "SMALL_SL"
                         else:
-                            entry_price = trades[-1]['price']
-                            support_wall, resistance_wall = large_bids[0], large_asks[0]
-                            sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT) if side == "LONG" else resistance_wall['price'] * (1 + SL_BUFFER_PERCENT)
+                            if atr < ATR_MIN:
+                                extended_message += f"ATR {atr:.2f} < {ATR_MIN}. Пропущен по ATR."
+                                reason_prop = "LOW_ATR"
+                                return
+                            tp_price = entry_price + atr * TP_ATR_MULTIPLIER if side == "LONG" else entry_price - atr * TP_ATR_MULTIPLIER
                             
-                            if abs(entry_price - sl_price) / entry_price < MIN_SL_DISTANCE_PCT:
-                                extended_message += f"SL distance: {abs(entry_price - sl_price) / entry_price:.4f} < {MIN_SL_DISTANCE_PCT}. Пропущен по SL."
-                                reason_prop = "SMALL_SL"
-                            else:
-                                tp_price = entry_price + atr * TP_ATR_MULTIPLIER if side == "LONG" else entry_price - atr * TP_ATR_MULTIPLIER
-                                
-                                idea = f"ADX {adx:.1f} (Dir: {trend_dir}). Дисбаланс {imbalance_ratio:.1f}x + Агрессия {side}"
-                                decision = {"Signal_ID": f"signal_{int(time.time() * 1000)}", 
-                                            "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-                                            "Pair": PAIR_TO_SCAN, "Algorithm_Type": "Directional ADX Imbalance", 
-                                            "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": sl_price, 
-                                            "TP_Price": tp_price, "side": side, "Deposit": bot_data.get('deposit', 50), 
-                                            "Leverage": bot_data.get('leverage', 100), "dominance_lost_counter": 0,
-                                            "ADX": adx, "PDI": pdi, "MDI": mdi, 
-                                            "Imbalance_Ratio": imbalance_ratio, "Aggression_Side": aggression_side, 
-                                            "Trigger_Order_USD": max(top_bids_usd, top_asks_usd),
-                                            "ATR": atr
-                                            }
-                                msg = f"🔥 <b>ВХОД В СДЕЛКУ ({side})</b>\n\n<b>Тип:</b> <code>{idea}</code>\n<b>Вход:</b> <code>{entry_price:.2f}</code> | <b>SL:</b> <code>{sl_price:.2f}</code> | <b>TP:</b> <code>{tp_price:.2f}</code>"
-                                await broadcast_func(app, msg)
-                                await log_trade_to_sheet(decision)
-                                bot_data['monitored_signals'].append(decision)
-                                save_state(app)
-                                extended_message += "Сигнал найден и отправлен!"
-                                reason_prop = "SIGNAL_FOUND"
+                            idea = f"ADX {adx:.1f} (Dir: {trend_dir}). Дисбаланс {imbalance_ratio:.1f}x + Агрессия {side}"
+                            decision = {"Signal_ID": f"signal_{int(time.time() * 1000)}", 
+                                        "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+                                        "Pair": PAIR_TO_SCAN, "Algorithm_Type": "Directional ADX Imbalance", 
+                                        "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": sl_price, 
+                                        "TP_Price": tp_price, "side": side, "Deposit": bot_data.get('deposit', 50), 
+                                        "Leverage": bot_data.get('leverage', 100), "dominance_lost_counter": 0,
+                                        "ADX": adx, "PDI": pdi, "MDI": mdi, 
+                                        "Imbalance_Ratio": imbalance_ratio, "Aggression_Side": aggression_side, 
+                                        "Trigger_Order_USD": max(top_bids_usd, top_asks_usd),
+                                        "ATR": atr
+                                        }
+                            msg = f"🔥 <b>ВХОД В СДЕЛКУ ({side})</b>\n\n<b>Тип:</b> <code>{idea}</code>\n<b>Вход:</b> <code>{entry_price:.2f}</code> | <b>SL:</b> <code>{sl_price:.2f}</code> | <b>TP:</b> <code>{tp_price:.2f}</code>"
+                            await broadcast_func(app, msg)
+                            await log_trade_to_sheet(decision)
+                            bot_data['monitored_signals'].append(decision)
+                            save_state(app)
+                            extended_message += "Сигнал найден и отправлен!"
+                            reason_prop = "SIGNAL_FOUND"
 
-        # Новый: Log в debug sheet если debug_on
+        # Log в debug sheet если debug_on
         if bot_data.get('debug_mode_on', False):
             debug_data = {
                 "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
@@ -266,3 +278,4 @@ async def scanner_main_loop(app: Application, broadcast_func):
         if exchange:
             await exchange.close()
         log.info("Main Engine loop stopped.")
+```
