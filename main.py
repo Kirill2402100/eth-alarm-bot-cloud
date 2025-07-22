@@ -1,7 +1,9 @@
+# main.py
 # ============================================================================
-# v38.0 - УПРОЩЕННАЯ СТРАТЕГИЯ: ОБНОВЛЕНИЕ HEADERS И DEBUG_HEADERS
-# - Убраны столбцы Imbalance_Ratio, Aggression_Side, Trigger_Order_USD
-# - DEBUG_HEADERS адаптированы: убраны Imbalance_Ratio, Trend_Dir, Aggression_Side
+# v39.0 - НОВАЯ СТРАТЕГИЯ: ОБНОВЛЕНИЕ HEADERS И DEBUG_HEADERS ДЛЯ RSI + STOCH
+# - Убраны столбцы ADX, PDI, MDI, ATR
+# - Добавлены RSI, Stoch_K, Stoch_D
+# - DEBUG_HEADERS адаптированы: RSI, Stoch_K, Stoch_D, Side, Reason_Prop
 # ============================================================================
 
 import os
@@ -20,7 +22,7 @@ from scanner_engine import scanner_main_loop
 from state_utils import load_state, save_state
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "38.0"
+BOT_VERSION        = "39.0"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -36,13 +38,13 @@ DEBUG_SHEET_NAME = f"Debug_Log_v{BOT_VERSION}"
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Algorithm_Type", "Strategy_Idea",
     "Entry_Price", "SL_Price", "TP_Price", "side", "Deposit", "Leverage",
-    "ADX", "PDI", "MDI", "ATR",
+    "RSI", "Stoch_K", "Stoch_D",
     "Status", "Exit_Time_UTC", "Exit_Price", "PNL_USD", "PNL_Percent",
-    "Exit_Reason", "Time_In_Trade"
+    "Exit_Reason", "Time_In_Trade", "Intermediate_Triggered"
 ]
 DEBUG_HEADERS = [
-    "Timestamp_UTC", "ADX", "PDI", "MDI", "ATR",
-    "Side", "DI_Diff", "Reason_Prop"
+    "Timestamp_UTC", "RSI", "Stoch_K", "Stoch_D",
+    "Side", "Reason_Prop"
 ]
 
 def setup_sheets():
