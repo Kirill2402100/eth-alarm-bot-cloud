@@ -1,4 +1,4 @@
-# scanner_engine.py 
+# scanner_engine.py
 # ============================================================================
 # v38.0 - УПРОЩЕННАЯ СТРАТЕГИЯ НА ОСНОВЕ PDI, MDI И ADX
 # - Вход: |PDI - MDI| > DI_DIFF_THRESHOLD, ADX > ADX_TREND_THRESHOLD, ATR > ATR_MIN
@@ -60,7 +60,7 @@ def calculate_indicators(ohlcv):
     )
 
 # === Логика сканирования =============================================
-async def scan_for_new_opportunities(exchange, app: ccxt.Exchange, broadcast_func, ohlcv):
+async def scan_for_new_opportunities(exchange, app: Application, broadcast_func, ohlcv):
     bot_data = app.bot_data
     status_code, status_message = None, None
     extended_message = "" 
@@ -108,7 +108,7 @@ async def scan_for_new_opportunities(exchange, app: ccxt.Exchange, broadcast_fun
                 return
             
             # Получение entry_price (из последней цены)
-            trades = await exchange.fetch_trades(PAIR_TO_SCAN, limit=1', params={'type': 'swap'})
+            trades = await exchange.fetch_trades(PAIR_TO_SCAN, limit=1, params={'type': 'swap'})
             if not trades:
                 return
             entry_price = trades[0]['price']
