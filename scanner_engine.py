@@ -1,4 +1,4 @@
-# scanner_engine.py
+# scanner_engine.py 
 # ============================================================================
 # v38.0 - УПРОЩЕННАЯ СТРАТЕГИЯ НА ОСНОВЕ PDI, MDI И ADX
 # - Вход: |PDI - MDI| > DI_DIFF_THRESHOLD, ADX > ADX_TREND_THRESHOLD, ATR > ATR_MIN
