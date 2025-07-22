@@ -1,6 +1,7 @@
 # scanner_engine.py
 # ============================================================================
-# v37.6 - ФИКС SL DISTANCE ДЛЯ VOLATILE
+# v37.7 - DEBUG LOG SHEET
+# - Логируем потенциальные в debug_mode через log_debug_data.
 # ============================================================================
 import asyncio
 import time
@@ -12,7 +13,7 @@ import pandas_ta as ta
 import ccxt.async_support as ccxt
 from telegram.ext import Application
 
-from trade_executor import log_trade_to_sheet, update_trade_in_sheet
+from trade_executor import log_trade_to_sheet, update_trade_in_sheet, log_debug_data
 from state_utils import save_state
 
 log = logging.getLogger("bot")
@@ -24,7 +25,7 @@ LARGE_ORDER_USD = 150000
 TOP_N_ORDERS_TO_ANALYZE = 20
 SCAN_INTERVAL = 5
 SL_BUFFER_PERCENT = 0.0005
-MIN_SL_DISTANCE_PCT = 0.002  # Увеличено до 0.2% для SOL
+MIN_SL_DISTANCE_PCT = 0.0008
 
 # --- Параметры стратегии ---
 MIN_IMBALANCE_RATIO = 1.5
@@ -71,20 +72,29 @@ def calculate_indicators(ohlcv):
     indicators = df[['ADX_14', 'DMP_14', 'DMN_14', 'ATRr_14']].iloc[-1]
     return indicators['ADX_14'], indicators['DMP_14'], indicators['DMN_14'], indicators['ATRr_14']
 
-# === Логика сканирования (без изменений) =============================================
+# === Логика сканирования (ИЗМЕНЕНА: Debug log) =============================================
 async def scan_for_new_opportunities(exchange, app: Application, broadcast_func, adx, pdi, mdi, atr):
     bot_data = app.bot_data
     status_code, status_message = None, None
     extended_message = "" 
+    reason_prop = ""  # Для debug log
+    side = ""  # Для debug
+    trend_dir = ""  # Для debug
+    di_diff = 0  # Для debug
+    aggression_side = ""  # Для debug
+    imbalance_ratio = 0  # Для debug
     try:
         if adx is None:
             status_code, status_message = "WAIT_ADX", "Ожидание данных для расчета ADX..."
+            reason_prop = "WAIT_ADX"
         else:
             extended_message = f"PDI: {pdi:.1f}, MDI: {mdi:.1f}. ATR: {atr:.2f}. "
             if adx < ADX_FLAT_THRESHOLD:
                 status_code, status_message = "MARKET_IS_FLAT", f"ADX ({adx:.1f}) < {ADX_FLAT_THRESHOLD}. Рынок во флэте, торговля на паузе."
+                reason_prop = "FLAT"
             elif adx < ADX_TREND_THRESHOLD:
                 status_code, status_message = "MARKET_IS_WEAK", f"ADX ({adx:.1f}) в 'серой зоне' ({ADX_FLAT_THRESHOLD}-{ADX_TREND_THRESHOLD}). Жду сильного тренда."
+                reason_prop = "WEAK"
             else:
                 status_code, status_message = "SCANNING_IN_TREND", f"ADX ({adx:.1f}) > {ADX_TREND_THRESHOLD}. Поиск сигнала в тренде..."
                 order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=100, params={'type': 'swap'})
@@ -95,16 +105,18 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func,
 
                 if imbalance_ratio < min_imbalance:
                     extended_message += "Пропущен по imbalance."
+                    reason_prop = "LOW_IMBALANCE"
                 else:
                     dominant_side_is_bids = top_bids_usd > top_asks_usd
-                    side_to_trade = "LONG" if dominant_side_is_bids else "SHORT"
+                    side = "LONG" if dominant_side_is_bids else "SHORT"
                     trend_dir = "LONG" if pdi > mdi else "SHORT" if mdi > pdi else None
                     di_diff = abs(pdi - mdi)
-                    extended_message += f"Side: {side_to_trade}, Trend dir: {trend_dir}, DI diff: {di_diff:.1f}. "
-                    if trend_dir is None or (di_diff < DI_DIFF_THRESHOLD) or side_to_trade == trend_dir:
+                    extended_message += f"Side: {side}, Trend dir: {trend_dir}, DI diff: {di_diff:.1f}. "
+                    if trend_dir is None or (di_diff < DI_DIFF_THRESHOLD) or side == trend_dir:
                         pass
                     else:
                         extended_message += "Пропущен по тренду (strong diff)."
+                        reason_prop = "TREND_MISMATCH"
                         return
                     now_ms, since = exchange.milliseconds(), exchange.milliseconds() - AGGRESSION_TIMEFRAME_SEC * 1000
                     trades = await exchange.fetch_trades(PAIR_TO_SCAN, since=since, limit=100, params={'type': 'swap', 'until': now_ms})
@@ -114,36 +126,48 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func,
                         sell_volume = sum(t['cost'] for t in trades if t['side'] == 'sell')
                         aggression_side = "LONG" if buy_volume > sell_volume * AGGRESSION_RATIO else "SHORT" if sell_volume > buy_volume * AGGRESSION_RATIO else None
                         extended_message += f"Aggression side: {aggression_side}. "
-                        if aggression_side != side_to_trade:
+                        if aggression_side != side:
                             extended_message += "Пропущен по aggression."
+                            reason_prop = "AGGRESSION_MISMATCH"
                         else:
                             entry_price = trades[-1]['price']
                             support_wall, resistance_wall = large_bids[0], large_asks[0]
-                            sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT) if side_to_trade == "LONG" else resistance_wall['price'] * (1 + SL_BUFFER_PERCENT)
+                            sl_price = support_wall['price'] * (1 - SL_BUFFER_PERCENT) if side == "LONG" else resistance_wall['price'] * (1 + SL_BUFFER_PERCENT)
                             
                             if abs(entry_price - sl_price) / entry_price < MIN_SL_DISTANCE_PCT:
                                 extended_message += f"SL distance: {abs(entry_price - sl_price) / entry_price:.4f} < {MIN_SL_DISTANCE_PCT}. Пропущен по SL."
+                                reason_prop = "SMALL_SL"
                             else:
-                                tp_price = entry_price + atr * TP_ATR_MULTIPLIER if side_to_trade == "LONG" else entry_price - atr * TP_ATR_MULTIPLIER
+                                tp_price = entry_price + atr * TP_ATR_MULTIPLIER if side == "LONG" else entry_price - atr * TP_ATR_MULTIPLIER
                                 
-                                idea = f"ADX {adx:.1f} (Dir: {trend_dir}). Дисбаланс {imbalance_ratio:.1f}x + Агрессия {side_to_trade}"
+                                idea = f"ADX {adx:.1f} (Dir: {trend_dir}). Дисбаланс {imbalance_ratio:.1f}x + Агрессия {side}"
                                 decision = {"Signal_ID": f"signal_{int(time.time() * 1000)}", 
                                             "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
                                             "Pair": PAIR_TO_SCAN, "Algorithm_Type": "Directional ADX Imbalance", 
                                             "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": sl_price, 
-                                            "TP_Price": tp_price, "side": side_to_trade, "Deposit": bot_data.get('deposit', 50), 
+                                            "TP_Price": tp_price, "side": side, "Deposit": bot_data.get('deposit', 50), 
                                             "Leverage": bot_data.get('leverage', 100), "dominance_lost_counter": 0,
                                             "ADX": adx, "PDI": pdi, "MDI": mdi, 
                                             "Imbalance_Ratio": imbalance_ratio, "Aggression_Side": aggression_side, 
                                             "Trigger_Order_USD": max(top_bids_usd, top_asks_usd),
                                             "ATR": atr
                                             }
-                                msg = f"🔥 <b>ВХОД В СДЕЛКУ ({side_to_trade})</b>\n\n<b>Тип:</b> <code>{idea}</code>\n<b>Вход:</b> <code>{entry_price:.2f}</code> | <b>SL:</b> <code>{sl_price:.2f}</code> | <b>TP:</b> <code>{tp_price:.2f}</code>"
+                                msg = f"🔥 <b>ВХОД В СДЕЛКУ ({side})</b>\n\n<b>Тип:</b> <code>{idea}</code>\n<b>Вход:</b> <code>{entry_price:.2f}</code> | <b>SL:</b> <code>{sl_price:.2f}</code> | <b>TP:</b> <code>{tp_price:.2f}</code>"
                                 await broadcast_func(app, msg)
                                 await log_trade_to_sheet(decision)
                                 bot_data['monitored_signals'].append(decision)
                                 save_state(app)
                                 extended_message += "Сигнал найден и отправлен!"
+                                reason_prop = "SIGNAL_FOUND"
+
+        # Новый: Log в debug sheet если debug_on
+        if bot_data.get('debug_mode_on', False):
+            debug_data = {
+                "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+                "ADX": adx, "PDI": pdi, "MDI": mdi, "ATR": atr, "Imbalance_Ratio": imbalance_ratio,
+                "Side": side, "Trend_Dir": trend_dir, "DI_Diff": di_diff, "Aggression_Side": aggression_side, "Reason_Prop": reason_prop
+            }
+            await log_debug_data(debug_data)
 
     except Exception as e:
         status_code, status_message = "SCANNER_ERROR", f"КРИТИЧЕСКАЯ ОШИБКА: {e}"
@@ -159,6 +183,51 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func,
         if status_code and status_code != last_code:
             bot_data['last_debug_code'] = status_code
             await broadcast_func(app, f"<code>{status_message}</code>")
+
+# === Логика мониторинга (без изменений) ==============================
+async def monitor_active_trades(exchange, app: Application, broadcast_func):
+    bot_data = app.bot_data
+    if not bot_data.get('monitored_signals'): return
+    signal = bot_data['monitored_signals'][0]
+    pair, entry_price, sl_price, tp_price, side = (signal['Pair'], signal['Entry_Price'], signal['SL_Price'], signal.get('TP_Price'), signal['side'])
+    try:
+        order_book = await exchange.fetch_order_book(pair, limit=100, params={'type': 'swap'})
+        if not (order_book.get('bids') and order_book['bids'][0] and order_book.get('asks') and order_book['asks'][0]): return
+        best_bid, best_ask = order_book['bids'][0][0], order_book['asks'][0][0]
+        last_price = (best_bid + best_ask) / 2
+        _, _, _, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
+        exit_status, exit_price, reason = None, None, None
+        
+        if (side == 'LONG' and last_price >= tp_price) or (side == 'SHORT' and last_price <= tp_price):
+            exit_status, exit_price, reason = "TP_HIT", tp_price if side == 'LONG' else tp_price, "Take Profit достигнут"
+        
+        if not exit_status:
+            if (side == 'LONG' and last_price <= sl_price) or (side == 'SHORT' and last_price >= sl_price):
+                exit_status, exit_price, reason = "SL_HIT", sl_price, "Аварийный стоп-лосс"
+        
+        if not exit_status:
+            dominance_is_lost = (side == 'LONG' and top_bids_usd <= top_asks_usd) or (side == 'SHORT' and top_asks_usd <= top_bids_usd)
+            if dominance_is_lost:
+                signal['dominance_lost_counter'] = signal.get('dominance_lost_counter', 0) + 1
+                if signal['dominance_lost_counter'] >= DOMINANCE_LOST_MAX_COUNTER:
+                    reason_text = "Потеря доминации покупателей" if side == 'LONG' else "Потеря доминации продавцов"
+                    exit_status, exit_price, reason = "DOMINANCE_LOST", last_price, f"{reason_text} (подтверждено)"
+            else:
+                signal['dominance_lost_counter'] = 0
+        
+        if exit_status:
+            pnl_percent_raw = ((exit_price - entry_price) / entry_price) * (-1 if side == 'SHORT' else 1)
+            pnl_usd = signal['Deposit'] * signal['Leverage'] * pnl_percent_raw
+            pnl_percent_display = pnl_percent_raw * 100 * signal['Leverage']
+            await update_trade_in_sheet(signal, exit_status, exit_price, pnl_usd, pnl_percent_display, reason=reason)
+            emoji = "✅" if pnl_usd > 0 else "❌"
+            msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({exit_status})</b>\n\n<b>Причина:</b> {reason}\n<b>Результат: ${pnl_usd:+.2f} ({pnl_percent_display:+.2f}%)</b>")
+            await broadcast_func(app, msg)
+            bot_data['monitored_signals'] = []
+            save_state(app)
+    except Exception as e:
+        log.error(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
+        await broadcast_func(app, f"⚠️ <b>Критическая ошибка мониторинга!</b>\n<code>Ошибка: {e}</code>")
 
 # === Главный цикл (без изменений) ============================================
 async def scanner_main_loop(app: Application, broadcast_func):
