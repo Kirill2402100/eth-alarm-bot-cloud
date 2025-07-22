@@ -1,7 +1,8 @@
 # scanner_engine.py
 # ============================================================================
-# v37.4 - FLEXIBLE TREND FILTER
-# - Добавлен DI_DIFF_THRESHOLD=5.0: Если разница |PDI-MDI|<5, тренд нейтральный, сигнал разрешён.
+# v37.5 - SOL/USDT + ПРИСТРЕЛОЧНЫЕ НАСТРОЙКИ
+# - PAIR_TO_SCAN = 'SOL/USDT' (волатильный).
+# - Убедились в futures (swap).
 # ============================================================================
 import asyncio
 import time
@@ -19,7 +20,7 @@ from state_utils import save_state
 log = logging.getLogger("bot")
 
 # === Конфигурация сканера ==================================================
-PAIR_TO_SCAN = 'BTC/USDT'
+PAIR_TO_SCAN = 'SOL/USDT'  # Смена на SOL/USDT
 TIMEFRAME = '5m'  # Таймфрейм для анализа тренда
 LARGE_ORDER_USD = 150000
 TOP_N_ORDERS_TO_ANALYZE = 20
@@ -27,13 +28,13 @@ SCAN_INTERVAL = 5
 SL_BUFFER_PERCENT = 0.0005
 MIN_SL_DISTANCE_PCT = 0.0008
 
-# --- Параметры стратегии ---
-MIN_IMBALANCE_RATIO = 1.5  # Уменьшено по вашему запросу
+# --- Параметры стратегии (пристрелочные) ---
+MIN_IMBALANCE_RATIO = 1.5  # Уменьшено для теста
 AGGRESSION_TIMEFRAME_SEC = 30
-AGGRESSION_RATIO = 1.2
+AGGRESSION_RATIO = 1.5
 TP_ATR_MULTIPLIER = 1.5
 DOMINANCE_LOST_MAX_COUNTER = 3
-DI_DIFF_THRESHOLD = 5.0  # Новый: Порог для слабого тренда (нейтральный если |PDI-MDI|<5)
+DI_DIFF_THRESHOLD = 5.0
 
 # --- Параметры режимного фильтра ---
 ADX_PERIOD = 14
@@ -72,7 +73,7 @@ def calculate_indicators(ohlcv):
     indicators = df[['ADX_14', 'DMP_14', 'DMN_14', 'ATRr_14']].iloc[-1]
     return indicators['ADX_14'], indicators['DMP_14'], indicators['DMN_14'], indicators['ATRr_14']
 
-# === Логика сканирования (ИЗМЕНЕНА: Гибкий тренд фильтр) =============================================
+# === Логика сканирования (без изменений, но с SOL) =============================================
 async def scan_for_new_opportunities(exchange, app: Application, broadcast_func, adx, pdi, mdi, atr):
     bot_data = app.bot_data
     status_code, status_message = None, None
@@ -102,8 +103,7 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func,
                     trend_dir = "LONG" if pdi > mdi else "SHORT" if mdi > pdi else None
                     di_diff = abs(pdi - mdi)
                     extended_message += f"Side: {side_to_trade}, Trend dir: {trend_dir}, DI diff: {di_diff:.1f}. "
-                    if trend_dir is None or (di_diff < DI_DIFF_THRESHOLD) or side_to_trade == trend_dir:  # Новый: Разрешить если дифф мала или совпадает
-                        # Разрешён
+                    if trend_dir is None or (di_diff < DI_DIFF_THRESHOLD) or side_to_trade == trend_dir:
                         pass
                     else:
                         extended_message += "Пропущен по тренду (strong diff)."
@@ -223,7 +223,7 @@ async def scanner_main_loop(app: Application, broadcast_func):
         while app.bot_data.get("bot_on", False):
             try:
                 if time.time() - last_adx_update_time > 60:
-                    ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=50)
+                    ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=50, params={'type': 'swap'})  # Убедились в swap для OHLCV
                     adx, pdi, mdi, atr = calculate_indicators(ohlcv)
                     last_adx_update_time = time.time()
                 
