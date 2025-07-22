@@ -1,6 +1,6 @@
 # main.py
 # ============================================================================
-# v37.5 - SOL/USDT + ПРИСТРЕЛОЧНЫЕ НАСТРОЙКИ
+# v37.6 - ФИКС ATR ЛОГИ И SL DISTANCE
 # ============================================================================
 
 import os
@@ -19,7 +19,7 @@ from scanner_engine import scanner_main_loop
 from state_utils import load_state, save_state
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "37.5"
+BOT_VERSION        = "37.6"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -35,7 +35,7 @@ HEADERS = [
     "Entry_Price", "SL_Price", "TP_Price", "side", "Deposit", "Leverage",
     "ADX", "PDI", "MDI", "Imbalance_Ratio", "Aggression_Side",
     "Status", "Exit_Time_UTC", "Exit_Price", "PNL_USD", "PNL_Percent",
-    "Trigger_Order_USD", "Exit_Reason", "Time_In_Trade", "ATR"  # ATR добавлен
+    "Trigger_Order_USD", "Exit_Reason", "Time_In_Trade", "ATR"  # ATR в конце
 ]
 
 def setup_sheets():
@@ -131,7 +131,7 @@ async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except (IndexError, ValueError):
         await update.message.reply_text("⚠️ /leverage <число>", parse_mode=constants.ParseMode.HTML)
 
-async def cmd_run(update: Update, ctx:ContextTypes.DEFAULT_TYPE):
+async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     app = ctx.application
     if hasattr(app, '_main_loop_task') and not app._main_loop_task.done():
         await update.message.reply_text("ℹ️ Основной цикл уже запущен.")
