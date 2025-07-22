@@ -1,6 +1,7 @@
 # main.py
 # ============================================================================
-# v37.6 - ФИКС ATR ЛОГИ И SL DISTANCE
+# v37.7 - DEBUG LOG SHEET
+# - Новый лист "Debug_Log_v37.7" для потенциальных сигналов в debug_mode.
 # ============================================================================
 
 import os
@@ -19,7 +20,7 @@ from scanner_engine import scanner_main_loop
 from state_utils import load_state, save_state
 
 # === Конфигурация =========================================================
-BOT_VERSION        = "37.6"
+BOT_VERSION        = "37.7"
 BOT_TOKEN          = os.getenv("BOT_TOKEN")
 CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID           = os.getenv("SHEET_ID")
@@ -29,17 +30,23 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # === Google-Sheets =========================================================
 TRADE_LOG_WS = None
+DEBUG_LOG_WS = None  # Новый для debug
 SHEET_NAME   = f"Trading_Log_v{BOT_VERSION}"
+DEBUG_SHEET_NAME = f"Debug_Log_v{BOT_VERSION}"  # Новый лист
 HEADERS = [
     "Signal_ID", "Timestamp_UTC", "Pair", "Algorithm_Type", "Strategy_Idea",
     "Entry_Price", "SL_Price", "TP_Price", "side", "Deposit", "Leverage",
     "ADX", "PDI", "MDI", "Imbalance_Ratio", "Aggression_Side",
     "Status", "Exit_Time_UTC", "Exit_Price", "PNL_USD", "PNL_Percent",
-    "Trigger_Order_USD", "Exit_Reason", "Time_In_Trade", "ATR"  # ATR в конце
+    "Trigger_Order_USD", "Exit_Reason", "Time_In_Trade", "ATR"
+]
+DEBUG_HEADERS = [  # Для потенциальных
+    "Timestamp_UTC", "ADX", "PDI", "MDI", "ATR", "Imbalance_Ratio",
+    "Side", "Trend_Dir", "DI_Diff", "Aggression_Side", "Reason_Prop"
 ]
 
 def setup_sheets():
-    global TRADE_LOG_WS
+    global TRADE_LOG_WS, DEBUG_LOG_WS
     if not SHEET_ID:
         log.warning("SHEET_ID не задан. Логирование в Google Sheets отключено.")
         return
@@ -58,9 +65,21 @@ def setup_sheets():
             TRADE_LOG_WS.format(f"A1:{chr(ord('A')+len(HEADERS)-1)}1", {"textFormat":{"bold":True}})
         log.info("Google-Sheets ready. Logging to '%s'.", SHEET_NAME)
         trade_executor.TRADE_LOG_WS = TRADE_LOG_WS
+        
+        # Новый: Debug лист
+        try:
+            DEBUG_LOG_WS = ss.worksheet(DEBUG_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            log.info(f"Лист '{DEBUG_SHEET_NAME}' не найден. Создаю новый.")
+            DEBUG_LOG_WS = ss.add_worksheet(title=DEBUG_SHEET_NAME, rows="10000", cols=len(DEBUG_HEADERS))
+            DEBUG_LOG_WS.update(range_name="A1", values=[DEBUG_HEADERS])
+            DEBUG_LOG_WS.format(f"A1:{chr(ord('A')+len(DEBUG_HEADERS)-1)}1", {"textFormat":{"bold":True}})
+        log.info("Debug-Sheets ready. Logging to '%s'.", DEBUG_SHEET_NAME)
+        trade_executor.DEBUG_LOG_WS = DEBUG_LOG_WS  # Добавим в executor для удобства
     except Exception as e:
         log.error("Sheets init failed: %s", e)
         TRADE_LOG_WS, trade_executor.TRADE_LOG_WS = None, None
+        DEBUG_LOG_WS, trade_executor.DEBUG_LOG_WS = None, None
 
 # === Общие функции =========================================================
 async def broadcast(app: Application, txt:str):
