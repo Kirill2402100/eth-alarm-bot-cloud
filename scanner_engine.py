@@ -1,8 +1,6 @@
 # scanner_engine.py
 # ============================================================================
-# v37.5 - SOL/USDT + ПРИСТРЕЛОЧНЫЕ НАСТРОЙКИ
-# - PAIR_TO_SCAN = 'SOL/USDT' (волатильный).
-# - Убедились в futures (swap).
+# v37.6 - ФИКС SL DISTANCE ДЛЯ VOLATILE
 # ============================================================================
 import asyncio
 import time
@@ -20,16 +18,16 @@ from state_utils import save_state
 log = logging.getLogger("bot")
 
 # === Конфигурация сканера ==================================================
-PAIR_TO_SCAN = 'SOL/USDT'  # Смена на SOL/USDT
-TIMEFRAME = '5m'  # Таймфрейм для анализа тренда
+PAIR_TO_SCAN = 'SOL/USDT'
+TIMEFRAME = '5m'
 LARGE_ORDER_USD = 150000
 TOP_N_ORDERS_TO_ANALYZE = 20
 SCAN_INTERVAL = 5
 SL_BUFFER_PERCENT = 0.0005
-MIN_SL_DISTANCE_PCT = 0.0008
+MIN_SL_DISTANCE_PCT = 0.002  # Увеличено до 0.2% для SOL
 
-# --- Параметры стратегии (пристрелочные) ---
-MIN_IMBALANCE_RATIO = 1.5  # Уменьшено для теста
+# --- Параметры стратегии ---
+MIN_IMBALANCE_RATIO = 1.5
 AGGRESSION_TIMEFRAME_SEC = 30
 AGGRESSION_RATIO = 1.5
 TP_ATR_MULTIPLIER = 1.5
@@ -73,7 +71,7 @@ def calculate_indicators(ohlcv):
     indicators = df[['ADX_14', 'DMP_14', 'DMN_14', 'ATRr_14']].iloc[-1]
     return indicators['ADX_14'], indicators['DMP_14'], indicators['DMN_14'], indicators['ATRr_14']
 
-# === Логика сканирования (без изменений, но с SOL) =============================================
+# === Логика сканирования (без изменений) =============================================
 async def scan_for_new_opportunities(exchange, app: Application, broadcast_func, adx, pdi, mdi, atr):
     bot_data = app.bot_data
     status_code, status_message = None, None
@@ -162,51 +160,6 @@ async def scan_for_new_opportunities(exchange, app: Application, broadcast_func,
             bot_data['last_debug_code'] = status_code
             await broadcast_func(app, f"<code>{status_message}</code>")
 
-# === Логика мониторинга (без изменений) ==============================
-async def monitor_active_trades(exchange, app: Application, broadcast_func):
-    bot_data = app.bot_data
-    if not bot_data.get('monitored_signals'): return
-    signal = bot_data['monitored_signals'][0]
-    pair, entry_price, sl_price, tp_price, side = (signal['Pair'], signal['Entry_Price'], signal['SL_Price'], signal.get('TP_Price'), signal['side'])
-    try:
-        order_book = await exchange.fetch_order_book(pair, limit=100, params={'type': 'swap'})
-        if not (order_book.get('bids') and order_book['bids'][0] and order_book.get('asks') and order_book['asks'][0]): return
-        best_bid, best_ask = order_book['bids'][0][0], order_book['asks'][0][0]
-        last_price = (best_bid + best_ask) / 2
-        _, _, _, top_bids_usd, top_asks_usd = get_imbalance_and_walls(order_book)
-        exit_status, exit_price, reason = None, None, None
-        
-        if (side == 'LONG' and last_price >= tp_price) or (side == 'SHORT' and last_price <= tp_price):
-            exit_status, exit_price, reason = "TP_HIT", tp_price if side == 'LONG' else tp_price, "Take Profit достигнут"
-        
-        if not exit_status:
-            if (side == 'LONG' and last_price <= sl_price) or (side == 'SHORT' and last_price >= sl_price):
-                exit_status, exit_price, reason = "SL_HIT", sl_price, "Аварийный стоп-лосс"
-        
-        if not exit_status:
-            dominance_is_lost = (side == 'LONG' and top_bids_usd <= top_asks_usd) or (side == 'SHORT' and top_asks_usd <= top_bids_usd)
-            if dominance_is_lost:
-                signal['dominance_lost_counter'] = signal.get('dominance_lost_counter', 0) + 1
-                if signal['dominance_lost_counter'] >= DOMINANCE_LOST_MAX_COUNTER:
-                    reason_text = "Потеря доминации покупателей" if side == 'LONG' else "Потеря доминации продавцов"
-                    exit_status, exit_price, reason = "DOMINANCE_LOST", last_price, f"{reason_text} (подтверждено)"
-            else:
-                signal['dominance_lost_counter'] = 0
-        
-        if exit_status:
-            pnl_percent_raw = ((exit_price - entry_price) / entry_price) * (-1 if side == 'SHORT' else 1)
-            pnl_usd = signal['Deposit'] * signal['Leverage'] * pnl_percent_raw
-            pnl_percent_display = pnl_percent_raw * 100 * signal['Leverage']
-            await update_trade_in_sheet(signal, exit_status, exit_price, pnl_usd, pnl_percent_display, reason=reason)
-            emoji = "✅" if pnl_usd > 0 else "❌"
-            msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({exit_status})</b>\n\n<b>Причина:</b> {reason}\n<b>Результат: ${pnl_usd:+.2f} ({pnl_percent_display:+.2f}%)</b>")
-            await broadcast_func(app, msg)
-            bot_data['monitored_signals'] = []
-            save_state(app)
-    except Exception as e:
-        log.error(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
-        await broadcast_func(app, f"⚠️ <b>Критическая ошибка мониторинга!</b>\n<code>Ошибка: {e}</code>")
-
 # === Главный цикл (без изменений) ============================================
 async def scanner_main_loop(app: Application, broadcast_func):
     bot_version = getattr(app, 'bot_version', 'N/A')
@@ -223,7 +176,7 @@ async def scanner_main_loop(app: Application, broadcast_func):
         while app.bot_data.get("bot_on", False):
             try:
                 if time.time() - last_adx_update_time > 60:
-                    ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=50, params={'type': 'swap'})  # Убедились в swap для OHLCV
+                    ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=50, params={'type': 'swap'})
                     adx, pdi, mdi, atr = calculate_indicators(ohlcv)
                     last_adx_update_time = time.time()
                 
