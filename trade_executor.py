@@ -1,12 +1,13 @@
 # trade_executor.py
 # ============================================================================
-# v37.6 - ФИКС ATR ЛОГИ
+# v37.7 - DEBUG LOG SHEET
 # ============================================================================
 import asyncio
 from datetime import datetime, timezone
 import gspread
 
 TRADE_LOG_WS = None
+DEBUG_LOG_WS = None  # Новый
 
 async def log_trade_to_sheet(decision: dict):
     if not TRADE_LOG_WS: return False
@@ -19,7 +20,7 @@ async def log_trade_to_sheet(decision: dict):
             decision.get("ADX"), decision.get("PDI"), decision.get("MDI"),
             decision.get("Imbalance_Ratio"), decision.get("Aggression_Side"),
             "OPEN", None, None, None, None, decision.get("Trigger_Order_USD"),
-            None, None, decision.get("ATR")  # ATR в конце
+            None, None, decision.get("ATR")
         ]
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: TRADE_LOG_WS.append_row(row_data, value_input_option='USER_ENTERED'))
@@ -55,4 +56,19 @@ async def update_trade_in_sheet(signal: dict, status: str, exit_price: float, pn
         return False
     except Exception as e:
         print(f"Google Sheets update error: {e}")
+        return False
+
+async def log_debug_data(data: dict):
+    if not DEBUG_LOG_WS: return False
+    try:
+        row_data = [
+            data.get("Timestamp_UTC"), data.get("ADX"), data.get("PDI"), data.get("MDI"),
+            data.get("ATR"), data.get("Imbalance_Ratio"), data.get("Side"),
+            data.get("Trend_Dir"), data.get("DI_Diff"), data.get("Aggression_Side"), data.get("Reason_Prop")
+        ]
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: DEBUG_LOG_WS.append_row(row_data, value_input_option='USER_ENTERED'))
+        return True
+    except Exception as e:
+        print(f"Google Sheets debug log error: {e}")
         return False
