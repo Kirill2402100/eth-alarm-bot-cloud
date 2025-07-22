@@ -1,7 +1,6 @@
 # trade_executor.py
 # ============================================================================
-# v37.2 - РАСШИРЕННОЕ ЛОГИРОВАНИЕ
-# - Добавлены поля: ADX, PDI, MDI, Imbalance_Ratio, Aggression_Side, Time_In_Trade.
+# v37.6 - ФИКС ATR ЛОГИ
 # ============================================================================
 import asyncio
 from datetime import datetime, timezone
@@ -17,10 +16,10 @@ async def log_trade_to_sheet(decision: dict):
             decision.get("Algorithm_Type"), decision.get("Strategy_Idea"),
             decision.get("Entry_Price"), decision.get("SL_Price"), decision.get("TP_Price"),
             decision.get("side"), decision.get("Deposit"), decision.get("Leverage"),
-            decision.get("ADX"), decision.get("PDI"), decision.get("MDI"),  # Новые
-            decision.get("Imbalance_Ratio"), decision.get("Aggression_Side"),  # Новые
+            decision.get("ADX"), decision.get("PDI"), decision.get("MDI"),
+            decision.get("Imbalance_Ratio"), decision.get("Aggression_Side"),
             "OPEN", None, None, None, None, decision.get("Trigger_Order_USD"),
-            None, None  # Exit_Reason, Time_In_Trade
+            None, None, decision.get("ATR")  # ATR в конце
         ]
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: TRADE_LOG_WS.append_row(row_data, value_input_option='USER_ENTERED'))
@@ -39,15 +38,14 @@ async def update_trade_in_sheet(signal: dict, status: str, exit_price: float, pn
         if not cell: return False
         exit_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         
-        # Новый: Расчёт Time_In_Trade (минуты)
         entry_time = datetime.fromisoformat(signal.get("Timestamp_UTC"))
         time_in_trade = round((datetime.fromisoformat(exit_time) - entry_time).total_seconds() / 60, 2)
         
         update_tasks = [
-            (f'Q{cell.row}', status),  # Status теперь Q (после новых полей)
+            (f'Q{cell.row}', status),
             (f'R{cell.row}', exit_time), (f'S{cell.row}', exit_price),
             (f'T{cell.row}', pnl_usd), (f'U{cell.row}', pnl_percent),
-            (f'W{cell.row}', reason), (f'X{cell.row}', time_in_trade)  # Exit_Reason W, Time_In_Trade X
+            (f'W{cell.row}', reason), (f'X{cell.row}', time_in_trade)
         ]
             
         await loop.run_in_executor(None, lambda: TRADE_LOG_WS.batch_update([{'range': r, 'values': [[v]]} for r, v in update_tasks]))
