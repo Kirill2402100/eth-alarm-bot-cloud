@@ -1,8 +1,11 @@
 # scanner_engine.py
 # ============================================================================
-# v39.1 - РЕЖИМ LIVE-ЛОГИРОВАНИЯ
-# - В главный цикл добавлена логика отправки статуса индикаторов,
-#   если включен режим live-логирования (/info).
+# v39.2 - ДОБАВЛЕН ФИЛЬТР EMA И НОВЫЙ СТОП-ЛОСС
+# - SL увеличен до 0.5% для большей устойчивости к шуму.
+# - Добавлен фильтр тренда: EMA 100.
+#   - LONG: только если цена > EMA 100.
+#   - SHORT: только если цена < EMA 100.
+# - Обновлен live-log для отображения статуса EMA.
 # ============================================================================
 import asyncio
 import time
@@ -29,85 +32,106 @@ RSI_PERIOD = 14
 STOCH_K = 14
 STOCH_D = 3
 STOCH_SMOOTH = 3
+EMA_PERIOD = 100  # <<< НОВЫЙ ПАРАМЕТР: Период для EMA фильтра
+
 RSI_LONG_THRESHOLD = 35
 RSI_SHORT_THRESHOLD = 75
 STOCH_LONG_THRESHOLD = 20
 STOCH_SHORT_THRESHOLD = 80
 
-TP_PERCENT = 0.01  # 1%
-SL_PERCENT = 0.0025  # 0.25%
+TP_PERCENT = 0.01      # 1%
+SL_PERCENT = 0.005     # <<< ИЗМЕНЕНО: 0.5%
 INTERMEDIATE_PERCENT = 0.005  # 0.5% для обновления SL
 
 # === Функции-помощники =====================================================
 def calculate_indicators(ohlcv):
-    """Рассчитывает RSI и Stochastic по данным свечей."""
-    if not ohlcv or len(ohlcv) < max(RSI_PERIOD, STOCH_K) + STOCH_SMOOTH:
-        return None, None, None
+    """Рассчитывает RSI, Stochastic и EMA по данным свечей."""
+    if not ohlcv or len(ohlcv) < EMA_PERIOD:
+        return None, None, None, None
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df.ta.rsi(length=RSI_PERIOD, append=True)
-    df.ta.stoch(high=df['high'], low=df['low'], close=df['close'], k=STOCH_K, d=STOCH_D, smooth_k=STOCH_SMOOTH, append=True)
+    df.ta.stoch(k=STOCH_K, d=STOCH_D, smooth_k=STOCH_SMOOTH, append=True)
+    df.ta.ema(length=EMA_PERIOD, append=True) # <<< ДОБАВЛЕНО: Расчет EMA
     last = df.iloc[-1]
-    return last[f'RSI_{RSI_PERIOD}'], last[f'STOCHk_{STOCH_K}_{STOCH_D}_{STOCH_SMOOTH}'], last[f'STOCHd_{STOCH_K}_{STOCH_D}_{STOCH_SMOOTH}']
+    return (
+        last[f'RSI_{RSI_PERIOD}'],
+        last[f'STOCHk_{STOCH_K}_{STOCH_D}_{STOCH_SMOOTH}'],
+        last[f'STOCHd_{STOCH_K}_{STOCH_D}_{STOCH_SMOOTH}'],
+        last[f'EMA_{EMA_PERIOD}'] # <<< ДОБАВЛЕНО: Возвращаем EMA
+    )
 
 # === Логика сканирования =============================================
 async def scan_for_new_opportunities(exchange, app: Application, broadcast_func, ohlcv):
     bot_data = app.bot_data
-    reason_prop = ""
     side = ""
     try:
-        rsi, stoch_k, stoch_d = calculate_indicators(ohlcv)
+        # Получаем индикаторы, включая EMA
+        rsi, stoch_k, stoch_d, ema = calculate_indicators(ohlcv)
         if rsi is None:
-            return # Просто выходим, основная петля обработает сообщение для live-лога
+            return
 
         trades = await exchange.fetch_trades(PAIR_TO_SCAN, limit=1, params={'type': 'swap'})
-        if not trades:
-            return
+        if not trades: return
         entry_price = trades[0]['price']
 
-        if rsi < RSI_LONG_THRESHOLD and stoch_k > stoch_d and stoch_k < STOCH_LONG_THRESHOLD:
+        # --- НОВЫЕ ПРАВИЛА ВХОДА С ФИЛЬТРОМ EMA ---
+        long_signal_conditions = (
+            rsi < RSI_LONG_THRESHOLD and
+            stoch_k > stoch_d and
+            stoch_k < STOCH_LONG_THRESHOLD
+        )
+        short_signal_conditions = (
+            rsi > RSI_SHORT_THRESHOLD and
+            stoch_k < stoch_d and
+            stoch_k > STOCH_SHORT_THRESHOLD
+        )
+
+        # Проверяем LONG сигнал + фильтр тренда
+        if long_signal_conditions and entry_price > ema:
             side = "LONG"
-        elif rsi > RSI_SHORT_THRESHOLD and stoch_k < stoch_d and stoch_k > STOCH_SHORT_THRESHOLD:
+        # Проверяем SHORT сигнал + фильтр тренда
+        elif short_signal_conditions and entry_price < ema:
             side = "SHORT"
         else:
-            reason_prop = "NO_SIGNAL"
-            # Если сигнала нет, просто выходим. Не нужно ничего логировать здесь.
+            # Если сигнала нет, просто выходим
             return
 
+        # --- Дальнейшая логика остается без изменений ---
         sl_price = entry_price * (1 - SL_PERCENT) if side == "LONG" else entry_price * (1 + SL_PERCENT)
         tp_price = entry_price * (1 + TP_PERCENT) if side == "LONG" else entry_price * (1 - TP_PERCENT)
         intermediate_sl = entry_price * (1 + INTERMEDIATE_PERCENT) if side == "LONG" else entry_price * (1 - INTERMEDIATE_PERCENT)
 
         idea = f"RSI {rsi:.1f}, Stoch K/D {stoch_k:.1f}/{stoch_d:.1f}"
-        decision = {"Signal_ID": f"signal_{int(time.time() * 1000)}",
-                      "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-                      "Pair": PAIR_TO_SCAN, "Algorithm_Type": "RSI Stoch 1m",
-                      "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": sl_price,
-                      "TP_Price": tp_price, "Intermediate_SL": intermediate_sl, "side": side,
-                      "Deposit": bot_data.get('deposit', 50), "Leverage": bot_data.get('leverage', 100),
-                      "RSI": rsi, "Stoch_K": stoch_k, "Stoch_D": stoch_d,
-                      "intermediate_triggered": False
-                      }
+        decision = {
+            "Signal_ID": f"signal_{int(time.time() * 1000)}",
+            "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+            "Pair": PAIR_TO_SCAN, "Algorithm_Type": "RSI Stoch EMA 1m",
+            "Strategy_Idea": idea, "Entry_Price": entry_price, "SL_Price": sl_price,
+            "TP_Price": tp_price, "Intermediate_SL": intermediate_sl, "side": side,
+            "Deposit": bot_data.get('deposit', 50), "Leverage": bot_data.get('leverage', 100),
+            "RSI": rsi, "Stoch_K": stoch_k, "Stoch_D": stoch_d, "EMA": ema,
+            "intermediate_triggered": False
+        }
         msg = f"🔥 <b>ВХОД В СДЕЛКУ ({side})</b>\n\n<b>Тип:</b> <code>{idea} ({side})</code>\n<b>Вход:</b> <code>{entry_price:.4f}</code> | <b>SL:</b> <code>{sl_price:.4f}</code> | <b>TP:</b> <code>{tp_price:.4f}</code>"
         await broadcast_func(app, msg)
         await log_trade_to_sheet(decision)
         bot_data['monitored_signals'].append(decision)
         save_state(app)
-        reason_prop = "SIGNAL_FOUND"
 
         if bot_data.get('debug_mode_on', False):
             await log_debug_data({
                 "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-                "RSI": rsi, "Stoch_K": stoch_k, "Stoch_D": stoch_d,
-                "Side": side, "Reason_Prop": reason_prop
+                "RSI": rsi, "Stoch_K": stoch_k, "Stoch_D": stoch_d, "EMA": ema,
+                "Side": side, "Reason_Prop": "SIGNAL_FOUND"
             })
 
     except Exception as e:
         log.error(f"КРИТИЧЕСКАЯ ОШИБКА СКАНЕРА: {e}", exc_info=True)
-        # Отправляем сообщение об ошибке только если это не live-логи
         if not bot_data.get('live_info_on', False):
             await broadcast_func(app, f"Критическая ошибка в сканере: {e}")
 
-# === Логика мониторинга =============================================
+
+# === Логика мониторинга (без изменений) =============================================
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
     if not bot_data.get('monitored_signals'): return
@@ -118,7 +142,6 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         order_book = await exchange.fetch_order_book(pair, limit=1, params={'type': 'swap'})
         last_price = (order_book['bids'][0][0] + order_book['asks'][0][0]) / 2
         
-        # Live-мониторинг для активной сделки
         if bot_data.get('live_info_on', False):
              pnl_percent_raw = ((last_price - entry_price) / entry_price) * (-1 if side == 'SHORT' else 1)
              pnl_percent_display = pnl_percent_raw * 100 * signal['Leverage']
@@ -133,7 +156,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         
         if not intermediate_triggered:
             if (side == 'LONG' and last_price >= intermediate_sl) or (side == 'SHORT' and last_price <= intermediate_sl):
-                msg = f"📈 <b>Профит 0.5% ({side})</b>\nSL обновлен на цену входа: {intermediate_sl:.4f}."
+                msg = f"📈 <b>Безубыток ({side})</b>\nSL обновлен на {intermediate_sl:.4f}."
                 await broadcast_func(app, msg)
                 signal['intermediate_triggered'] = True
                 signal['SL_Price'] = intermediate_sl
@@ -160,6 +183,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         log.error(f"CRITICAL MONITORING ERROR: {e}", exc_info=True)
         await broadcast_func(app, f"⚠️ <b>Критическая ошибка мониторинга!</b>\n<code>Ошибка: {e}</code>")
 
+
 # === Главный цикл ============================================
 async def scanner_main_loop(app: Application, broadcast_func):
     bot_version = getattr(app, 'bot_version', 'N/A')
@@ -176,30 +200,31 @@ async def scanner_main_loop(app: Application, broadcast_func):
         while app.bot_data.get("bot_on", False):
             try:
                 current_time = time.time()
-                # Обновляем свечи раз в минуту
                 if current_time - last_ohlcv_update_time > 60:
-                    ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=100, params={'type': 'swap'})
+                    ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=200, params={'type': 'swap'})
                     last_ohlcv_update_time = current_time
                     log.info("OHLCV data updated.")
 
-                # Если нет активных сделок, ищем новые
                 if not app.bot_data.get('monitored_signals'):
-                    # --- Логика для Live-логов ---
-                    if app.bot_data.get('live_info_on', False):
-                        rsi, stoch_k, stoch_d = calculate_indicators(ohlcv)
+                    # --- ОБНОВЛЕННАЯ Логика для Live-логов ---
+                    if app.bot_data.get('live_info_on', False) and ohlcv:
+                        rsi, stoch_k, stoch_d, ema = calculate_indicators(ohlcv)
                         if rsi is not None:
+                            # Получаем текущую цену для сравнения с EMA
+                            order_book = await exchange.fetch_order_book(PAIR_TO_SCAN, limit=1)
+                            price = (order_book['bids'][0][0] + order_book['asks'][0][0]) / 2
+                            
+                            trend_status = "🔼 выше" if price > ema else "🔽 ниже"
+                            
                             info_msg = (
-                                f"<b>[INFO]</b> | "
-                                f"RSI: <code>{rsi:.2f}</code>, "
-                                f"Stoch K/D: <code>{stoch_k:.2f}</code>/<code>{stoch_d:.2f}</code>"
+                                f"<b>[INFO]</b> | Цена: <code>{price:.2f}</code> ({trend_status} EMA <code>{ema:.2f}</code>)\n"
+                                f"RSI: <code>{rsi:.2f}</code>, Stoch K/D: <code>{stoch_k:.2f}</code>/<code>{stoch_d:.2f}</code>"
                             )
                             await broadcast_func(app, info_msg)
                         else:
                             await broadcast_func(app, "<b>[INFO]</b> | Ожидание данных для расчета индикаторов...")
                     
                     await scan_for_new_opportunities(exchange, app, broadcast_func, ohlcv)
-                
-                # Если есть активная сделка, мониторим ее
                 else:
                     await monitor_active_trades(exchange, app, broadcast_func)
 
@@ -207,7 +232,7 @@ async def scanner_main_loop(app: Application, broadcast_func):
             except Exception as e:
                 log.critical(f"CRITICAL Error in loop iteration: {e}", exc_info=True)
                 await broadcast_func(app, f"Критическая ошибка в цикле: {e}")
-                await asyncio.sleep(20) # Пауза в случае серьезной ошибки
+                await asyncio.sleep(20)
     except Exception as e:
         log.critical(f"CRITICAL STARTUP ERROR: {e}", exc_info=True)
         await broadcast_func(app, f"<b>КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА!</b>\n<code>Ошибка: {e}</code>")
