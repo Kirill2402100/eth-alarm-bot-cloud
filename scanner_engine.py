@@ -32,7 +32,7 @@ RSI_PERIOD = 14
 STOCH_K = 14
 STOCH_D = 3
 STOCH_SMOOTH = 3
-EMA_PERIOD = 100  # <<< НОВЫЙ ПАРАМЕТР: Период для EMA фильтра
+EMA_PERIOD = 50  # <<< НОВЫЙ ПАРАМЕТР: Период для EMA фильтра
 
 RSI_LONG_THRESHOLD = 35
 RSI_SHORT_THRESHOLD = 75
