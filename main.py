@@ -4,25 +4,24 @@ import asyncio
 import json
 import logging
 from telegram import Update, constants
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, PicklePersistence
 
 log = logging.getLogger("bot")
 import scanner_engine
 import trade_executor
 
 # --- Конфигурация ---
-BOT_VERSION = "ML-2.0-Pro"
+BOT_VERSION = "ML-2.1-Debug"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.INFO)
 
 def setup_sheets():
+    # ... (код setup_sheets остается без изменений)
     if not SHEET_ID or not GOOGLE_CREDENTIALS:
         log.warning("Логирование в Google Sheets отключено.")
         return
@@ -53,48 +52,59 @@ def setup_sheets():
     except Exception as e:
         log.error(f"Ошибка инициализации Google Sheets: {e}")
 
+async def post_init(app: Application):
+    """Действия после запуска бота."""
+    log.info("Бот запущен. Проверяем, нужно ли запускать основной цикл...")
+    if app.bot_data.get('run_loop_on_startup', False):
+        log.info("Обнаружен флаг 'run_loop_on_startup'. Запускаю основной цикл.")
+        asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
+    # Устанавливаем команды для удобного меню в Telegram
+    await app.bot.set_my_commands([
+        ('start', 'Запустить/перезапустить бота'),
+        ('run', 'Запустить/остановить основной цикл'),
+        ('status', 'Показать текущий статус'),
+        ('info', 'Включить/выключить live-логи')
+    ])
+
 async def broadcast(app: Application, txt: str):
-    for cid in getattr(app, "chat_ids", []):
+    chat_ids = app.bot_data.get('chat_ids', [])
+    for cid in chat_ids:
         try:
             await app.bot.send_message(chat_id=cid, text=txt, parse_mode=constants.ParseMode.HTML)
         except Exception as e:
             log.error(f"Send fail to {cid}: {e}")
 
-async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        amount = float(ctx.args[0])
-        ctx.bot_data['deposit'] = amount
-        await update.message.reply_text(f"✅ Депозит для расчета PNL установлен: <b>${amount}</b>", parse_mode=constants.ParseMode.HTML)
-    except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ Неверный формат. Используйте: /deposit <сумма>")
-
-async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        leverage = int(ctx.args[0])
-        ctx.bot_data['leverage'] = leverage
-        await update.message.reply_text(f"✅ Плечо для расчета PNL установлено: <b>x{leverage}</b>", parse_mode=constants.ParseMode.HTML)
-    except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ Неверный формат. Используйте: /leverage <число>")
-
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.application.chat_ids.add(update.effective_chat.id)
-    ctx.bot_data["bot_on"] = True
+    chat_id = update.effective_chat.id
+    ctx.bot_data.setdefault('chat_ids', set()).add(chat_id)
     ctx.bot_data.setdefault('deposit', 50)
     ctx.bot_data.setdefault('leverage', 100)
-    await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} запущен.</b>\nИспользуйте /run для запуска.", parse_mode=constants.ParseMode.HTML)
+    log.info(f"Пользователь {chat_id} запустил бота.")
+    await update.message.reply_text(f"✅ <b>Бот v{BOT_VERSION} запущен.</b>\nИспользуйте /run для запуска сканера.", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     app = ctx.application
-    if hasattr(app, '_main_loop_task') and not app._main_loop_task.done():
-        await update.message.reply_text("ℹ️ Основной цикл уже запущен.")
-    else:
-        app.bot_data["bot_on"] = True
-        await update.message.reply_text(f"🚀 Запускаю ML-сканер (v{BOT_VERSION})...")
-        app._main_loop_task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
+    is_running = not (app.bot_data.get('main_loop_task') is None or app.bot_data['main_loop_task'].done())
 
+    if is_running:
+        app.bot_data['bot_on'] = False # Даем сигнал циклу на остановку
+        if app.bot_data.get('main_loop_task'):
+             app.bot_data['main_loop_task'].cancel()
+        app.bot_data['run_loop_on_startup'] = False
+        log.info("Команда /run: останавливаем основной цикл.")
+        await update.message.reply_text("🛑 <b>Сканер остановлен.</b>")
+    else:
+        app.bot_data['bot_on'] = True
+        app.bot_data['run_loop_on_startup'] = True
+        log.info("Команда /run: запускаем основной цикл.")
+        await update.message.reply_text(f"🚀 <b>Запускаю ML-сканер...</b>")
+        task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
+        app.bot_data['main_loop_task'] = task
+        
 async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    # ... (код cmd_status остается без изменений)
     bot_data = ctx.bot_data
-    is_running = hasattr(ctx.application, '_main_loop_task') and not ctx.application._main_loop_task.done()
+    is_running = not (bot_data.get('main_loop_task') is None or bot_data['main_loop_task'].done())
     active_signals = bot_data.get('monitored_signals', [])
     msg = (f"<b>Состояние бота v{BOT_VERSION}</b>\n"
            f"<b>Основной цикл:</b> {'⚡️ RUNNING' if is_running else '🔌 STOPPED'}\n"
@@ -103,14 +113,27 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
            f"<b>Плечо:</b> x{bot_data.get('leverage', 100)}\n")
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
+async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # ... (код cmd_info остается без изменений)
+    current_state = ctx.bot_data.get("live_info_on", False)
+    new_state = not current_state
+    ctx.bot_data["live_info_on"] = new_state
+    msg = "✅ <b>Live-логирование включено.</b>" if new_state else "❌ <b>Live-логирование выключено.</b>"
+    await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
+
 if __name__ == "__main__":
     setup_sheets()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.chat_ids = set()
+    
+    # --- ДОБАВЛЕНО: Сохранение состояния ---
+    persistence = PicklePersistence(filepath="bot_persistence")
+    
+    app = ApplicationBuilder().token(BOT_TOKEN).persistence(persistence).post_init(post_init).build()
+    
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("deposit", cmd_deposit))
-    app.add_handler(CommandHandler("leverage", cmd_leverage))
-    log.info(f"Bot v{BOT_VERSION} started polling.")
+    app.add_handler(CommandHandler("info", cmd_info))
+    # ... (другие ваши команды, если есть)
+    
+    log.info(f"Bot v{BOT_VERSION} starting...")
     app.run_polling()
