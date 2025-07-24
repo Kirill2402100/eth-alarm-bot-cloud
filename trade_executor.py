@@ -5,26 +5,42 @@ from datetime import datetime, timezone
 log = logging.getLogger("bot")
 TRADE_LOG_WS = None
 
-async def log_trade_to_sheet(trade_data):
-    """Записывает информацию о сигнале в Google Sheet."""
-    if not TRADE_LOG_WS:
-        log.warning("Google Sheets (TRADE_LOG_WS) не инициализирован. Пропуск логирования.")
-        return
-
+async def log_open_trade(trade_data):
+    if not TRADE_LOG_WS: return
     try:
-        # Определяем порядок колонок в соответствии с вашими старыми заголовками
-        headers = [
-            "Signal_ID", "Timestamp_UTC", "Pair", "Algorithm_Type", "Strategy_Idea",
-            "Entry_Price", "SL_Price", "TP_Price", "side", "Probability", "Status"
-        ]
-        
-        # Собираем данные для записи в правильном порядке
-        row_to_insert = []
-        for header in headers:
-            row_to_insert.append(trade_data.get(header, '')) # Используем get для безопасности
-
+        headers = TRADE_LOG_WS.row_values(1)
+        row_to_insert = [trade_data.get(header, '') for header in headers]
         TRADE_LOG_WS.append_row(row_to_insert, value_input_option='USER_ENTERED')
-        log.info(f"Сигнал {trade_data['Signal_ID']} записан в Google Sheets.")
-
+        log.info(f"Сигнал {trade_data.get('Signal_ID')} записан в Google Sheets.")
     except Exception as e:
         log.error(f"Ошибка при записи в Google Sheets: {e}", exc_info=True)
+
+async def update_closed_trade(signal_id, status, exit_price, pnl_usd, pnl_percent):
+    if not TRADE_LOG_WS: return
+    try:
+        cell = TRADE_LOG_WS.find(signal_id)
+        if not cell:
+            log.error(f"Не удалось найти сделку с ID {signal_id} для обновления.")
+            return
+        
+        row = cell.row
+        headers = TRADE_LOG_WS.row_values(1)
+        
+        # Обновляем ячейки по именам колонок
+        updates = {
+            "Status": status,
+            "Exit_Time_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+            "Exit_Price": exit_price,
+            "PNL_USD": pnl_usd,
+            "PNL_Percent": pnl_percent
+        }
+        
+        for key, value in updates.items():
+            if key in headers:
+                col = headers.index(key) + 1
+                TRADE_LOG_WS.update_cell(row, col, value)
+        
+        log.info(f"Сделка {signal_id} обновлена в Google Sheets со статусом {status}.")
+
+    except Exception as e:
+        log.error(f"Ошибка при обновлении сделки {signal_id} в Google Sheets: {e}", exc_info=True)
