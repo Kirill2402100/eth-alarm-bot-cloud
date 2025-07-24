@@ -9,6 +9,7 @@ from telegram.ext import Application, ApplicationBuilder, CommandHandler, Contex
 log = logging.getLogger("bot")
 import scanner_engine
 import trade_executor
+import debug_executor
 
 # --- Конфигурация ---
 BOT_VERSION = "ML-2.1-Debug"
@@ -21,7 +22,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.INFO)
 
 def setup_sheets():
-    # ... (код setup_sheets остается без изменений)
     if not SHEET_ID or not GOOGLE_CREDENTIALS:
         log.warning("Логирование в Google Sheets отключено.")
         return
@@ -32,6 +32,7 @@ def setup_sheets():
         gs = gspread.authorize(creds)
         ss = gs.open_by_key(SHEET_ID)
         
+        # --- Настройка основного лога сделок ---
         sheet_name = "ML_Trading_Log_v2"
         try:
             worksheet = ss.worksheet(sheet_name)
@@ -46,9 +47,22 @@ def setup_sheets():
             worksheet = ss.add_worksheet(title=sheet_name, rows="2000", cols=len(headers))
             worksheet.update(range_name="A1", values=[headers])
             worksheet.format(f"A1:{chr(ord('A')+len(headers)-1)}1", {"textFormat": {"bold": True}})
-        
         trade_executor.TRADE_LOG_WS = worksheet
         log.info(f"Google-Sheets ready. Logging to '{sheet_name}'.")
+
+        # --- Настройка лога для отладки ---
+        debug_sheet_name = "ML_Debug_Log"
+        try:
+            debug_worksheet = ss.worksheet(debug_sheet_name)
+        except gspread.WorksheetNotFound:
+            log.info(f"Лист '{debug_sheet_name}' не найден. Создаю новый.")
+            debug_headers = ["Timestamp_UTC", "Close_Price", "Prob_Long", "Prob_Short", "RSI_14", "STOCHk_14_3_3"]
+            debug_worksheet = ss.add_worksheet(title=debug_sheet_name, rows="10000", cols=len(debug_headers))
+            debug_worksheet.update(range_name="A1", values=[debug_headers])
+            debug_worksheet.format(f"A1:{chr(ord('A')+len(debug_headers)-1)}1", {"textFormat": {"bold": True}})
+        debug_executor.DEBUG_LOG_WS = debug_worksheet
+        log.info(f"Debug-Sheets ready. Logging to '{debug_sheet_name}'.")
+
     except Exception as e:
         log.error(f"Ошибка инициализации Google Sheets: {e}")
 
@@ -58,7 +72,6 @@ async def post_init(app: Application):
     if app.bot_data.get('run_loop_on_startup', False):
         log.info("Обнаружен флаг 'run_loop_on_startup'. Запускаю основной цикл.")
         asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
-    # Устанавливаем команды для удобного меню в Telegram
     await app.bot.set_my_commands([
         ('start', 'Запустить/перезапустить бота'),
         ('run', 'Запустить/остановить основной цикл'),
@@ -87,7 +100,7 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     is_running = not (app.bot_data.get('main_loop_task') is None or app.bot_data['main_loop_task'].done())
 
     if is_running:
-        app.bot_data['bot_on'] = False # Даем сигнал циклу на остановку
+        app.bot_data['bot_on'] = False
         if app.bot_data.get('main_loop_task'):
              app.bot_data['main_loop_task'].cancel()
         app.bot_data['run_loop_on_startup'] = False
@@ -102,7 +115,6 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         app.bot_data['main_loop_task'] = task
         
 async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    # ... (код cmd_status остается без изменений)
     bot_data = ctx.bot_data
     is_running = not (bot_data.get('main_loop_task') is None or bot_data['main_loop_task'].done())
     active_signals = bot_data.get('monitored_signals', [])
@@ -114,17 +126,31 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
 async def cmd_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # ... (код cmd_info остается без изменений)
     current_state = ctx.bot_data.get("live_info_on", False)
     new_state = not current_state
     ctx.bot_data["live_info_on"] = new_state
     msg = "✅ <b>Live-логирование включено.</b>" if new_state else "❌ <b>Live-логирование выключено.</b>"
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
+async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        amount = float(ctx.args[0])
+        ctx.bot_data['deposit'] = amount
+        await update.message.reply_text(f"✅ Депозит для расчета PNL установлен: <b>${amount}</b>", parse_mode=constants.ParseMode.HTML)
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ Неверный формат. Используйте: /deposit <сумма>")
+
+async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        leverage = int(ctx.args[0])
+        ctx.bot_data['leverage'] = leverage
+        await update.message.reply_text(f"✅ Плечо для расчета PNL установлено: <b>x{leverage}</b>", parse_mode=constants.ParseMode.HTML)
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ Неверный формат. Используйте: /leverage <число>")
+
 if __name__ == "__main__":
     setup_sheets()
     
-    # --- ДОБАВЛЕНО: Сохранение состояния ---
     persistence = PicklePersistence(filepath="bot_persistence")
     
     app = ApplicationBuilder().token(BOT_TOKEN).persistence(persistence).post_init(post_init).build()
@@ -133,7 +159,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("info", cmd_info))
-    # ... (другие ваши команды, если есть)
+    app.add_handler(CommandHandler("deposit", cmd_deposit))
+    app.add_handler(CommandHandler("leverage", cmd_leverage))
     
     log.info(f"Bot v{BOT_VERSION} starting...")
     app.run_polling()
