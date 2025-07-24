@@ -1,10 +1,11 @@
-# main.py
 import os
 import asyncio
 import json
 import logging
 from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, PicklePersistence
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials # <-- УБЕДИТЕСЬ, ЧТО ЭТА СТРОКА ЕСТЬ
 
 log = logging.getLogger("bot")
 import scanner_engine
