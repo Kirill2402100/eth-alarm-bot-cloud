@@ -38,7 +38,6 @@ def setup_sheets():
             worksheet = ss.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
             log.info(f"Лист '{sheet_name}' не найден. Создаю новый.")
-            # <<< НОВЫЕ РАСШИРЕННЫЕ ЗАГОЛОВКИ >>>
             headers = [
                 "Signal_ID", "Timestamp_UTC", "Pair", "Algorithm_Type", "side", "Probability", 
                 "Entry_Price", "Exit_Price", "SL_Price", "TP_Price", 
@@ -61,7 +60,6 @@ async def broadcast(app: Application, txt: str):
         except Exception as e:
             log.error(f"Send fail to {cid}: {e}")
 
-# --- Новые команды ---
 async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         amount = float(ctx.args[0])
@@ -78,7 +76,6 @@ async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except (IndexError, ValueError):
         await update.message.reply_text("⚠️ Неверный формат. Используйте: /leverage <число>")
 
-# --- Старые команды ---
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.chat_ids.add(update.effective_chat.id)
     ctx.bot_data["bot_on"] = True
@@ -105,8 +102,6 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
            f"<b>Депозит:</b> ${bot_data.get('deposit', 50)}\n"
            f"<b>Плечо:</b> x{bot_data.get('leverage', 100)}\n")
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
-
-# ... (другие команды, если они вам нужны) ...
 
 if __name__ == "__main__":
     setup_sheets()
