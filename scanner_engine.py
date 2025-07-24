@@ -9,6 +9,7 @@ from telegram.ext import Application
 import xgboost as xgb
 from datetime import datetime, timezone
 from trade_executor import log_open_trade, update_closed_trade
+from debug_executor import log_debug_data
 
 log = logging.getLogger("bot")
 
@@ -16,7 +17,7 @@ log = logging.getLogger("bot")
 PAIR_TO_SCAN = 'SOL/USDT'
 TIMEFRAME = '1m'
 SCAN_INTERVAL = 5
-PROBABILITY_THRESHOLD = 0.65
+PROBABILITY_THRESHOLD = 0.65 
 TP_PERCENT = 0.01
 SL_PERCENT = 0.005
 
@@ -83,11 +84,19 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
         features_for_model = ['RSI_14', 'STOCHk_14_3_3', 'EMA_50', 'EMA_200', 'close', 'volume']
         current_features = pd.DataFrame([features_series[features_for_model]])
         
-        # <<< ИЗМЕНЕНИЕ ЗДЕСЬ >>>
         prediction_prob = ML_MODEL.predict(xgb.DMatrix(current_features))[0]
-        
         prob_long = prediction_prob[1]
         prob_short = prediction_prob[2]
+        
+        debug_info = {
+            "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+            "Close_Price": features_series['close'],
+            "Prob_Long": f"{prob_long:.2%}",
+            "Prob_Short": f"{prob_short:.2%}",
+            "RSI_14": features_series['RSI_14'],
+            "STOCHk_14_3_3": features_series['STOCHk_14_3_3']
+        }
+        await log_debug_data(debug_info)
 
         side, probability = None, 0
         if prob_long > PROBABILITY_THRESHOLD and prob_long > prob_short:
