@@ -16,7 +16,7 @@ log = logging.getLogger("bot")
 PAIR_TO_SCAN = 'SOL/USDT'
 TIMEFRAME = '1m'
 SCAN_INTERVAL = 5
-PROBABILITY_THRESHOLD = 0.65 # Снизил порог для большего кол-ва сигналов
+PROBABILITY_THRESHOLD = 0.65
 TP_PERCENT = 0.01
 SL_PERCENT = 0.005
 
@@ -39,7 +39,6 @@ def calculate_features(ohlcv):
     df.dropna(inplace=True)
     return df.iloc[-1]
 
-# --- Новая функция мониторинга ---
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
     signal = bot_data['monitored_signals'][0]
@@ -70,12 +69,11 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
             await broadcast_func(app, msg)
             
             await update_closed_trade(signal['Signal_ID'], exit_status, exit_price, pnl_usd, pnl_percent_display)
-            bot_data['monitored_signals'] = [] # Очищаем для поиска новой сделки
+            bot_data['monitored_signals'] = []
 
     except Exception as e:
         log.error(f"Ошибка мониторинга: {e}", exc_info=True)
 
-# --- Новая функция сканирования с LONG/SHORT ---
 async def scan_for_signals(exchange, app: Application, broadcast_func):
     try:
         ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=300)
@@ -85,7 +83,9 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
         features_for_model = ['RSI_14', 'STOCHk_14_3_3', 'EMA_50', 'EMA_200', 'close', 'volume']
         current_features = pd.DataFrame([features_series[features_for_model]])
         
-        prediction_prob = ML_MODEL.predict_proba(current_features)[0]
+        # <<< ИЗМЕНЕНИЕ ЗДЕСЬ >>>
+        prediction_prob = ML_MODEL.predict(xgb.DMatrix(current_features))[0]
+        
         prob_long = prediction_prob[1]
         prob_short = prediction_prob[2]
 
@@ -97,11 +97,15 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
         
         if side:
             await execute_trade(app, broadcast_func, features_series, side, probability)
+        
+        if app.bot_data.get('live_info_on', False):
+            info_msg = (f"<b>[ML INFO]</b> | Prob (L/S): <code>{prob_long:.1%} / {prob_short:.1%}</code> | "
+                        f"Close: <code>{features_series['close']:.2f}</code>")
+            await broadcast_func(app, info_msg)
 
     except Exception as e:
         log.error(f"Ошибка сканирования: {e}", exc_info=True)
 
-# --- Новая функция исполнения сделки ---
 async def execute_trade(app, broadcast_func, features, side, probability):
     entry_price = features['close']
     sl_price = entry_price * (1 - SL_PERCENT) if side == "LONG" else entry_price * (1 + SL_PERCENT)
@@ -128,7 +132,6 @@ async def execute_trade(app, broadcast_func, features, side, probability):
            f"<b>SL:</b> <code>{sl_price:.4f}</code> | <b>TP:</b> <code>{tp_price:.4f}</code>")
     await broadcast_func(app, msg)
 
-# --- Главный цикл с переключением сканер/монитор ---
 async def scanner_main_loop(app: Application, broadcast_func):
     log.info("Main Engine loop starting...")
     if ML_MODEL is None:
