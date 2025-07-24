@@ -7,3 +7,4 @@ joblib
 ccxt
 gspread
 oauth2client
+numpy~=1.26.4
