@@ -18,7 +18,7 @@ TIMEFRAME = '1m'
 SCAN_INTERVAL = 5 
 
 # --- Параметры стратегии RSI Reversal v2 ---
-RSI_PERIOD = 14
+RSI_PERIOD = 6
 RSI_ENTRY_LONG = 25
 RSI_ENTRY_SHORT = 75 # Рекомендуемое значение
 PRICE_TAKE_PROFIT_PERCENT = 0.002 # 0.2%
