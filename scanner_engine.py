@@ -20,7 +20,7 @@ SCAN_INTERVAL = 5
 # --- Параметры стратегии RSI Reversal ---
 RSI_PERIOD = 14
 RSI_ENTRY_LONG = 25 # <<< Новая точка входа для LONG
-RSI_ENTRY_SHORT = 75 # <<< Новая точка входа для SHORT
+RSI_ENTRY_SHORT = 65 # <<< Новая точка входа для SHORT
 PRICE_TAKE_PROFIT_PERCENT = 0.005 # 0.5%
 PRICE_STOP_LOSS_PERCENT = 0.005 # 0.5%
 
