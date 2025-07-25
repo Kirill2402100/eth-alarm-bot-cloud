@@ -17,11 +17,13 @@ log = logging.getLogger("bot")
 PAIR_TO_SCAN = 'SOL/USDT'
 TIMEFRAME = '1m'
 SCAN_INTERVAL = 5
-PROBABILITY_THRESHOLD = 0.65
+
+# <<< НОВАЯ ЛОГИКА СИГНАЛА >>>
+PROBABILITY_DIFFERENCE_THRESHOLD = 0.20 # Сигнал, если разница > 20%
+
 TP_PERCENT = 0.005  # 0.5%
 SL_PERCENT = 0.005  # 0.5%
 
-# --- Загрузка ML модели ---
 try:
     ML_MODEL = xgb.Booster()
     ML_MODEL.load_model('trading_model.json')
@@ -88,6 +90,7 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
         prediction_prob = ML_MODEL.predict(xgb.DMatrix(current_features))[0]
         prob_long = prediction_prob[1]
         prob_short = prediction_prob[2]
+        prob_diff = prob_long - prob_short
         
         debug_info = {
             "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
@@ -99,10 +102,11 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
         }
         await log_debug_data(debug_info)
 
+        # <<< ИЗМЕНЕНИЕ ЗДЕСЬ: ПРОВЕРЯЕМ РАЗНИЦУ ВЕРОЯТНОСТЕЙ >>>
         side, probability = None, 0
-        if prob_long > PROBABILITY_THRESHOLD and prob_long > prob_short:
+        if prob_diff > PROBABILITY_DIFFERENCE_THRESHOLD:
             side, probability = "LONG", prob_long
-        elif prob_short > PROBABILITY_THRESHOLD and prob_short > prob_long:
+        elif prob_diff < -PROBABILITY_DIFFERENCE_THRESHOLD:
             side, probability = "SHORT", prob_short
         
         if side:
