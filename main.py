@@ -11,10 +11,10 @@ from oauth2client.service_account import ServiceAccountCredentials
 log = logging.getLogger("bot")
 import scanner_engine
 import trade_executor
-import debug_executor
+# <<< Убрали import debug_executor, он больше не нужен >>>
 
 # --- Конфигурация ---
-BOT_VERSION = "ML-3.1-Fixed"
+BOT_VERSION = "RSI-Momentum-1.0" # <<< Изменили версию бота >>>
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
@@ -23,6 +23,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 def setup_sheets():
+    # <<< Функция полностью переписана для соответствия новой стратегии >>>
     if not SHEET_ID or not GOOGLE_CREDENTIALS:
         log.warning("Логирование в Google Sheets отключено.")
         return
@@ -33,37 +34,27 @@ def setup_sheets():
         gs = gspread.authorize(creds)
         ss = gs.open_by_key(SHEET_ID)
 
-        sheet_name = "ML_Trading_Log_v3_Fixed"
+        sheet_name = "RSI_Trading_Log" # Новое имя для лога
         try:
             worksheet = ss.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
             log.info(f"Лист '{sheet_name}' не найден. Создаю новый.")
+            # Новый, упрощенный список заголовков для RSI стратегии
             headers = [
-                "Signal_ID", "Timestamp_UTC", "Pair", "side", "Probability", "Status",
-                "Entry_Price", "Exit_Price", "SL_Price", "TP_Price", 
-                "PNL_USD", "PNL_Percent", "Exit_Time_UTC",
-                "RSI_14", "STOCHk_14_3_3", "EMA_50", "EMA_200", "close", "volume"
+                "Signal_ID", "Timestamp_UTC", "Pair", "side", "Status",
+                "Entry_Price", "Exit_Price", "SL_Price",
+                "PNL_USD", "PNL_Percent", "Exit_Time_UTC", "RSI_at_Entry"
             ]
             worksheet = ss.add_worksheet(title=sheet_name, rows="2000", cols=len(headers))
             worksheet.update(range_name="A1", values=[headers])
             worksheet.format(f"A1:{chr(ord('A')+len(headers)-1)}1", {"textFormat": {"bold": True}})
+        
         trade_executor.TRADE_LOG_WS = worksheet
         log.info(f"Google-Sheets ready. Logging to '{sheet_name}'.")
-        
-        debug_sheet_name = "ML_Debug_Log"
-        try:
-            debug_worksheet = ss.worksheet(debug_sheet_name)
-        except gspread.WorksheetNotFound:
-            log.info(f"Лист '{debug_sheet_name}' не найден. Создаю новый.")
-            debug_headers = ["Timestamp_UTC", "Close_Price", "Prob_Long", "Prob_Short", "RSI_14", "STOCHk_14_3_3"]
-            debug_worksheet = ss.add_worksheet(title=debug_sheet_name, rows="10000", cols=len(debug_headers))
-            debug_worksheet.update(range_name="A1", values=[debug_headers])
-            debug_worksheet.format(f"A1:{chr(ord('A')+len(debug_headers)-1)}1", {"textFormat": {"bold": True}})
-        debug_executor.DEBUG_LOG_WS = debug_worksheet
-        log.info(f"Debug-Sheets ready. Logging to '{debug_sheet_name}'.")
 
     except Exception as e:
         log.error(f"Ошибка инициализации Google Sheets: {e}")
+
 
 async def post_init(app: Application):
     log.info("Бот запущен. Проверяем, нужно ли запускать основной цикл...")
@@ -106,7 +97,8 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     app.bot_data['bot_on'] = True
     app.bot_data['run_loop_on_startup'] = True
     log.info("Команда /run: запускаем основной цикл.")
-    await update.message.reply_text(f"🚀 <b>Запускаю ML-сканер...</b>")
+    # <<< Изменили текст сообщения для пользователя >>>
+    await update.message.reply_text(f"🚀 <b>Запускаю RSI-сканер...</b>")
     task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
     app.bot_data['main_loop_task'] = task
 
