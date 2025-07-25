@@ -1,4 +1,5 @@
 # scanner_engine.py
+
 import asyncio
 import time
 import logging
@@ -6,59 +7,71 @@ import pandas as pd
 import pandas_ta as ta
 import ccxt.async_support as ccxt
 from telegram.ext import Application
-import xgboost as xgb
 from datetime import datetime, timezone
 from trade_executor import log_open_trade, update_closed_trade
-from debug_executor import log_debug_data
+# <<< Убрали debug_executor, т.к. вероятности ML больше не используются >>>
 
 log = logging.getLogger("bot")
 
-# --- Конфигурация ---
+# <<< НОВАЯ КОНФИГУРАЦИЯ СТРАТЕГИИ >>>
 PAIR_TO_SCAN = 'SOL/USDT'
-TIMEFRAME = '1m'
-SCAN_INTERVAL = 5
+TIMEFRAME = '5m' # <<< Изменен таймфрейм
+SCAN_INTERVAL = 10 # Увеличим интервал, чтобы не делать лишних запросов на 5м свечах
 
-# <<< НОВАЯ ЛОГИКА СИГНАЛА >>>
-PROBABILITY_DIFFERENCE_THRESHOLD = 0.20 # Сигнал, если разница > 20%
+# --- Параметры стратегии RSI Momentum ---
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 80
+RSI_OVERSOLD = 20
+RSI_MID_LINE = 50
+PRICE_STOP_LOSS_PERCENT = 0.005 # 0.5%
 
-TP_PERCENT = 0.005  # 0.5%
-SL_PERCENT = 0.005  # 0.5%
+# <<< Убрали загрузку ML Модели >>>
 
-try:
-    ML_MODEL = xgb.Booster()
-    ML_MODEL.load_model('trading_model.json')
-    log.info("ML модель 'trading_model.json' успешно загружена.")
-except Exception as e:
-    log.error(f"Ошибка загрузки модели: {e}")
-    ML_MODEL = None
-
+# <<< Функция теперь возвращает весь DataFrame, чтобы мы могли видеть предыдущие значения RSI >>>
 def calculate_features(ohlcv):
-    if len(ohlcv) < 201: return None
+    if len(ohlcv) < RSI_PERIOD + 2: # Нужно как минимум 2 последних значения RSI
+        return None
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df.ta.rsi(length=14, append=True)
-    df.ta.stoch(k=14, d=3, smooth_k=3, append=True)
-    df.ta.ema(length=50, append=True)
-    df.ta.ema(length=200, append=True)
-    df.ta.atr(length=14, append=True)
+    df.ta.rsi(length=RSI_PERIOD, append=True)
     df.dropna(inplace=True)
-    return df.iloc[-1]
+    return df
 
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
     signal = bot_data['monitored_signals'][0]
     
     try:
+        # Получаем новые данные для расчета текущего RSI
+        ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=RSI_PERIOD + 5)
+        features_df = calculate_features(ohlcv)
+        if features_df is None or len(features_df) < 2:
+            return # Недостаточно данных для анализа
+
+        current_rsi = features_df[f'RSI_{RSI_PERIOD}'].iloc[-1]
+        prev_rsi = features_df[f'RSI_{RSI_PERIOD}'].iloc[-2]
+        
+        # Получаем последнюю цену для проверки Stop Loss
         order_book = await exchange.fetch_order_book(signal['Pair'], limit=1)
         last_price = (order_book['bids'][0][0] + order_book['asks'][0][0]) / 2
 
-        exit_status, exit_price = None, None
+        exit_status, exit_price = None, last_price
         
+        # <<< НОВАЯ ЛОГИКА ВЫХОДА ИЗ СДЕЛКИ >>>
         if signal['side'] == 'LONG':
-            if last_price >= signal['TP_Price']: exit_status, exit_price = "TP_HIT", signal['TP_Price']
-            elif last_price <= signal['SL_Price']: exit_status, exit_price = "SL_HIT", signal['SL_Price']
+            if last_price <= signal['SL_Price']:
+                exit_status = "SL_HIT"
+            elif current_rsi < prev_rsi:
+                exit_status = "RSI_REVERSAL"
+            elif current_rsi >= RSI_OVERBOUGHT:
+                exit_status = "RSI_LIMIT_HIT"
+                
         elif signal['side'] == 'SHORT':
-            if last_price <= signal['TP_Price']: exit_status, exit_price = "TP_HIT", signal['TP_Price']
-            elif last_price >= signal['SL_Price']: exit_status, exit_price = "SL_HIT", signal['SL_Price']
+            if last_price >= signal['SL_Price']:
+                exit_status = "SL_HIT"
+            elif current_rsi > prev_rsi:
+                exit_status = "RSI_REVERSAL"
+            elif current_rsi <= RSI_OVERSOLD:
+                exit_status = "RSI_LIMIT_HIT"
 
         if exit_status:
             pnl_pct_raw = ((exit_price - signal['Entry_Price']) / signal['Entry_Price']) * (1 if signal['side'] == 'LONG' else -1)
@@ -69,88 +82,80 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 
             emoji = "✅" if pnl_usd > 0 else "❌"
             msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({exit_status})</b>\n\n"
+                   f"<b>Пара:</b> {signal['Pair']}\n"
                    f"<b>Результат: ${pnl_usd:+.2f} ({pnl_percent_display:+.2f}%)</b>")
             await broadcast_func(app, msg)
             
+            # <<< Передаем None вместо PNL, т.к. он уже не используется в этой функции >>>
             await update_closed_trade(signal['Signal_ID'], exit_status, exit_price, pnl_usd, pnl_percent_display)
             bot_data['monitored_signals'] = []
 
     except Exception as e:
         log.error(f"Ошибка мониторинга: {e}", exc_info=True)
 
+
 async def scan_for_signals(exchange, app: Application, broadcast_func):
     try:
-        ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=300)
-        features_series = calculate_features(ohlcv)
-        if features_series is None: return
+        ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=RSI_PERIOD + 5)
+        features_df = calculate_features(ohlcv)
+        if features_df is None or len(features_df) < 2:
+            return # Недостаточно данных для анализа
 
-        features_for_model = ['RSI_14', 'STOCHk_14_3_3', 'EMA_50', 'EMA_200', 'close', 'volume', 'ATRr_14']
-        current_features = pd.DataFrame([features_series[features_for_model]])
-        
-        prediction_prob = ML_MODEL.predict(xgb.DMatrix(current_features))[0]
-        prob_long = prediction_prob[1]
-        prob_short = prediction_prob[2]
-        prob_diff = prob_long - prob_short
-        
-        debug_info = {
-            "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-            "Close_Price": f"{features_series['close']:.4f}".replace('.',','),
-            "Prob_Long": f"{prob_long:.2%}",
-            "Prob_Short": f"{prob_short:.2%}",
-            "RSI_14": f"{features_series['RSI_14']:.2f}".replace('.',','),
-            "STOCHk_14_3_3": f"{features_series['STOCHk_14_3_3']:.2f}".replace('.',',')
-        }
-        await log_debug_data(debug_info)
+        current_rsi = features_df[f'RSI_{RSI_PERIOD}'].iloc[-1]
+        prev_rsi = features_df[f'RSI_{RSI_PERIOD}'].iloc[-2]
 
-        # <<< ИЗМЕНЕНИЕ ЗДЕСЬ: ПРОВЕРЯЕМ РАЗНИЦУ ВЕРОЯТНОСТЕЙ >>>
-        side, probability = None, 0
-        if prob_diff > PROBABILITY_DIFFERENCE_THRESHOLD:
-            side, probability = "LONG", prob_long
-        elif prob_diff < -PROBABILITY_DIFFERENCE_THRESHOLD:
-            side, probability = "SHORT", prob_short
+        side = None
+        
+        # <<< НОВАЯ ЛОГИКА ВХОДА В СДЕЛКУ >>>
+        if prev_rsi < RSI_MID_LINE and current_rsi > RSI_MID_LINE:
+            side = "LONG"
+        elif prev_rsi > RSI_MID_LINE and current_rsi < RSI_MID_LINE:
+            side = "SHORT"
         
         if side:
-            await execute_trade(app, broadcast_func, features_series, side, probability)
+            # Передаем последнюю цену закрытия из DataFrame
+            await execute_trade(app, broadcast_func, features_df.iloc[-1], side)
         
+        # Информационное сообщение в live-режиме
         if app.bot_data.get('live_info_on', False):
-            info_msg = (f"<b>[ML INFO]</b> | Prob (L/S): <code>{prob_long:.1%} / {prob_short:.1%}</code> | "
-                        f"Close: <code>{features_series['close']:.2f}</code>")
+            info_msg = (f"<b>[RSI INFO]</b> | Current: <code>{current_rsi:.2f}</code> | "
+                        f"Close: <code>{features_df['close'].iloc[-1]:.2f}</code>")
             await broadcast_func(app, info_msg)
 
     except Exception as e:
         log.error(f"Ошибка сканирования: {e}", exc_info=True)
 
-async def execute_trade(app, broadcast_func, features, side, probability):
+
+async def execute_trade(app, broadcast_func, features, side):
+    # <<< Убрали 'probability' из аргументов >>>
     entry_price = features['close']
-    sl_price = entry_price * (1 - SL_PERCENT) if side == "LONG" else entry_price * (1 + SL_PERCENT)
-    tp_price = entry_price * (1 + TP_PERCENT) if side == "LONG" else entry_price * (1 - TP_PERCENT)
-    signal_id = f"ml_{int(time.time() * 1000)}"
+    sl_price = entry_price * (1 - PRICE_STOP_LOSS_PERCENT) if side == "LONG" else entry_price * (1 + PRICE_STOP_LOSS_PERCENT)
+    signal_id = f"rsi_{int(time.time() * 1000)}"
 
     decision = {
         "Signal_ID": signal_id, "Pair": PAIR_TO_SCAN, "side": side,
-        "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": tp_price,
-        "Probability": f"{probability:.2%}", "Status": "ACTIVE",
+        "Entry_Price": entry_price, "SL_Price": sl_price, 
+        "Status": "ACTIVE",
         "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-        "RSI_14": features.get('RSI_14'), "STOCHk_14_3_3": features.get('STOCHk_14_3_3'), 
-        "EMA_50": features.get('EMA_50'), "EMA_200": features.get('EMA_200'), 
-        "close": features.get('close'), "volume": features.get('volume')
+        # <<< Упростили словарь, убрав лишние данные >>>
+        "RSI_at_Entry": features.get(f'RSI_{RSI_PERIOD}'),
     }
     
     app.bot_data.setdefault('monitored_signals', []).append(decision)
+    # <<< TP_Price больше нет, он определяется динамически по RSI >>>
     await log_open_trade(decision)
 
-    msg = (f"🔥 <b>ML СИГНАЛ НА ВХОД ({side})</b>\n\n"
-           f"<b>Вероятность успеха:</b> <code>{probability:.1%}</code> (ID: {signal_id})\n"
+    msg = (f"🔥 <b>RSI СИГНАЛ НА ВХОД ({side})</b>\n\n"
+           f"<b>Пара:</b> {PAIR_TO_SCAN}\n"
            f"<b>Вход:</b> <code>{entry_price:.4f}</code>\n"
-           f"<b>SL:</b> <code>{sl_price:.4f}</code> | <b>TP:</b> <code>{tp_price:.4f}</code>")
+           f"<b>SL:</b> <code>{sl_price:.4f}</code>\n"
+           f"<i>(TP будет определен по развороту RSI)</i>")
     await broadcast_func(app, msg)
 
-async def scanner_main_loop(app: Application, broadcast_func):
-    log.info("Main Engine loop starting...")
-    if ML_MODEL is None:
-        await broadcast_func(app, "<b>ОШИБКА: ML модель не найдена.</b>")
-        return
 
+async def scanner_main_loop(app: Application, broadcast_func):
+    log.info("RSI Momentum Engine loop starting...")
+    
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     await exchange.load_markets()
     
@@ -163,4 +168,4 @@ async def scanner_main_loop(app: Application, broadcast_func):
         await asyncio.sleep(SCAN_INTERVAL)
         
     await exchange.close()
-    log.info("Main Engine loop stopped.")
+    log.info("RSI Momentum Engine loop stopped.")
