@@ -38,7 +38,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
     signal = bot_data['monitored_signals'][0]
     
     try:
-        ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=RSI_PERIOD + 5)
+        ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=300)
         features_df = calculate_features(ohlcv)
         if features_df is None or len(features_df) < 2:
             return
