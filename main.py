@@ -1,3 +1,4 @@
+# main.py
 import os
 import asyncio
 import json
@@ -5,7 +6,7 @@ import logging
 from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, PicklePersistence
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials # <-- УБЕДИТЕСЬ, ЧТО ЭТА СТРОКА ЕСТЬ
+from oauth2client.service_account import ServiceAccountCredentials
 
 log = logging.getLogger("bot")
 import scanner_engine
@@ -13,14 +14,13 @@ import trade_executor
 import debug_executor
 
 # --- Конфигурация ---
-BOT_VERSION = "ML-2.1-Debug"
+BOT_VERSION = "ML-3.1-Fixed"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.INFO)
 
 def setup_sheets():
     if not SHEET_ID or not GOOGLE_CREDENTIALS:
@@ -32,17 +32,16 @@ def setup_sheets():
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         gs = gspread.authorize(creds)
         ss = gs.open_by_key(SHEET_ID)
-        
-        # --- Настройка основного лога сделок ---
-        sheet_name = "ML_Trading_Log_v2"
+
+        sheet_name = "ML_Trading_Log_v3_Fixed"
         try:
             worksheet = ss.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
             log.info(f"Лист '{sheet_name}' не найден. Создаю новый.")
             headers = [
-                "Signal_ID", "Timestamp_UTC", "Pair", "Algorithm_Type", "side", "Probability", 
+                "Signal_ID", "Timestamp_UTC", "Pair", "side", "Probability", "Status",
                 "Entry_Price", "Exit_Price", "SL_Price", "TP_Price", 
-                "Status", "Exit_Time_UTC", "PNL_USD", "PNL_Percent",
+                "PNL_USD", "PNL_Percent", "Exit_Time_UTC",
                 "RSI_14", "STOCHk_14_3_3", "EMA_50", "EMA_200", "close", "volume"
             ]
             worksheet = ss.add_worksheet(title=sheet_name, rows="2000", cols=len(headers))
@@ -50,8 +49,7 @@ def setup_sheets():
             worksheet.format(f"A1:{chr(ord('A')+len(headers)-1)}1", {"textFormat": {"bold": True}})
         trade_executor.TRADE_LOG_WS = worksheet
         log.info(f"Google-Sheets ready. Logging to '{sheet_name}'.")
-
-        # --- Настройка лога для отладки ---
+        
         debug_sheet_name = "ML_Debug_Log"
         try:
             debug_worksheet = ss.worksheet(debug_sheet_name)
@@ -68,16 +66,18 @@ def setup_sheets():
         log.error(f"Ошибка инициализации Google Sheets: {e}")
 
 async def post_init(app: Application):
-    """Действия после запуска бота."""
     log.info("Бот запущен. Проверяем, нужно ли запускать основной цикл...")
     if app.bot_data.get('run_loop_on_startup', False):
         log.info("Обнаружен флаг 'run_loop_on_startup'. Запускаю основной цикл.")
         asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
     await app.bot.set_my_commands([
         ('start', 'Запустить/перезапустить бота'),
-        ('run', 'Запустить/остановить основной цикл'),
+        ('run', 'Запустить сканер'),
+        ('stop', 'Остановить сканер'),
         ('status', 'Показать текущий статус'),
-        ('info', 'Включить/выключить live-логи')
+        ('info', 'Включить/выключить live-логи'),
+        ('deposit', 'Установить депозит'),
+        ('leverage', 'Установить плечо')
     ])
 
 async def broadcast(app: Application, txt: str):
@@ -99,22 +99,31 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     app = ctx.application
     is_running = not (app.bot_data.get('main_loop_task') is None or app.bot_data['main_loop_task'].done())
-
     if is_running:
-        app.bot_data['bot_on'] = False
-        if app.bot_data.get('main_loop_task'):
-             app.bot_data['main_loop_task'].cancel()
-        app.bot_data['run_loop_on_startup'] = False
-        log.info("Команда /run: останавливаем основной цикл.")
-        await update.message.reply_text("🛑 <b>Сканер остановлен.</b>")
-    else:
-        app.bot_data['bot_on'] = True
-        app.bot_data['run_loop_on_startup'] = True
-        log.info("Команда /run: запускаем основной цикл.")
-        await update.message.reply_text(f"🚀 <b>Запускаю ML-сканер...</b>")
-        task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
-        app.bot_data['main_loop_task'] = task
+        await update.message.reply_text("ℹ️ Сканер уже запущен. Для остановки используйте /stop.")
+        return
+    
+    app.bot_data['bot_on'] = True
+    app.bot_data['run_loop_on_startup'] = True
+    log.info("Команда /run: запускаем основной цикл.")
+    await update.message.reply_text(f"🚀 <b>Запускаю ML-сканер...</b>")
+    task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
+    app.bot_data['main_loop_task'] = task
+
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    app = ctx.application
+    is_running = not (app.bot_data.get('main_loop_task') is None or app.bot_data['main_loop_task'].done())
+    if not is_running:
+        await update.message.reply_text("ℹ️ Сканер уже остановлен.")
+        return
         
+    app.bot_data['bot_on'] = False
+    if app.bot_data.get('main_loop_task'):
+        app.bot_data['main_loop_task'].cancel()
+    app.bot_data['run_loop_on_startup'] = False
+    log.info("Команда /stop: останавливаем основной цикл.")
+    await update.message.reply_text("🛑 <b>Сканер остановлен.</b>")
+    
 async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     bot_data = ctx.bot_data
     is_running = not (bot_data.get('main_loop_task') is None or bot_data['main_loop_task'].done())
@@ -151,13 +160,12 @@ async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == "__main__":
     setup_sheets()
-    
     persistence = PicklePersistence(filepath="bot_persistence")
-    
     app = ApplicationBuilder().token(BOT_TOKEN).persistence(persistence).post_init(post_init).build()
     
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("run", cmd_run))
+    app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("info", cmd_info))
     app.add_handler(CommandHandler("deposit", cmd_deposit))
