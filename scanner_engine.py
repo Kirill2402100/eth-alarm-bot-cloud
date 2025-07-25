@@ -17,9 +17,9 @@ log = logging.getLogger("bot")
 PAIR_TO_SCAN = 'SOL/USDT'
 TIMEFRAME = '1m'
 SCAN_INTERVAL = 5
-PROBABILITY_THRESHOLD = 0.65 
-TP_PERCENT = 0.01
-SL_PERCENT = 0.005
+PROBABILITY_THRESHOLD = 0.65
+TP_PERCENT = 0.005  # 0.5%
+SL_PERCENT = 0.005  # 0.5%
 
 # --- Загрузка ML модели ---
 try:
@@ -37,6 +37,7 @@ def calculate_features(ohlcv):
     df.ta.stoch(k=14, d=3, smooth_k=3, append=True)
     df.ta.ema(length=50, append=True)
     df.ta.ema(length=200, append=True)
+    df.ta.atr(length=14, append=True)
     df.dropna(inplace=True)
     return df.iloc[-1]
 
@@ -81,7 +82,7 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
         features_series = calculate_features(ohlcv)
         if features_series is None: return
 
-        features_for_model = ['RSI_14', 'STOCHk_14_3_3', 'EMA_50', 'EMA_200', 'close', 'volume']
+        features_for_model = ['RSI_14', 'STOCHk_14_3_3', 'EMA_50', 'EMA_200', 'close', 'volume', 'ATRr_14']
         current_features = pd.DataFrame([features_series[features_for_model]])
         
         prediction_prob = ML_MODEL.predict(xgb.DMatrix(current_features))[0]
@@ -90,11 +91,11 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
         
         debug_info = {
             "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-            "Close_Price": features_series['close'],
+            "Close_Price": f"{features_series['close']:.4f}".replace('.',','),
             "Prob_Long": f"{prob_long:.2%}",
             "Prob_Short": f"{prob_short:.2%}",
-            "RSI_14": features_series['RSI_14'],
-            "STOCHk_14_3_3": features_series['STOCHk_14_3_3']
+            "RSI_14": f"{features_series['RSI_14']:.2f}".replace('.',','),
+            "STOCHk_14_3_3": f"{features_series['STOCHk_14_3_3']:.2f}".replace('.',',')
         }
         await log_debug_data(debug_info)
 
@@ -126,10 +127,9 @@ async def execute_trade(app, broadcast_func, features, side, probability):
         "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": tp_price,
         "Probability": f"{probability:.2%}", "Status": "ACTIVE",
         "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-        "Algorithm_Type": "ML-XGBoost-v2", "RSI_14": features.get('RSI_14'),
-        "STOCHk_14_3_3": features.get('STOCHk_14_3_3'), "EMA_50": features.get('EMA_50'),
-        "EMA_200": features.get('EMA_200'), "close": features.get('close'),
-        "volume": features.get('volume')
+        "RSI_14": features.get('RSI_14'), "STOCHk_14_3_3": features.get('STOCHk_14_3_3'), 
+        "EMA_50": features.get('EMA_50'), "EMA_200": features.get('EMA_200'), 
+        "close": features.get('close'), "volume": features.get('volume')
     }
     
     app.bot_data.setdefault('monitored_signals', []).append(decision)
