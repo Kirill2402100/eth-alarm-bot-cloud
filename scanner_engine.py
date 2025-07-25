@@ -12,7 +12,7 @@ from trade_executor import log_open_trade, update_closed_trade
 
 log = logging.getLogger("bot")
 
-# <<< НОВАЯ КОНФИГУРАЦИЯ СТРАТЕГИИ >>>
+# --- Конфигурация стратегии ---
 PAIR_TO_SCAN = 'SOL/USDT'
 TIMEFRAME = '1m'
 SCAN_INTERVAL = 5 
@@ -20,18 +20,17 @@ SCAN_INTERVAL = 5
 # --- Параметры стратегии RSI Reversal v2 ---
 RSI_PERIOD = 14
 RSI_ENTRY_LONG = 25
-RSI_ENTRY_SHORT = 65
-PRICE_TAKE_PROFIT_PERCENT = 0.002 # <<< Изменено на 0.2%
-PRICE_STOP_LOSS_PERCENT = 0.002 # <<< Изменено на 0.2%
+RSI_ENTRY_SHORT = 75 # Рекомендуемое значение
+PRICE_TAKE_PROFIT_PERCENT = 0.002 # 0.2%
+PRICE_STOP_LOSS_PERCENT = 0.002 # 0.2%
 
 
 def calculate_features(ohlcv):
-    # <<< ВАЖНОЕ ИСПРАВЛЕНИЕ: Запрашиваем больше данных для точности RSI >>>
     if len(ohlcv) < RSI_PERIOD + 2:
         return None
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df.ta.rsi(length=RSI_PERIOD, append=True)
-    df.dropna(inplace=True)
+    # df.dropna(inplace=True) # <<< КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Эта строка удалена
     return df
 
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
@@ -39,13 +38,11 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
     signal = bot_data['monitored_signals'][0]
     
     try:
-        # <<< Упростили мониторинг, теперь не нужно получать историю свечей >>>
         order_book = await exchange.fetch_order_book(signal['Pair'], limit=1)
         last_price = (order_book['bids'][0][0] + order_book['asks'][0][0]) / 2
 
         exit_status, exit_price = None, last_price
         
-        # <<< УПРОЩЕННАЯ ЛОГИКА ВЫХОДА: Убрали проверку разворота RSI >>>
         if signal['side'] == 'LONG':
             if last_price >= signal['TP_Price']:
                 exit_status = "TP_HIT"
@@ -80,14 +77,17 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 
 async def scan_for_signals(exchange, app: Application, broadcast_func):
     try:
-        # <<< ВАЖНОЕ ИСПРАВЛЕНИЕ: Загружаем 300 свечей для точного расчета RSI >>>
         ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=300)
         features_df = calculate_features(ohlcv)
-        if features_df is None or len(features_df) < 2:
+        if features_df is None or len(features_df.tail(2)) < 2:
             return 
 
         current_rsi = features_df[f'RSI_{RSI_PERIOD}'].iloc[-1]
         prev_rsi = features_df[f'RSI_{RSI_PERIOD}'].iloc[-2]
+
+        # Проверяем, что значения RSI не пустые (NaN)
+        if pd.isna(current_rsi) or pd.isna(prev_rsi):
+            return
 
         side = None
         
