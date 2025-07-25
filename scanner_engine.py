@@ -17,20 +17,33 @@ PAIR_TO_SCAN = 'SOL/USDT'
 TIMEFRAME = '1m'
 SCAN_INTERVAL = 5 
 
-# --- Параметры стратегии RSI Reversal v2 ---
-RSI_PERIOD = 6
-RSI_ENTRY_LONG = 25
-RSI_ENTRY_SHORT = 75 # Рекомендуемое значение
-PRICE_TAKE_PROFIT_PERCENT = 0.001 # 0.1%
-PRICE_STOP_LOSS_PERCENT = 0.001 # 0.1%
+# --- Параметры стратегии ---
+RSI_PERIOD = 14
+PRICE_TAKE_PROFIT_PERCENT = 0.001
+PRICE_STOP_LOSS_PERCENT = 0.001
 
+# <<< НОВЫЕ ПАРАМЕТРЫ ДЛЯ РАЗНЫХ РЕЖИМОВ РЫНКА >>>
+# --- Активный рынок (высокая волатильность) ---
+ACTIVE_RSI_ENTRY_LONG = 25
+ACTIVE_RSI_ENTRY_SHORT = 75
+
+# --- Неактивный рынок (низкая волатильность) ---
+INACTIVE_RSI_ENTRY_LONG = 40
+INACTIVE_RSI_ENTRY_SHORT = 65
+
+# --- Настройки индикатора активности рынка (ATR) ---
+ATR_PERIOD = 6
+ATR_AVG_PERIOD = 100 # Период для скользящей средней ATR
 
 def calculate_features(ohlcv):
-    if len(ohlcv) < RSI_PERIOD + 2:
+    if len(ohlcv) < ATR_AVG_PERIOD: # Убедимся, что данных достаточно для всех расчетов
         return None
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df.ta.rsi(length=RSI_PERIOD, append=True)
-    # df.dropna(inplace=True) # <<< КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Эта строка удалена
+    # <<< ДОБАВЛЕН РАСЧЕТ ATR ДЛЯ ОПРЕДЕЛЕНИЯ АКТИВНОСТИ >>>
+    df.ta.atr(length=ATR_PERIOD, append=True)
+    # Считаем скользящую среднюю от ATR, чтобы понимать, выше или ниже нормы текущая волатильность
+    df[f'ATR_AVG_{ATR_AVG_PERIOD}'] = df[f'ATRr_{ATR_PERIOD}'].rolling(window=ATR_AVG_PERIOD).mean()
     return df
 
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
@@ -44,16 +57,11 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         exit_status, exit_price = None, last_price
         
         if signal['side'] == 'LONG':
-            if last_price >= signal['TP_Price']:
-                exit_status = "TP_HIT"
-            elif last_price <= signal['SL_Price']:
-                exit_status = "SL_HIT"
-                
+            if last_price >= signal['TP_Price']: exit_status = "TP_HIT"
+            elif last_price <= signal['SL_Price']: exit_status = "SL_HIT"
         elif signal['side'] == 'SHORT':
-            if last_price <= signal['TP_Price']:
-                exit_status = "TP_HIT"
-            elif last_price >= signal['SL_Price']:
-                exit_status = "SL_HIT"
+            if last_price <= signal['TP_Price']: exit_status = "TP_HIT"
+            elif last_price >= signal['SL_Price']: exit_status = "SL_HIT"
 
         if exit_status:
             pnl_pct_raw = ((exit_price - signal['Entry_Price']) / signal['Entry_Price']) * (1 if signal['side'] == 'LONG' else -1)
@@ -79,29 +87,42 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
     try:
         ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=300)
         features_df = calculate_features(ohlcv)
-        if features_df is None or len(features_df.tail(2)) < 2:
-            return 
+        if features_df is None or len(features_df.tail(2)) < 2: return 
 
+        # <<< ЛОГИКА ПЕРЕКЛЮЧЕНИЯ ПАРАМЕТРОВ >>>
+        current_atr = features_df[f'ATRr_{ATR_PERIOD}'].iloc[-1]
+        avg_atr = features_df[f'ATR_AVG_{ATR_AVG_PERIOD}'].iloc[-1]
+        
+        market_is_active = current_atr > avg_atr
+        
+        if market_is_active:
+            rsi_entry_long = ACTIVE_RSI_ENTRY_LONG
+            rsi_entry_short = ACTIVE_RSI_ENTRY_SHORT
+            market_status_str = "АКТИВНЫЙ"
+        else:
+            rsi_entry_long = INACTIVE_RSI_ENTRY_LONG
+            rsi_entry_short = INACTIVE_RSI_ENTRY_SHORT
+            market_status_str = "НЕАКТИВНЫЙ"
+        
+        # --- Основная логика входа ---
         current_rsi = features_df[f'RSI_{RSI_PERIOD}'].iloc[-1]
         prev_rsi = features_df[f'RSI_{RSI_PERIOD}'].iloc[-2]
 
-        # Проверяем, что значения RSI не пустые (NaN)
-        if pd.isna(current_rsi) or pd.isna(prev_rsi):
-            return
+        if pd.isna(current_rsi) or pd.isna(prev_rsi): return
 
         side = None
-        
-        if prev_rsi < RSI_ENTRY_LONG and current_rsi >= RSI_ENTRY_LONG:
+        if prev_rsi < rsi_entry_long and current_rsi >= rsi_entry_long:
             side = "LONG"
-        elif prev_rsi > RSI_ENTRY_SHORT and current_rsi <= RSI_ENTRY_SHORT:
+        elif prev_rsi > rsi_entry_short and current_rsi <= rsi_entry_short:
             side = "SHORT"
         
         if side:
             await execute_trade(app, broadcast_func, features_df.iloc[-1], side)
         
         if app.bot_data.get('live_info_on', False):
-            info_msg = (f"<b>[RSI INFO]</b> | Current: <code>{current_rsi:.2f}</code> | "
-                        f"Close: <code>{features_df['close'].iloc[-1]:.2f}</code>")
+            info_msg = (f"<b>[INFO]</b> Рынок: {market_status_str}\n"
+                        f"RSI: <code>{current_rsi:.2f}</code> | "
+                        f"ATR: <code>{current_atr:.4f}</code> (Avg: <code>{avg_atr:.4f}</code>)")
             await broadcast_func(app, info_msg)
 
     except Exception as e:
@@ -133,7 +154,7 @@ async def execute_trade(app, broadcast_func, features, side):
 
 
 async def scanner_main_loop(app: Application, broadcast_func):
-    log.info("RSI Reversal Engine v2 loop starting...")
+    log.info("Adaptive RSI Engine loop starting...")
     
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     await exchange.load_markets()
@@ -147,4 +168,4 @@ async def scanner_main_loop(app: Application, broadcast_func):
         await asyncio.sleep(SCAN_INTERVAL)
         
     await exchange.close()
-    log.info("RSI Reversal Engine v2 loop stopped.")
+    log.info("Adaptive RSI Engine loop stopped.")
