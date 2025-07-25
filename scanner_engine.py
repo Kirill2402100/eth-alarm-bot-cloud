@@ -14,18 +14,19 @@ log = logging.getLogger("bot")
 
 # <<< НОВАЯ КОНФИГУРАЦИЯ СТРАТЕГИИ >>>
 PAIR_TO_SCAN = 'SOL/USDT'
-TIMEFRAME = '1m' # <<< Изменен таймфрейм
+TIMEFRAME = '1m'
 SCAN_INTERVAL = 5 
 
-# --- Параметры стратегии RSI Reversal ---
+# --- Параметры стратегии RSI Reversal v2 ---
 RSI_PERIOD = 14
-RSI_ENTRY_LONG = 25 # <<< Новая точка входа для LONG
-RSI_ENTRY_SHORT = 65 # <<< Новая точка входа для SHORT
-PRICE_TAKE_PROFIT_PERCENT = 0.005 # 0.5%
-PRICE_STOP_LOSS_PERCENT = 0.005 # 0.5%
+RSI_ENTRY_LONG = 25
+RSI_ENTRY_SHORT = 65
+PRICE_TAKE_PROFIT_PERCENT = 0.002 # <<< Изменено на 0.2%
+PRICE_STOP_LOSS_PERCENT = 0.002 # <<< Изменено на 0.2%
 
 
 def calculate_features(ohlcv):
+    # <<< ВАЖНОЕ ИСПРАВЛЕНИЕ: Запрашиваем больше данных для точности RSI >>>
     if len(ohlcv) < RSI_PERIOD + 2:
         return None
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -38,35 +39,24 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
     signal = bot_data['monitored_signals'][0]
     
     try:
-        ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=300)
-        features_df = calculate_features(ohlcv)
-        if features_df is None or len(features_df) < 2:
-            return
-
-        current_rsi = features_df[f'RSI_{RSI_PERIOD}'].iloc[-1]
-        prev_rsi = features_df[f'RSI_{RSI_PERIOD}'].iloc[-2]
-        
+        # <<< Упростили мониторинг, теперь не нужно получать историю свечей >>>
         order_book = await exchange.fetch_order_book(signal['Pair'], limit=1)
         last_price = (order_book['bids'][0][0] + order_book['asks'][0][0]) / 2
 
         exit_status, exit_price = None, last_price
         
-        # <<< НОВАЯ ЛОГИКА ВЫХОДА ИЗ СДЕЛКИ С TP/SL ПО ЦЕНЕ >>>
+        # <<< УПРОЩЕННАЯ ЛОГИКА ВЫХОДА: Убрали проверку разворота RSI >>>
         if signal['side'] == 'LONG':
             if last_price >= signal['TP_Price']:
                 exit_status = "TP_HIT"
             elif last_price <= signal['SL_Price']:
                 exit_status = "SL_HIT"
-            elif current_rsi < prev_rsi:
-                exit_status = "RSI_REVERSAL"
                 
         elif signal['side'] == 'SHORT':
             if last_price <= signal['TP_Price']:
                 exit_status = "TP_HIT"
             elif last_price >= signal['SL_Price']:
                 exit_status = "SL_HIT"
-            elif current_rsi > prev_rsi:
-                exit_status = "RSI_REVERSAL"
 
         if exit_status:
             pnl_pct_raw = ((exit_price - signal['Entry_Price']) / signal['Entry_Price']) * (1 if signal['side'] == 'LONG' else -1)
@@ -90,7 +80,8 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 
 async def scan_for_signals(exchange, app: Application, broadcast_func):
     try:
-        ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=RSI_PERIOD + 5)
+        # <<< ВАЖНОЕ ИСПРАВЛЕНИЕ: Загружаем 300 свечей для точного расчета RSI >>>
+        ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=300)
         features_df = calculate_features(ohlcv)
         if features_df is None or len(features_df) < 2:
             return 
@@ -100,10 +91,9 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
 
         side = None
         
-        # <<< НОВАЯ ЛОГИКА ВХОДА В СДЕЛКУ >>>
-        if prev_rsi < RSI_ENTRY_LONG and current_rsi > RSI_ENTRY_LONG:
+        if prev_rsi < RSI_ENTRY_LONG and current_rsi >= RSI_ENTRY_LONG:
             side = "LONG"
-        elif prev_rsi > RSI_ENTRY_SHORT and current_rsi < RSI_ENTRY_SHORT:
+        elif prev_rsi > RSI_ENTRY_SHORT and current_rsi <= RSI_ENTRY_SHORT:
             side = "SHORT"
         
         if side:
@@ -120,7 +110,6 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
 
 async def execute_trade(app, broadcast_func, features, side):
     entry_price = features['close']
-    # <<< ДОБАВЛЕН РАСЧЕТ TP_Price >>>
     tp_price = entry_price * (1 + PRICE_TAKE_PROFIT_PERCENT) if side == "LONG" else entry_price * (1 - PRICE_TAKE_PROFIT_PERCENT)
     sl_price = entry_price * (1 - PRICE_STOP_LOSS_PERCENT) if side == "LONG" else entry_price * (1 + PRICE_STOP_LOSS_PERCENT)
     signal_id = f"rsi_{int(time.time() * 1000)}"
@@ -144,7 +133,7 @@ async def execute_trade(app, broadcast_func, features, side):
 
 
 async def scanner_main_loop(app: Application, broadcast_func):
-    log.info("RSI Reversal Engine loop starting...")
+    log.info("RSI Reversal Engine v2 loop starting...")
     
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     await exchange.load_markets()
@@ -158,4 +147,4 @@ async def scanner_main_loop(app: Application, broadcast_func):
         await asyncio.sleep(SCAN_INTERVAL)
         
     await exchange.close()
-    log.info("RSI Reversal Engine loop stopped.")
+    log.info("RSI Reversal Engine v2 loop stopped.")
