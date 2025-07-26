@@ -13,7 +13,7 @@ import scanner_engine
 import trade_executor
 
 # --- Конфигурация ---
-BOT_VERSION = "StochRSI-Advanced-1.0"
+BOT_VERSION = "StochRSI-70-30-1.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
@@ -32,16 +32,17 @@ def setup_sheets():
         gs = gspread.authorize(creds)
         ss = gs.open_by_key(SHEET_ID)
 
+        # --- Лист для записи сделок ---
         trade_sheet_name = "Trading_Log"
         try:
             trade_worksheet = ss.worksheet(trade_sheet_name)
         except gspread.WorksheetNotFound:
             log.info(f"Лист '{trade_sheet_name}' не найден. Создаю новый.")
-            # <<< Добавлена колонка Exit_Detail >>>
             headers = [
                 "Signal_ID", "Timestamp_UTC", "Pair", "side", "Status",
-                "Entry_Price", "Exit_Price", "SL_Price", "TP_Price",
-                "PNL_USD", "PNL_Percent", "Exit_Time_UTC", "StochRSI_at_Entry", "Exit_Detail"
+                "Entry_Price", "Exit_Price", "SL_Price",
+                "PNL_USD", "PNL_Percent", "Exit_Time_UTC", 
+                "StochRSI_at_Entry", "Exit_Detail", "ATR_at_Entry" # <<< Добавлена колонка ATR
             ]
             trade_worksheet = ss.add_worksheet(title=trade_sheet_name, rows="2000", cols=len(headers))
             trade_worksheet.update(range_name="A1", values=[headers])
@@ -49,12 +50,13 @@ def setup_sheets():
         trade_executor.TRADE_LOG_WS = trade_worksheet
         log.info(f"Google-Sheets ready. Logging trades to '{trade_sheet_name}'.")
 
+        # --- Лист для аналитики ---
         analysis_sheet_name = "Strategy_Analysis_Log"
         try:
             analysis_worksheet = ss.worksheet(analysis_sheet_name)
         except gspread.WorksheetNotFound:
             log.info(f"Лист '{analysis_sheet_name}' не найден. Создаю новый.")
-            headers = ["Timestamp_UTC", "Close_Price", "StochRSI_k", "EMA_200", "Trend_Direction"]
+            headers = ["Timestamp_UTC", "Close_Price", "StochRSI_k", "EMA_200", "Trend_Direction", "ATR_14"] # <<< Добавлена колонка ATR
             analysis_worksheet = ss.add_worksheet(title=analysis_sheet_name, rows="10000", cols=len(headers))
             analysis_worksheet.update(range_name="A1", values=[headers])
             analysis_worksheet.format(f"A1:{chr(ord('A')+len(headers)-1)}1", {"textFormat": {"bold": True}})
