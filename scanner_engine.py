@@ -17,23 +17,26 @@ PAIR_TO_SCAN = 'SOL/USDT'
 TIMEFRAME = '1m'
 SCAN_INTERVAL = 5 
 
-# <<< НОВЫЕ ПАРАМЕТРЫ ДЛЯ СТРАТЕГИИ "ЕЗДА НА ИМПУЛЬСЕ" >>>
+# --- Параметры стратегии ---
 STOCHRSI_PERIOD = 14
+STOCHRSI_K_PERIOD = 3 # Стандартный параметр для Smooth K
+STOCHRSI_D_PERIOD = 3 # Стандартный параметр для Smooth D
 EMA_PERIOD = 200
-STOCHRSI_UPPER_BAND = 80 # Уровень для входа в LONG и выхода из него
-STOCHRSI_LOWER_BAND = 20 # Уровень для входа в SHORT и выхода из него
-PRICE_STOP_LOSS_PERCENT = 0.003 # Защитный стоп-лосс
+STOCHRSI_UPPER_BAND = 80
+STOCHRSI_LOWER_BAND = 20
+PRICE_STOP_LOSS_PERCENT = 0.002
 
 def calculate_features(ohlcv):
     if len(ohlcv) < EMA_PERIOD: return None
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    stoch_rsi_df = df.ta.stochrsi(length=STOCHRSI_PERIOD, rsi_length=STOCHRSI_PERIOD, k=3, d=3)
-    df['stochrsi_k'] = stoch_rsi_df.iloc[:, 0]
+    # <<< РАСЧЕТ StochRSI С ЛИНИЯМИ K и D >>>
+    stoch_rsi_df = df.ta.stochrsi(length=STOCHRSI_PERIOD, rsi_length=STOCHRSI_PERIOD, k=STOCHRSI_K_PERIOD, d=STOCHRSI_D_PERIOD)
+    df['stochrsi_k'] = stoch_rsi_df.iloc[:, 0] # Smooth K
+    df['stochrsi_d'] = stoch_rsi_df.iloc[:, 1] # Smooth D
     df[f'EMA_{EMA_PERIOD}'] = df.ta.ema(length=EMA_PERIOD)
     return df
 
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
-    # <<< ЛОГИКА ВЫХОДА ПОЛНОСТЬЮ ПЕРЕПИСАНА >>>
     bot_data = app.bot_data
     signal = bot_data['monitored_signals'][0]
     try:
@@ -45,10 +48,12 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         prev_row = features_df.iloc[-2]
 
         last_price = last_row['close']
-        current_stochrsi = last_row['stochrsi_k']
-        prev_stochrsi = prev_row['stochrsi_k']
+        
+        # <<< ПОЛУЧАЕМ ЗНАЧЕНИЯ K и D ДЛЯ ТЕКУЩЕЙ И ПРЕДЫДУЩЕЙ СВЕЧИ >>>
+        current_k, current_d = last_row['stochrsi_k'], last_row['stochrsi_d']
+        prev_k, prev_d = prev_row['stochrsi_k'], prev_row['stochrsi_d']
 
-        if pd.isna(current_stochrsi) or pd.isna(prev_stochrsi): return
+        if pd.isna(current_k) or pd.isna(current_d) or pd.isna(prev_k) or pd.isna(prev_d): return
 
         exit_status, exit_price, exit_detail = None, last_price, None
         
@@ -56,18 +61,18 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         if signal['side'] == 'LONG':
             if last_price <= signal['SL_Price']:
                 exit_status = "SL_HIT"
-            # Основной выход: StochRSI упал ниже верхней границы, показав ослабление импульса
-            elif prev_stochrsi > STOCHRSI_UPPER_BAND and current_stochrsi <= STOCHRSI_UPPER_BAND:
-                exit_status = "MOMENTUM_FADE" # Импульс угас
-                exit_detail = f"StochRSI: {current_stochrsi:.2f}"
+            # <<< ВЫХОД ПО ПЕРЕСЕЧЕНИЮ: K пересек D сверху вниз >>>
+            elif prev_k > prev_d and current_k <= current_d:
+                exit_status = "STOCHRSI_CROSS"
+                exit_detail = f"K:{current_k:.2f} | D:{current_d:.2f}"
 
         elif signal['side'] == 'SHORT':
             if last_price >= signal['SL_Price']:
                 exit_status = "SL_HIT"
-            # Основной выход: StochRSI поднялся выше нижней границы
-            elif prev_stochrsi < STOCHRSI_LOWER_BAND and current_stochrsi >= STOCHRSI_LOWER_BAND:
-                exit_status = "MOMENTUM_FADE"
-                exit_detail = f"StochRSI: {current_stochrsi:.2f}"
+            # <<< ВЫХОД ПО ПЕРЕСЕЧЕНИЮ: K пересек D снизу вверх >>>
+            elif prev_k < prev_d and current_k >= current_d:
+                exit_status = "STOCHRSI_CROSS"
+                exit_detail = f"K:{current_k:.2f} | D:{current_d:.2f}"
 
         if exit_status:
             pnl_pct_raw = ((exit_price - signal['Entry_Price']) / signal['Entry_Price']) * (1 if signal['side'] == 'LONG' else -1)
@@ -78,7 +83,6 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 
             emoji = "✅" if pnl_usd > 0 else "❌"
             msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({exit_status})</b>\n\n"
-                   f"<b>Пара:</b> {signal['Pair']}\n"
                    f"<b>Результат: ${pnl_usd:+.2f} ({pnl_percent_display:+.2f}%)</b>\n")
             if exit_detail:
                 msg += f"<b>Детали:</b> {exit_detail}"
@@ -100,11 +104,11 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
         prev_row = features_df.iloc[-2]
         
         current_price = last_row['close']
-        current_stochrsi = last_row['stochrsi_k']
-        prev_stochrsi = prev_row['stochrsi_k']
+        current_k = last_row['stochrsi_k']
+        prev_k = prev_row['stochrsi_k']
         current_ema = last_row[f'EMA_{EMA_PERIOD}']
 
-        if pd.isna(current_stochrsi) or pd.isna(prev_stochrsi) or pd.isna(current_ema): return
+        if pd.isna(current_k) or pd.isna(prev_k) or pd.isna(current_ema): return
 
         if current_price > current_ema: trend = "UP"
         elif current_price < current_ema: trend = "DOWN"
@@ -112,16 +116,15 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
             
         analysis_data = {
             "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-            "Close_Price": f"{current_price:.4f}", "StochRSI_k": f"{current_stochrsi:.2f}",
+            "Close_Price": f"{current_price:.4f}", "StochRSI_k": f"{current_k:.2f}",
             "EMA_200": f"{current_ema:.4f}", "Trend_Direction": trend
         }
         await log_analysis_data(analysis_data)
         
         side = None
-        # <<< НОВАЯ ЛОГИКА ВХОДА: ИЩЕМ ПОДТВЕРЖДЕНИЕ СИЛЫ ТРЕНДА >>>
-        if trend == "UP" and (prev_stochrsi < STOCHRSI_UPPER_BAND and current_stochrsi >= STOCHRSI_UPPER_BAND):
+        if trend == "UP" and (prev_k < STOCHRSI_UPPER_BAND and current_k >= STOCHRSI_UPPER_BAND):
             side = "LONG"
-        elif trend == "DOWN" and (prev_stochrsi > STOCHRSI_LOWER_BAND and current_stochrsi <= STOCHRSI_LOWER_BAND):
+        elif trend == "DOWN" and (prev_k > STOCHRSI_LOWER_BAND and current_k <= STOCHRSI_LOWER_BAND):
             side = "SHORT"
         
         if side:
@@ -129,7 +132,7 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
         
         if app.bot_data.get('live_info_on', False):
             info_msg = (f"<b>[INFO]</b> Trend: {trend}\n"
-                        f"StochRSI: <code>{current_stochrsi:.2f}</code> | "
+                        f"StochRSI: <code>{current_k:.2f}</code> | "
                         f"Close: <code>{current_price:.2f}</code> | EMA: <code>{current_ema:.2f}</code>")
             await broadcast_func(app, info_msg)
 
@@ -154,14 +157,13 @@ async def execute_trade(app, broadcast_func, features, side):
     await log_open_trade(decision)
 
     msg = (f"🔥 <b>СИГНАЛ ПО ИМПУЛЬСУ ({side})</b>\n\n"
-           f"<b>Пара:</b> {PAIR_TO_SCAN}\n"
            f"<b>Вход:</b> <code>{entry_price:.4f}</code>\n"
-           f"<b>SL:</b> <code>{sl_price:.4f}</code> (Выход по ослаблению StochRSI)")
+           f"<b>SL:</b> <code>{sl_price:.4f}</code> (Выход по пересечению K/D)")
     await broadcast_func(app, msg)
 
 
 async def scanner_main_loop(app: Application, broadcast_func):
-    log.info("StochRSI Momentum Engine loop starting...")
+    log.info("StochRSI Momentum K/D Cross Engine loop starting...")
     
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     await exchange.load_markets()
@@ -175,4 +177,4 @@ async def scanner_main_loop(app: Application, broadcast_func):
         await asyncio.sleep(SCAN_INTERVAL)
         
     await exchange.close()
-    log.info("StochRSI Momentum Engine loop stopped.")
+    log.info("StochRSI Momentum K/D Cross Engine loop stopped.")
