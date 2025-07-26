@@ -11,10 +11,9 @@ from oauth2client.service_account import ServiceAccountCredentials
 log = logging.getLogger("bot")
 import scanner_engine
 import trade_executor
-# <<< Убрали import debug_executor, он больше не нужен >>>
 
 # --- Конфигурация ---
-BOT_VERSION = "RSI-Momentum-1.0" # <<< Изменили версию бота >>>
+BOT_VERSION = "StochRSI-TrendFilter-1.0" # <<< Обновили версию
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
@@ -23,7 +22,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 def setup_sheets():
-    # <<< Функция полностью переписана для соответствия новой стратегии >>>
     if not SHEET_ID or not GOOGLE_CREDENTIALS:
         log.warning("Логирование в Google Sheets отключено.")
         return
@@ -34,27 +32,41 @@ def setup_sheets():
         gs = gspread.authorize(creds)
         ss = gs.open_by_key(SHEET_ID)
 
-        sheet_name = "RSI_Trading_Log" # Новое имя для лога
+        # --- Лист для записи сделок ---
+        trade_sheet_name = "Trading_Log"
         try:
-            worksheet = ss.worksheet(sheet_name)
+            trade_worksheet = ss.worksheet(trade_sheet_name)
         except gspread.WorksheetNotFound:
-            log.info(f"Лист '{sheet_name}' не найден. Создаю новый.")
-            # Новый, упрощенный список заголовков для RSI стратегии
+            log.info(f"Лист '{trade_sheet_name}' не найден. Создаю новый.")
             headers = [
                 "Signal_ID", "Timestamp_UTC", "Pair", "side", "Status",
-                "Entry_Price", "Exit_Price", "SL_Price",
-                "PNL_USD", "PNL_Percent", "Exit_Time_UTC", "RSI_at_Entry"
+                "Entry_Price", "Exit_Price", "SL_Price", "TP_Price",
+                "PNL_USD", "PNL_Percent", "Exit_Time_UTC", "StochRSI_at_Entry"
             ]
-            worksheet = ss.add_worksheet(title=sheet_name, rows="2000", cols=len(headers))
-            worksheet.update(range_name="A1", values=[headers])
-            worksheet.format(f"A1:{chr(ord('A')+len(headers)-1)}1", {"textFormat": {"bold": True}})
-        
-        trade_executor.TRADE_LOG_WS = worksheet
-        log.info(f"Google-Sheets ready. Logging to '{sheet_name}'.")
+            trade_worksheet = ss.add_worksheet(title=trade_sheet_name, rows="2000", cols=len(headers))
+            trade_worksheet.update(range_name="A1", values=[headers])
+            trade_worksheet.format(f"A1:{chr(ord('A')+len(headers)-1)}1", {"textFormat": {"bold": True}})
+        trade_executor.TRADE_LOG_WS = trade_worksheet
+        log.info(f"Google-Sheets ready. Logging trades to '{trade_sheet_name}'.")
+
+        # <<< НОВЫЙ ЛИСТ ДЛЯ АНАЛИТИКИ >>>
+        analysis_sheet_name = "Strategy_Analysis_Log"
+        try:
+            analysis_worksheet = ss.worksheet(analysis_sheet_name)
+        except gspread.WorksheetNotFound:
+            log.info(f"Лист '{analysis_sheet_name}' не найден. Создаю новый.")
+            headers = ["Timestamp_UTC", "Close_Price", "StochRSI_k", "EMA_200", "Trend_Direction"]
+            analysis_worksheet = ss.add_worksheet(title=analysis_sheet_name, rows="10000", cols=len(headers))
+            analysis_worksheet.update(range_name="A1", values=[headers])
+            analysis_worksheet.format(f"A1:{chr(ord('A')+len(headers)-1)}1", {"textFormat": {"bold": True}})
+        trade_executor.ANALYSIS_LOG_WS = analysis_worksheet
+        log.info(f"Google-Sheets ready. Logging analysis to '{analysis_sheet_name}'.")
 
     except Exception as e:
         log.error(f"Ошибка инициализации Google Sheets: {e}")
 
+
+# ... (остальной код main.py остается без изменений) ...
 
 async def post_init(app: Application):
     log.info("Бот запущен. Проверяем, нужно ли запускать основной цикл...")
@@ -97,8 +109,7 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     app.bot_data['bot_on'] = True
     app.bot_data['run_loop_on_startup'] = True
     log.info("Команда /run: запускаем основной цикл.")
-    # <<< Изменили текст сообщения для пользователя >>>
-    await update.message.reply_text(f"🚀 <b>Запускаю RSI-сканер...</b>")
+    await update.message.reply_text(f"🚀 <b>Запускаю сканер...</b>")
     task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
     app.bot_data['main_loop_task'] = task
 
