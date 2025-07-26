@@ -13,7 +13,7 @@ import scanner_engine
 import trade_executor
 
 # --- Конфигурация ---
-BOT_VERSION = "StochRSI-70-30-1.0"
+BOT_VERSION = "StochRSI-Momentum-1.2"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
@@ -32,17 +32,18 @@ def setup_sheets():
         gs = gspread.authorize(creds)
         ss = gs.open_by_key(SHEET_ID)
 
-        # --- Лист для записи сделок ---
+        # --- Упрощенная настройка: только один лист ---
         trade_sheet_name = "Trading_Log"
         try:
             trade_worksheet = ss.worksheet(trade_sheet_name)
         except gspread.WorksheetNotFound:
             log.info(f"Лист '{trade_sheet_name}' не найден. Создаю новый.")
+            # <<< Обновляем заголовки, добавляя ATR_at_Exit >>>
             headers = [
                 "Signal_ID", "Timestamp_UTC", "Pair", "side", "Status",
                 "Entry_Price", "Exit_Price", "SL_Price",
                 "PNL_USD", "PNL_Percent", "Exit_Time_UTC", 
-                "StochRSI_at_Entry", "Exit_Detail", "ATR_at_Entry" # <<< Добавлена колонка ATR
+                "StochRSI_at_Entry", "Exit_Detail", "ATR_at_Exit"
             ]
             trade_worksheet = ss.add_worksheet(title=trade_sheet_name, rows="2000", cols=len(headers))
             trade_worksheet.update(range_name="A1", values=[headers])
@@ -50,21 +51,11 @@ def setup_sheets():
         trade_executor.TRADE_LOG_WS = trade_worksheet
         log.info(f"Google-Sheets ready. Logging trades to '{trade_sheet_name}'.")
 
-        # --- Лист для аналитики ---
-        analysis_sheet_name = "Strategy_Analysis_Log"
-        try:
-            analysis_worksheet = ss.worksheet(analysis_sheet_name)
-        except gspread.WorksheetNotFound:
-            log.info(f"Лист '{analysis_sheet_name}' не найден. Создаю новый.")
-            headers = ["Timestamp_UTC", "Close_Price", "StochRSI_k", "EMA_200", "Trend_Direction", "ATR_14"] # <<< Добавлена колонка ATR
-            analysis_worksheet = ss.add_worksheet(title=analysis_sheet_name, rows="10000", cols=len(headers))
-            analysis_worksheet.update(range_name="A1", values=[headers])
-            analysis_worksheet.format(f"A1:{chr(ord('A')+len(headers)-1)}1", {"textFormat": {"bold": True}})
-        trade_executor.ANALYSIS_LOG_WS = analysis_worksheet
-        log.info(f"Google-Sheets ready. Logging analysis to '{analysis_sheet_name}'.")
+        # <<< УБРАНА ЛОГИКА СОЗДАНИЯ ЛИСТА АНАЛИТИКИ >>>
 
     except Exception as e:
         log.error(f"Ошибка инициализации Google Sheets: {e}")
+
 
 # ... (остальной код main.py без изменений) ...
 
@@ -151,7 +142,7 @@ async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.bot_data['deposit'] = amount
         await update.message.reply_text(f"✅ Депозит для расчета PNL установлен: <b>${amount}</b>", parse_mode=constants.ParseMode.HTML)
     except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ Неверный формат. Используйте: /deposit <сумма>")
+        await update.message.reply_text("⚠️ Неверный формат. Используйте /deposit <сумма>")
 
 async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
@@ -159,7 +150,7 @@ async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.bot_data['leverage'] = leverage
         await update.message.reply_text(f"✅ Плечо для расчета PNL установлено: <b>x{leverage}</b>", parse_mode=constants.ParseMode.HTML)
     except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ Неверный формат. Используйте: /leverage <число>")
+        await update.message.reply_text("⚠️ Неверный формат. Используйте /leverage <число>")
 
 if __name__ == "__main__":
     setup_sheets()
