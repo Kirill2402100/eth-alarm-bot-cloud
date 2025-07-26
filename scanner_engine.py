@@ -24,7 +24,7 @@ STOCHRSI_ENTRY_SHORT = 95
 EMA_PERIOD = 200
 PRICE_TAKE_PROFIT_PERCENT = 0.003
 PRICE_STOP_LOSS_PERCENT = 0.003
-STOCHRSI_REVERSAL_SENSITIVITY = 5 # <<< Пункты StochRSI для упреждающего стопа
+STOCHRSI_REVERSAL_SENSITIVITY = 8 # <<< Пункты StochRSI для упреждающего стопа
 
 def calculate_features(ohlcv):
     if len(ohlcv) < EMA_PERIOD:
