@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 log = logging.getLogger("bot")
 TRADE_LOG_WS = None
-ANALYSIS_LOG_WS = None
+# <<< Убрана переменная ANALYSIS_LOG_WS >>>
 
 async def log_open_trade(trade_data):
     if not TRADE_LOG_WS: return
@@ -19,8 +19,8 @@ async def log_open_trade(trade_data):
     except Exception as e:
         log.error(f"Ошибка при записи в Google Sheets: {e}", exc_info=True)
 
-async def update_closed_trade(signal_id, status, exit_price, pnl_usd, pnl_percent, exit_detail=None):
-    # <<< Добавлен аргумент exit_detail >>>
+# <<< Добавлен аргумент atr_at_exit >>>
+async def update_closed_trade(signal_id, status, exit_price, pnl_usd, pnl_percent, exit_detail=None, atr_at_exit=None):
     if not TRADE_LOG_WS: return
     try:
         cell = TRADE_LOG_WS.find(signal_id)
@@ -38,9 +38,11 @@ async def update_closed_trade(signal_id, status, exit_price, pnl_usd, pnl_percen
             "PNL_USD": f"{pnl_usd:.2f}",
             "PNL_Percent": f"{pnl_percent:.2f}%"
         }
-        # <<< Добавляем детали выхода, если они есть >>>
         if exit_detail:
             updates["Exit_Detail"] = exit_detail
+        # <<< Добавляем ATR в словарь для обновления >>>
+        if atr_at_exit:
+            updates["ATR_at_Exit"] = f"{atr_at_exit:.4f}"
         
         for key, value in updates.items():
             if key in headers:
@@ -52,11 +54,4 @@ async def update_closed_trade(signal_id, status, exit_price, pnl_usd, pnl_percen
     except Exception as e:
         log.error(f"Ошибка при обновлении сделки {signal_id} в Google Sheets: {e}", exc_info=True)
 
-async def log_analysis_data(analysis_data):
-    if not ANALYSIS_LOG_WS: return
-    try:
-        headers = ANALYSIS_LOG_WS.row_values(1)
-        row_to_insert = [analysis_data.get(header, '') for header in headers]
-        ANALYSIS_LOG_WS.append_row(row_to_insert, value_input_option='USER_ENTERED')
-    except Exception as e:
-        pass
+# <<< УБРАНА ФУНКЦИЯ log_analysis_data >>>
