@@ -21,26 +21,25 @@ SCAN_INTERVAL = 5
 STOCHRSI_PERIOD = 14
 STOCHRSI_ENTRY_LONG = 5
 STOCHRSI_ENTRY_SHORT = 95
-EMA_PERIOD = 200
 PRICE_TAKE_PROFIT_PERCENT = 0.003
 PRICE_STOP_LOSS_PERCENT = 0.003
-STOCHRSI_REVERSAL_SENSITIVITY = 8 # <<< Пункты StochRSI для упреждающего стопа
+STOCHRSI_REVERSAL_SENSITIVITY = 8
+
+# <<< Убрали EMA_PERIOD >>>
 
 def calculate_features(ohlcv):
-    if len(ohlcv) < EMA_PERIOD:
+    # <<< Убрали расчет EMA и связанную с ним проверку длины >>>
+    if len(ohlcv) < STOCHRSI_PERIOD * 2:
         return None
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     stoch_rsi_df = df.ta.stochrsi(length=STOCHRSI_PERIOD, rsi_length=STOCHRSI_PERIOD, k=3, d=3)
     df['stochrsi_k'] = stoch_rsi_df.iloc[:, 0]
-    df[f'EMA_{EMA_PERIOD}'] = df.ta.ema(length=EMA_PERIOD)
     return df
 
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
-    # <<< Функция полностью переписана для отслеживания упреждающего стопа >>>
     bot_data = app.bot_data
     signal = bot_data['monitored_signals'][0]
     try:
-        # Получаем свежие данные для анализа
         ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=300)
         features_df = calculate_features(ohlcv)
         if features_df is None: return
@@ -53,9 +52,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 
         exit_status, exit_price, exit_detail = None, last_price, None
         
-        # --- Логика упреждающего стопа ---
         if signal['side'] == 'LONG':
-            # Обновляем пиковое значение StochRSI, достигнутое в сделке
             peak_stochrsi = max(signal.get('stochrsi_peak', 0), current_stochrsi)
             signal['stochrsi_peak'] = peak_stochrsi
             
@@ -68,7 +65,6 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
                 exit_detail = f"StochRSI: {current_stochrsi:.2f}"
 
         elif signal['side'] == 'SHORT':
-            # Обновляем минимальное значение StochRSI, достигнутое в сделке
             trough_stochrsi = min(signal.get('stochrsi_trough', 100), current_stochrsi)
             signal['stochrsi_trough'] = trough_stochrsi
 
@@ -113,34 +109,26 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
         current_price = last_row['close']
         current_stochrsi = last_row['stochrsi_k']
         prev_stochrsi = prev_row['stochrsi_k']
-        current_ema = last_row[f'EMA_{EMA_PERIOD}']
 
-        if pd.isna(current_stochrsi) or pd.isna(prev_stochrsi) or pd.isna(current_ema): return
+        if pd.isna(current_stochrsi) or pd.isna(prev_stochrsi): return
 
-        if current_price > current_ema: trend = "UP"
-        elif current_price < current_ema: trend = "DOWN"
-        else: trend = "FLAT"
-            
-        analysis_data = {
-            "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-            "Close_Price": f"{current_price:.4f}", "StochRSI_k": f"{current_stochrsi:.2f}",
-            "EMA_200": f"{current_ema:.4f}", "Trend_Direction": trend
-        }
-        await log_analysis_data(analysis_data)
+        # <<< УБРАНА ВСЯ ЛОГИКА ФИЛЬТРА ТРЕНДА >>>
+        # <<< Убрано логирование аналитики, т.к. фильтра больше нет >>>
         
         side = None
-        if trend == "UP" and (prev_stochrsi < STOCHRSI_ENTRY_LONG and current_stochrsi >= STOCHRSI_ENTRY_LONG):
+        # <<< Условия входа теперь не зависят от тренда >>>
+        if prev_stochrsi < STOCHRSI_ENTRY_LONG and current_stochrsi >= STOCHRSI_ENTRY_LONG:
             side = "LONG"
-        elif trend == "DOWN" and (prev_stochrsi > STOCHRSI_ENTRY_SHORT and current_stochrsi <= STOCHRSI_ENTRY_SHORT):
+        elif prev_stochrsi > STOCHRSI_ENTRY_SHORT and current_stochrsi <= STOCHRSI_ENTRY_SHORT:
             side = "SHORT"
         
         if side:
             await execute_trade(app, broadcast_func, last_row, side)
         
         if app.bot_data.get('live_info_on', False):
-            info_msg = (f"<b>[INFO]</b> Trend: {trend}\n"
-                        f"StochRSI: <code>{current_stochrsi:.2f}</code> | "
-                        f"Close: <code>{current_price:.2f}</code> | EMA: <code>{current_ema:.2f}</code>")
+            # <<< Упрощено инфо-сообщение >>>
+            info_msg = (f"<b>[INFO]</b> StochRSI: <code>{current_stochrsi:.2f}</code> | "
+                        f"Close: <code>{current_price:.2f}</code>")
             await broadcast_func(app, info_msg)
 
     except Exception as e:
@@ -159,15 +147,15 @@ async def execute_trade(app, broadcast_func, features, side):
         "Status": "ACTIVE",
         "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
         "StochRSI_at_Entry": features.get('stochrsi_k'),
-        # <<< Добавляем начальные значения для отслеживания пика/дна StochRSI >>>
         "stochrsi_peak": features.get('stochrsi_k') if side == 'LONG' else 0,
         "stochrsi_trough": features.get('stochrsi_k') if side == 'SHORT' else 100,
     }
     
     app.bot_data.setdefault('monitored_signals', []).append(decision)
     await log_open_trade(decision)
-
-    msg = (f"🔥 <b>СИГНАЛ С ФИЛЬТРОМ ТРЕНДА ({side})</b>\n\n"
+    
+    # <<< Изменено сообщение о входе >>>
+    msg = (f"🔥 <b>StochRSI СИГНАЛ НА ВХОД ({side})</b>\n\n"
            f"<b>Пара:</b> {PAIR_TO_SCAN}\n"
            f"<b>Вход:</b> <code>{entry_price:.4f}</code>\n"
            f"<b>SL:</b> <code>{sl_price:.4f}</code> | <b>TP:</b> <code>{tp_price:.4f}</code>")
@@ -175,7 +163,8 @@ async def execute_trade(app, broadcast_func, features, side):
 
 
 async def scanner_main_loop(app: Application, broadcast_func):
-    log.info("StochRSI + EMA Trend Filter Engine v2 loop starting...")
+    # <<< Изменено сообщение о запуске >>>
+    log.info("StochRSI Reversal Engine (No Filter) loop starting...")
     
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     await exchange.load_markets()
@@ -189,4 +178,4 @@ async def scanner_main_loop(app: Application, broadcast_func):
         await asyncio.sleep(SCAN_INTERVAL)
         
     await exchange.close()
-    log.info("StochRSI + EMA Trend Filter Engine v2 loop stopped.")
+    log.info("StochRSI Reversal Engine (No Filter) loop stopped.")
