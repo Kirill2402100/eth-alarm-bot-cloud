@@ -8,7 +8,8 @@ import pandas_ta as ta
 import ccxt.async_support as ccxt
 from telegram.ext import Application
 from datetime import datetime, timezone
-from trade_executor import log_open_trade, update_closed_trade, log_analysis_data
+# <<< Убираем импорт log_analysis_data >>>
+from trade_executor import log_open_trade, update_closed_trade
 
 log = logging.getLogger("bot")
 
@@ -22,9 +23,9 @@ STOCHRSI_PERIOD = 14
 STOCHRSI_K_PERIOD = 3
 STOCHRSI_D_PERIOD = 3
 EMA_PERIOD = 200
-ATR_PERIOD = 14 # <<< Добавляем параметр для ATR
-STOCHRSI_UPPER_BAND = 70 # <<< ИЗМЕНЕНО
-STOCHRSI_LOWER_BAND = 30 # <<< ИЗМЕНЕНО
+ATR_PERIOD = 14
+STOCHRSI_UPPER_BAND = 70
+STOCHRSI_LOWER_BAND = 30
 PRICE_STOP_LOSS_PERCENT = 0.002
 
 def calculate_features(ohlcv):
@@ -34,7 +35,7 @@ def calculate_features(ohlcv):
     df['stochrsi_k'] = stoch_rsi_df.iloc[:, 0]
     df['stochrsi_d'] = stoch_rsi_df.iloc[:, 1]
     df[f'EMA_{EMA_PERIOD}'] = df.ta.ema(length=EMA_PERIOD)
-    df.ta.atr(length=ATR_PERIOD, append=True) # <<< Добавляем расчет ATR
+    df.ta.atr(length=ATR_PERIOD, append=True)
     return df
 
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
@@ -51,21 +52,19 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         
         current_k, current_d = last_row['stochrsi_k'], last_row['stochrsi_d']
         prev_k, prev_d = prev_row['stochrsi_k'], prev_row['stochrsi_d']
+        current_atr = last_row.get(f'ATRr_{ATR_PERIOD}') # <<< Получаем ATR для лога
 
         if pd.isna(current_k) or pd.isna(current_d) or pd.isna(prev_k) or pd.isna(prev_d): return
 
         exit_status, exit_price, exit_detail = None, last_price, None
         
         if signal['side'] == 'LONG':
-            if last_price <= signal['SL_Price']:
-                exit_status = "SL_HIT"
+            if last_price <= signal['SL_Price']: exit_status = "SL_HIT"
             elif prev_k > prev_d and current_k <= current_d:
                 exit_status = "STOCHRSI_CROSS"
                 exit_detail = f"K:{current_k:.2f} | D:{current_d:.2f}"
-
         elif signal['side'] == 'SHORT':
-            if last_price >= signal['SL_Price']:
-                exit_status = "SL_HIT"
+            if last_price >= signal['SL_Price']: exit_status = "SL_HIT"
             elif prev_k < prev_d and current_k >= current_d:
                 exit_status = "STOCHRSI_CROSS"
                 exit_detail = f"K:{current_k:.2f} | D:{current_d:.2f}"
@@ -80,16 +79,11 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
             emoji = "✅" if pnl_usd > 0 else "❌"
             msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({exit_status})</b>\n\n"
                    f"<b>Результат: ${pnl_usd:+.2f} ({pnl_percent_display:+.2f}%)</b>\n")
-            if exit_detail:
-                msg += f"<b>Детали:</b> {exit_detail}"
-            
-            # <<< Добавляем ATR в детали закрытия сделки для лога >>>
-            current_atr = last_row.get(f'ATRr_{ATR_PERIOD}')
-            if current_atr:
-                exit_detail += f" | ATR: {current_atr:.4f}"
+            if exit_detail: msg += f"<b>Детали:</b> {exit_detail}"
 
             await broadcast_func(app, msg)
-            await update_closed_trade(signal['Signal_ID'], exit_status, exit_price, pnl_usd, pnl_percent_display, exit_detail)
+            # <<< Передаем ATR при закрытии в функцию логгера >>>
+            await update_closed_trade(signal['Signal_ID'], exit_status, exit_price, pnl_usd, pnl_percent_display, exit_detail, current_atr)
             bot_data['monitored_signals'] = []
     except Exception as e:
         log.error(f"Ошибка мониторинга: {e}", exc_info=True)
@@ -107,21 +101,14 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
         current_k = last_row['stochrsi_k']
         prev_k = prev_row['stochrsi_k']
         current_ema = last_row[f'EMA_{EMA_PERIOD}']
-        current_atr = last_row.get(f'ATRr_{ATR_PERIOD}') # <<< Получаем ATR
 
-        if pd.isna(current_k) or pd.isna(prev_k) or pd.isna(current_ema) or pd.isna(current_atr): return
+        if pd.isna(current_k) or pd.isna(prev_k) or pd.isna(current_ema): return
 
         if current_price > current_ema: trend = "UP"
         elif current_price < current_ema: trend = "DOWN"
         else: trend = "FLAT"
             
-        analysis_data = {
-            "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-            "Close_Price": f"{current_price:.4f}", "StochRSI_k": f"{current_k:.2f}",
-            "EMA_200": f"{current_ema:.4f}", "Trend_Direction": trend,
-            "ATR_14": f"{current_atr:.4f}" # <<< Добавляем ATR в лог аналитики
-        }
-        await log_analysis_data(analysis_data)
+        # <<< УБРАН ВЫЗОВ log_analysis_data >>>
         
         side = None
         if trend == "UP" and (prev_k < STOCHRSI_UPPER_BAND and current_k >= STOCHRSI_UPPER_BAND):
@@ -153,7 +140,6 @@ async def execute_trade(app, broadcast_func, features, side):
         "Status": "ACTIVE",
         "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
         "StochRSI_at_Entry": features.get('stochrsi_k'),
-        "ATR_at_Entry": features.get(f'ATRr_{ATR_PERIOD}') # <<< Добавляем ATR в данные о сделке
     }
     
     app.bot_data.setdefault('monitored_signals', []).append(decision)
