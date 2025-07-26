@@ -13,7 +13,7 @@ import scanner_engine
 import trade_executor
 
 # --- Конфигурация ---
-BOT_VERSION = "StochRSI-TrendFilter-1.0" # <<< Обновили версию
+BOT_VERSION = "StochRSI-Advanced-1.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
@@ -32,16 +32,16 @@ def setup_sheets():
         gs = gspread.authorize(creds)
         ss = gs.open_by_key(SHEET_ID)
 
-        # --- Лист для записи сделок ---
         trade_sheet_name = "Trading_Log"
         try:
             trade_worksheet = ss.worksheet(trade_sheet_name)
         except gspread.WorksheetNotFound:
             log.info(f"Лист '{trade_sheet_name}' не найден. Создаю новый.")
+            # <<< Добавлена колонка Exit_Detail >>>
             headers = [
                 "Signal_ID", "Timestamp_UTC", "Pair", "side", "Status",
                 "Entry_Price", "Exit_Price", "SL_Price", "TP_Price",
-                "PNL_USD", "PNL_Percent", "Exit_Time_UTC", "StochRSI_at_Entry"
+                "PNL_USD", "PNL_Percent", "Exit_Time_UTC", "StochRSI_at_Entry", "Exit_Detail"
             ]
             trade_worksheet = ss.add_worksheet(title=trade_sheet_name, rows="2000", cols=len(headers))
             trade_worksheet.update(range_name="A1", values=[headers])
@@ -49,7 +49,6 @@ def setup_sheets():
         trade_executor.TRADE_LOG_WS = trade_worksheet
         log.info(f"Google-Sheets ready. Logging trades to '{trade_sheet_name}'.")
 
-        # <<< НОВЫЙ ЛИСТ ДЛЯ АНАЛИТИКИ >>>
         analysis_sheet_name = "Strategy_Analysis_Log"
         try:
             analysis_worksheet = ss.worksheet(analysis_sheet_name)
@@ -65,8 +64,7 @@ def setup_sheets():
     except Exception as e:
         log.error(f"Ошибка инициализации Google Sheets: {e}")
 
-
-# ... (остальной код main.py остается без изменений) ...
+# ... (остальной код main.py без изменений) ...
 
 async def post_init(app: Application):
     log.info("Бот запущен. Проверяем, нужно ли запускать основной цикл...")
