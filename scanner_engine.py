@@ -19,21 +19,22 @@ SCAN_INTERVAL = 5
 
 # --- Параметры стратегии ---
 STOCHRSI_PERIOD = 14
-STOCHRSI_K_PERIOD = 3 # Стандартный параметр для Smooth K
-STOCHRSI_D_PERIOD = 3 # Стандартный параметр для Smooth D
+STOCHRSI_K_PERIOD = 3
+STOCHRSI_D_PERIOD = 3
 EMA_PERIOD = 200
-STOCHRSI_UPPER_BAND = 80
-STOCHRSI_LOWER_BAND = 20
+ATR_PERIOD = 14 # <<< Добавляем параметр для ATR
+STOCHRSI_UPPER_BAND = 70 # <<< ИЗМЕНЕНО
+STOCHRSI_LOWER_BAND = 30 # <<< ИЗМЕНЕНО
 PRICE_STOP_LOSS_PERCENT = 0.002
 
 def calculate_features(ohlcv):
     if len(ohlcv) < EMA_PERIOD: return None
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    # <<< РАСЧЕТ StochRSI С ЛИНИЯМИ K и D >>>
     stoch_rsi_df = df.ta.stochrsi(length=STOCHRSI_PERIOD, rsi_length=STOCHRSI_PERIOD, k=STOCHRSI_K_PERIOD, d=STOCHRSI_D_PERIOD)
-    df['stochrsi_k'] = stoch_rsi_df.iloc[:, 0] # Smooth K
-    df['stochrsi_d'] = stoch_rsi_df.iloc[:, 1] # Smooth D
+    df['stochrsi_k'] = stoch_rsi_df.iloc[:, 0]
+    df['stochrsi_d'] = stoch_rsi_df.iloc[:, 1]
     df[f'EMA_{EMA_PERIOD}'] = df.ta.ema(length=EMA_PERIOD)
+    df.ta.atr(length=ATR_PERIOD, append=True) # <<< Добавляем расчет ATR
     return df
 
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
@@ -46,10 +47,8 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 
         last_row = features_df.iloc[-1]
         prev_row = features_df.iloc[-2]
-
         last_price = last_row['close']
         
-        # <<< ПОЛУЧАЕМ ЗНАЧЕНИЯ K и D ДЛЯ ТЕКУЩЕЙ И ПРЕДЫДУЩЕЙ СВЕЧИ >>>
         current_k, current_d = last_row['stochrsi_k'], last_row['stochrsi_d']
         prev_k, prev_d = prev_row['stochrsi_k'], prev_row['stochrsi_d']
 
@@ -57,11 +56,9 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 
         exit_status, exit_price, exit_detail = None, last_price, None
         
-        # --- Проверяем условия выхода ---
         if signal['side'] == 'LONG':
             if last_price <= signal['SL_Price']:
                 exit_status = "SL_HIT"
-            # <<< ВЫХОД ПО ПЕРЕСЕЧЕНИЮ: K пересек D сверху вниз >>>
             elif prev_k > prev_d and current_k <= current_d:
                 exit_status = "STOCHRSI_CROSS"
                 exit_detail = f"K:{current_k:.2f} | D:{current_d:.2f}"
@@ -69,7 +66,6 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         elif signal['side'] == 'SHORT':
             if last_price >= signal['SL_Price']:
                 exit_status = "SL_HIT"
-            # <<< ВЫХОД ПО ПЕРЕСЕЧЕНИЮ: K пересек D снизу вверх >>>
             elif prev_k < prev_d and current_k >= current_d:
                 exit_status = "STOCHRSI_CROSS"
                 exit_detail = f"K:{current_k:.2f} | D:{current_d:.2f}"
@@ -86,9 +82,13 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
                    f"<b>Результат: ${pnl_usd:+.2f} ({pnl_percent_display:+.2f}%)</b>\n")
             if exit_detail:
                 msg += f"<b>Детали:</b> {exit_detail}"
+            
+            # <<< Добавляем ATR в детали закрытия сделки для лога >>>
+            current_atr = last_row.get(f'ATRr_{ATR_PERIOD}')
+            if current_atr:
+                exit_detail += f" | ATR: {current_atr:.4f}"
 
             await broadcast_func(app, msg)
-            
             await update_closed_trade(signal['Signal_ID'], exit_status, exit_price, pnl_usd, pnl_percent_display, exit_detail)
             bot_data['monitored_signals'] = []
     except Exception as e:
@@ -107,8 +107,9 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
         current_k = last_row['stochrsi_k']
         prev_k = prev_row['stochrsi_k']
         current_ema = last_row[f'EMA_{EMA_PERIOD}']
+        current_atr = last_row.get(f'ATRr_{ATR_PERIOD}') # <<< Получаем ATR
 
-        if pd.isna(current_k) or pd.isna(prev_k) or pd.isna(current_ema): return
+        if pd.isna(current_k) or pd.isna(prev_k) or pd.isna(current_ema) or pd.isna(current_atr): return
 
         if current_price > current_ema: trend = "UP"
         elif current_price < current_ema: trend = "DOWN"
@@ -117,7 +118,8 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
         analysis_data = {
             "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
             "Close_Price": f"{current_price:.4f}", "StochRSI_k": f"{current_k:.2f}",
-            "EMA_200": f"{current_ema:.4f}", "Trend_Direction": trend
+            "EMA_200": f"{current_ema:.4f}", "Trend_Direction": trend,
+            "ATR_14": f"{current_atr:.4f}" # <<< Добавляем ATR в лог аналитики
         }
         await log_analysis_data(analysis_data)
         
@@ -151,6 +153,7 @@ async def execute_trade(app, broadcast_func, features, side):
         "Status": "ACTIVE",
         "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
         "StochRSI_at_Entry": features.get('stochrsi_k'),
+        "ATR_at_Entry": features.get(f'ATRr_{ATR_PERIOD}') # <<< Добавляем ATR в данные о сделке
     }
     
     app.bot_data.setdefault('monitored_signals', []).append(decision)
