@@ -1,5 +1,3 @@
-# scanner_engine.py
-
 import asyncio
 import time
 import logging
@@ -8,7 +6,8 @@ import pandas_ta as ta
 import ccxt.async_support as ccxt
 from telegram.ext import Application
 from datetime import datetime, timezone
-from trade_executor import log_open_trade, update_closed_trade, log_analysis_data
+# ИЗМЕНЕНИЕ 1: Убрали импорт ненужной функции
+from trade_executor import log_open_trade, update_closed_trade
 
 log = logging.getLogger("bot")
 
@@ -81,15 +80,12 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
             msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({exit_status})</b>\n\n"
                    f"<b>Результат: ${pnl_usd:+.2f} ({pnl_percent_display:+.2f}%)</b>\n")
             
-            # <<< ИСПРАВЛЕННАЯ ЛОГИКА ФОРМИРОВАНИЯ СООБЩЕНИЯ И ДЕТАЛЕЙ >>>
             if exit_detail is None:
-                exit_detail = "" # Инициализируем пустой строкой, чтобы избежать ошибки
+                exit_detail = "" 
 
             if current_atr:
-                # Добавляем ATR в детали, если он есть
                 exit_detail += f" | ATR: {current_atr:.4f}"
             
-            # Убираем лишний разделитель в начале, если он есть
             exit_detail = exit_detail.lstrip(" | ")
 
             if exit_detail:
@@ -121,14 +117,16 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
         if current_price > current_ema: trend = "UP"
         elif current_price < current_ema: trend = "DOWN"
         else: trend = "FLAT"
-            
+              
         analysis_data = {
             "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
             "Close_Price": f"{current_price:.4f}", "StochRSI_k": f"{current_k:.2f}",
             "EMA_200": f"{current_ema:.4f}", "Trend_Direction": trend,
             "ATR_14": f"{current_atr:.4f}"
         }
-        await log_analysis_data(analysis_data)
+        
+        # ИЗМЕНЕНИЕ 2: Убрали вызов ненужной функции
+        # await log_analysis_data(analysis_data)
         
         side = None
         if trend == "UP" and (prev_k < STOCHRSI_UPPER_BAND and current_k >= STOCHRSI_UPPER_BAND):
