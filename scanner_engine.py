@@ -22,12 +22,11 @@ STOCHRSI_D_PERIOD = 3
 EMA_PERIOD = 200
 ATR_PERIOD = 14
 STOCHRSI_UPPER_BAND = 70
-STOCHRSI_LOWER_BAND = 70
+STOCHRSI_LOWER_BAND = 40
 PRICE_STOP_LOSS_PERCENT = 0.0005
 TAKE_PROFIT_PERCENT = 0.001
 BREAK_EVEN_TRIGGER_PERCENT = 0.0005
 KD_CROSS_BUFFER = 3
-# ИЗМЕНЕНИЕ: Добавили константу для паузы между сигналами
 SIGNAL_COOLDOWN_SECONDS = 75
 
 def calculate_features(ohlcv):
@@ -44,7 +43,9 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
     signal = bot_data['monitored_signals'][0]
     try:
-        ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=300)
+        # ИЗМЕНЕНИЕ: Явно указываем, что нужны данные с фьючерсного рынка (swap)
+        ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=300, params={'type': 'swap'})
+        
         features_df = calculate_features(ohlcv)
         if features_df is None or len(features_df.tail(1)) < 1: return
 
@@ -122,7 +123,6 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
             await update_closed_trade(signal['Signal_ID'], exit_status, exit_price, pnl_usd, pnl_percent_display, exit_detail, current_atr)
             bot_data['monitored_signals'] = []
             
-            # ИЗМЕНЕНИЕ: Устанавливаем время окончания паузы
             cooldown_end_time = time.time() + SIGNAL_COOLDOWN_SECONDS
             bot_data['cooldown_until'] = cooldown_end_time
             
@@ -134,7 +134,9 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 
 async def scan_for_signals(exchange, app: Application, broadcast_func):
     try:
-        ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=300)
+        # ИЗМЕНЕНИЕ: Явно указываем, что нужны данные с фьючерсного рынка (swap)
+        ohlcv = await exchange.fetch_ohlcv(PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=300, params={'type': 'swap'})
+        
         features_df = calculate_features(ohlcv)
         if features_df is None or len(features_df.tail(2)) < 2: return 
 
@@ -205,11 +207,11 @@ async def execute_trade(app, broadcast_func, features, side):
 async def scanner_main_loop(app: Application, broadcast_func):
     log.info("StochRSI Momentum K/D Cross Engine loop starting...")
     
+    # Опция defaultType здесь остается, она не мешает, но явное указание в запросе надежнее
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     await exchange.load_markets()
     
     while app.bot_data.get("bot_on", False):
-        # ИЗМЕНЕНИЕ: Проверяем, активна ли пауза
         cooldown_until = app.bot_data.get('cooldown_until', 0)
         current_time = time.time()
 
@@ -217,8 +219,6 @@ async def scanner_main_loop(app: Application, broadcast_func):
             if current_time > cooldown_until:
                 await scan_for_signals(exchange, app, broadcast_func)
             else:
-                # Можно добавить логирование, что бот в паузе, если нужно
-                # log.info(f"Cooldown active. Waiting for {cooldown_until - current_time:.1f} more seconds.")
                 pass
         else:
             await monitor_active_trades(exchange, app, broadcast_func)
