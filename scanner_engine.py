@@ -23,10 +23,12 @@ EMA_PERIOD = 200
 ATR_PERIOD = 14
 STOCHRSI_UPPER_BAND = 70
 STOCHRSI_LOWER_BAND = 40
-PRICE_STOP_LOSS_PERCENT = 0.0005  # ИЗМЕНЕНИЕ: Начальный стоп-лосс 0.05%
-TAKE_PROFIT_PERCENT = 0.001      # Тейк-профит остается 0.1%
-BREAK_EVEN_TRIGGER_PERCENT = 0.0005 # ИЗМЕНЕНИЕ: Уровень для переноса стопа в безубыток
+PRICE_STOP_LOSS_PERCENT = 0.0005
+TAKE_PROFIT_PERCENT = 0.001
+BREAK_EVEN_TRIGGER_PERCENT = 0.0005
 KD_CROSS_BUFFER = 3
+# ИЗМЕНЕНИЕ: Добавили константу для паузы между сигналами
+SIGNAL_COOLDOWN_SECONDS = 75
 
 def calculate_features(ohlcv):
     if len(ohlcv) < EMA_PERIOD: return None
@@ -49,7 +51,6 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         last_row = features_df.iloc[-1]
         last_price = last_row['close']
         
-        # --- ИЗМЕНЕНИЕ: Логика динамического стоп-лосса ---
         if not signal.get('break_even_activated', False):
             break_even_price_trigger = 0
             if signal['side'] == 'LONG':
@@ -120,6 +121,14 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
             await broadcast_func(app, msg)
             await update_closed_trade(signal['Signal_ID'], exit_status, exit_price, pnl_usd, pnl_percent_display, exit_detail, current_atr)
             bot_data['monitored_signals'] = []
+            
+            # ИЗМЕНЕНИЕ: Устанавливаем время окончания паузы
+            cooldown_end_time = time.time() + SIGNAL_COOLDOWN_SECONDS
+            bot_data['cooldown_until'] = cooldown_end_time
+            
+            cooldown_msg = f"⏱️ <b>ПАУЗА</b>\n\nПоиск сигналов возобновится через {SIGNAL_COOLDOWN_SECONDS} сек."
+            await broadcast_func(app, cooldown_msg)
+
     except Exception as e:
         log.error(f"Ошибка мониторинга: {e}", exc_info=True)
 
@@ -180,7 +189,7 @@ async def execute_trade(app, broadcast_func, features, side):
         "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
         "StochRSI_at_Entry": features.get('stochrsi_k'),
         "ATR_at_Entry": features.get(f'ATRr_14'),
-        "break_even_activated": False # ИЗМЕНЕНИЕ: Начальный флаг для безубытка
+        "break_even_activated": False
     }
     
     app.bot_data.setdefault('monitored_signals', []).append(decision)
@@ -200,8 +209,17 @@ async def scanner_main_loop(app: Application, broadcast_func):
     await exchange.load_markets()
     
     while app.bot_data.get("bot_on", False):
+        # ИЗМЕНЕНИЕ: Проверяем, активна ли пауза
+        cooldown_until = app.bot_data.get('cooldown_until', 0)
+        current_time = time.time()
+
         if not app.bot_data.get('monitored_signals'):
-            await scan_for_signals(exchange, app, broadcast_func)
+            if current_time > cooldown_until:
+                await scan_for_signals(exchange, app, broadcast_func)
+            else:
+                # Можно добавить логирование, что бот в паузе, если нужно
+                # log.info(f"Cooldown active. Waiting for {cooldown_until - current_time:.1f} more seconds.")
+                pass
         else:
             await monitor_active_trades(exchange, app, broadcast_func)
         
