@@ -6,7 +6,6 @@ import pandas_ta as ta
 import ccxt.async_support as ccxt
 from telegram.ext import Application
 from datetime import datetime, timezone
-# ИЗМЕНЕНИЕ 1: Убрали импорт ненужной функции
 from trade_executor import log_open_trade, update_closed_trade
 
 log = logging.getLogger("bot")
@@ -23,8 +22,9 @@ STOCHRSI_D_PERIOD = 3
 EMA_PERIOD = 200
 ATR_PERIOD = 14
 STOCHRSI_UPPER_BAND = 70
-STOCHRSI_LOWER_BAND = 50
-PRICE_STOP_LOSS_PERCENT = 0.002
+STOCHRSI_LOWER_BAND = 40
+PRICE_STOP_LOSS_PERCENT = 0.001  # ИЗМЕНЕНИЕ: Вернули стоп-лосс на 0.2%
+TAKE_PROFIT_PERCENT = 0.001      # ИЗМЕНЕНИЕ: Добавили тейк-профит 0.1%
 KD_CROSS_BUFFER = 3
 
 def calculate_features(ohlcv):
@@ -55,9 +55,13 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 
         exit_status, exit_price, exit_detail = None, last_price, None
         
+        # ИЗМЕНЕНИЕ: Добавлена проверка тейк-профита.
+        # Сработает то, что наступит раньше: SL, TP или пересечение.
         if signal['side'] == 'LONG':
             if last_price <= signal['SL_Price']:
                 exit_status = "SL_HIT"
+            elif last_price >= signal['TP_Price']:
+                exit_status = "TP_HIT"
             elif current_k < current_d and (current_d - current_k) >= KD_CROSS_BUFFER:
                 exit_status = "STOCHRSI_CROSS"
                 exit_detail = f"K:{current_k:.2f} | D:{current_d:.2f}"
@@ -65,6 +69,8 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         elif signal['side'] == 'SHORT':
             if last_price >= signal['SL_Price']:
                 exit_status = "SL_HIT"
+            elif last_price <= signal['TP_Price']:
+                exit_status = "TP_HIT"
             elif current_k > current_d and (current_k - current_d) >= KD_CROSS_BUFFER:
                 exit_status = "STOCHRSI_CROSS"
                 exit_detail = f"K:{current_k:.2f} | D:{current_d:.2f}"
@@ -117,16 +123,6 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
         if current_price > current_ema: trend = "UP"
         elif current_price < current_ema: trend = "DOWN"
         else: trend = "FLAT"
-              
-        analysis_data = {
-            "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-            "Close_Price": f"{current_price:.4f}", "StochRSI_k": f"{current_k:.2f}",
-            "EMA_200": f"{current_ema:.4f}", "Trend_Direction": trend,
-            "ATR_14": f"{current_atr:.4f}"
-        }
-        
-        # ИЗМЕНЕНИЕ 2: Убрали вызов ненужной функции
-        # await log_analysis_data(analysis_data)
         
         side = None
         if trend == "UP" and (prev_k < STOCHRSI_UPPER_BAND and current_k >= STOCHRSI_UPPER_BAND):
@@ -149,12 +145,18 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
 
 async def execute_trade(app, broadcast_func, features, side):
     entry_price = features['close']
+    
+    # ИЗМЕНЕНИЕ: Рассчитываем и SL и TP
     sl_price = entry_price * (1 - PRICE_STOP_LOSS_PERCENT) if side == "LONG" else entry_price * (1 + PRICE_STOP_LOSS_PERCENT)
+    tp_price = entry_price * (1 + TAKE_PROFIT_PERCENT) if side == "LONG" else entry_price * (1 - TAKE_PROFIT_PERCENT)
+    
     signal_id = f"stochrsi_momentum_{int(time.time() * 1000)}"
 
     decision = {
         "Signal_ID": signal_id, "Pair": PAIR_TO_SCAN, "side": side,
-        "Entry_Price": entry_price, "SL_Price": sl_price,
+        "Entry_Price": entry_price, 
+        "SL_Price": sl_price,
+        "TP_Price": tp_price, # ИЗМЕНЕНИЕ: Сохраняем цену тейк-профита
         "Status": "ACTIVE",
         "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
         "StochRSI_at_Entry": features.get('stochrsi_k'),
@@ -164,9 +166,11 @@ async def execute_trade(app, broadcast_func, features, side):
     app.bot_data.setdefault('monitored_signals', []).append(decision)
     await log_open_trade(decision)
 
+    # ИЗМЕНЕНИЕ: Добавили TP в сообщение о сигнале
     msg = (f"🔥 <b>СИГНАЛ ПО ИМПУЛЬСУ ({side})</b>\n\n"
            f"<b>Вход:</b> <code>{entry_price:.4f}</code>\n"
-           f"<b>SL:</b> <code>{sl_price:.4f}</code> (Выход по пересечению K/D c буфером)")
+           f"<b>TP:</b>   <code>{tp_price:.4f}</code> ({TAKE_PROFIT_PERCENT * 100}%)\n"
+           f"<b>SL:</b>   <code>{sl_price:.4f}</code> ({PRICE_STOP_LOSS_PERCENT * 100}%)")
     await broadcast_func(app, msg)
 
 
