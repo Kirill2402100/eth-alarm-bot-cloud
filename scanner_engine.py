@@ -23,8 +23,9 @@ EMA_PERIOD = 200
 ATR_PERIOD = 14
 STOCHRSI_UPPER_BAND = 70
 STOCHRSI_LOWER_BAND = 40
-PRICE_STOP_LOSS_PERCENT = 0.001  # ИЗМЕНЕНИЕ: Вернули стоп-лосс на 0.2%
-TAKE_PROFIT_PERCENT = 0.001      # ИЗМЕНЕНИЕ: Добавили тейк-профит 0.1%
+PRICE_STOP_LOSS_PERCENT = 0.0005  # ИЗМЕНЕНИЕ: Начальный стоп-лосс 0.05%
+TAKE_PROFIT_PERCENT = 0.001      # Тейк-профит остается 0.1%
+BREAK_EVEN_TRIGGER_PERCENT = 0.0005 # ИЗМЕНЕНИЕ: Уровень для переноса стопа в безубыток
 KD_CROSS_BUFFER = 3
 
 def calculate_features(ohlcv):
@@ -48,6 +49,27 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         last_row = features_df.iloc[-1]
         last_price = last_row['close']
         
+        # --- ИЗМЕНЕНИЕ: Логика динамического стоп-лосса ---
+        if not signal.get('break_even_activated', False):
+            break_even_price_trigger = 0
+            if signal['side'] == 'LONG':
+                break_even_price_trigger = signal['Entry_Price'] * (1 + BREAK_EVEN_TRIGGER_PERCENT)
+                if last_price >= break_even_price_trigger:
+                    signal['SL_Price'] = break_even_price_trigger
+                    signal['break_even_activated'] = True
+                    msg = (f"🛡️ <b>БЕЗУБЫТОК</b>\n\n"
+                           f"<b>SL для {signal['side']} изменен на:</b> <code>{signal['SL_Price']:.4f}</code>")
+                    await broadcast_func(app, msg)
+            
+            elif signal['side'] == 'SHORT':
+                break_even_price_trigger = signal['Entry_Price'] * (1 - BREAK_EVEN_TRIGGER_PERCENT)
+                if last_price <= break_even_price_trigger:
+                    signal['SL_Price'] = break_even_price_trigger
+                    signal['break_even_activated'] = True
+                    msg = (f"🛡️ <b>БЕЗУБЫТОК</b>\n\n"
+                           f"<b>SL для {signal['side']} изменен на:</b> <code>{signal['SL_Price']:.4f}</code>")
+                    await broadcast_func(app, msg)
+
         current_k, current_d = last_row['stochrsi_k'], last_row['stochrsi_d']
         current_atr = last_row.get(f'ATRr_{ATR_PERIOD}')
 
@@ -55,8 +77,6 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 
         exit_status, exit_price, exit_detail = None, last_price, None
         
-        # ИЗМЕНЕНИЕ: Добавлена проверка тейк-профита.
-        # Сработает то, что наступит раньше: SL, TP или пересечение.
         if signal['side'] == 'LONG':
             if last_price <= signal['SL_Price']:
                 exit_status = "SL_HIT"
@@ -146,7 +166,6 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
 async def execute_trade(app, broadcast_func, features, side):
     entry_price = features['close']
     
-    # ИЗМЕНЕНИЕ: Рассчитываем и SL и TP
     sl_price = entry_price * (1 - PRICE_STOP_LOSS_PERCENT) if side == "LONG" else entry_price * (1 + PRICE_STOP_LOSS_PERCENT)
     tp_price = entry_price * (1 + TAKE_PROFIT_PERCENT) if side == "LONG" else entry_price * (1 - TAKE_PROFIT_PERCENT)
     
@@ -156,17 +175,17 @@ async def execute_trade(app, broadcast_func, features, side):
         "Signal_ID": signal_id, "Pair": PAIR_TO_SCAN, "side": side,
         "Entry_Price": entry_price, 
         "SL_Price": sl_price,
-        "TP_Price": tp_price, # ИЗМЕНЕНИЕ: Сохраняем цену тейк-профита
+        "TP_Price": tp_price,
         "Status": "ACTIVE",
         "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
         "StochRSI_at_Entry": features.get('stochrsi_k'),
-        "ATR_at_Entry": features.get(f'ATRr_14')
+        "ATR_at_Entry": features.get(f'ATRr_14'),
+        "break_even_activated": False # ИЗМЕНЕНИЕ: Начальный флаг для безубытка
     }
     
     app.bot_data.setdefault('monitored_signals', []).append(decision)
     await log_open_trade(decision)
 
-    # ИЗМЕНЕНИЕ: Добавили TP в сообщение о сигнале
     msg = (f"🔥 <b>СИГНАЛ ПО ИМПУЛЬСУ ({side})</b>\n\n"
            f"<b>Вход:</b> <code>{entry_price:.4f}</code>\n"
            f"<b>TP:</b>   <code>{tp_price:.4f}</code> ({TAKE_PROFIT_PERCENT * 100}%)\n"
