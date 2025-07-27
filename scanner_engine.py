@@ -22,11 +22,11 @@ STOCHRSI_PERIOD = 14
 STOCHRSI_K_PERIOD = 3
 STOCHRSI_D_PERIOD = 3
 EMA_PERIOD = 200
+ATR_PERIOD = 14
+STOCHRSI_UPPER_BAND = 70
+STOCHRSI_LOWER_BAND = 40
 PRICE_STOP_LOSS_PERCENT = 0.002
-# <<< ИЗМЕНЕННЫЕ ПАРАМЕТРЫ >>>
-STOCHRSI_UPPER_BAND = 70 # Уровень для входа в LONG
-STOCHRSI_LOWER_BAND = 40 # Уровень для входа в SHORT
-KD_CROSS_BUFFER = 3    # Буфер в пунктах для выхода по пересечению K/D
+KD_CROSS_BUFFER = 3
 
 def calculate_features(ohlcv):
     if len(ohlcv) < EMA_PERIOD: return None
@@ -35,7 +35,7 @@ def calculate_features(ohlcv):
     df['stochrsi_k'] = stoch_rsi_df.iloc[:, 0]
     df['stochrsi_d'] = stoch_rsi_df.iloc[:, 1]
     df[f'EMA_{EMA_PERIOD}'] = df.ta.ema(length=EMA_PERIOD)
-    df.ta.atr(length=14, append=True) # Оставляем расчет ATR для сбора данных
+    df.ta.atr(length=ATR_PERIOD, append=True)
     return df
 
 async def monitor_active_trades(exchange, app: Application, broadcast_func):
@@ -50,18 +50,15 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         last_price = last_row['close']
         
         current_k, current_d = last_row['stochrsi_k'], last_row['stochrsi_d']
-        current_atr = last_row.get(f'ATRr_14')
+        current_atr = last_row.get(f'ATRr_{ATR_PERIOD}')
 
         if pd.isna(current_k) or pd.isna(current_d): return
 
         exit_status, exit_price, exit_detail = None, last_price, None
         
-        # --- Проверяем условия выхода ---
         if signal['side'] == 'LONG':
             if last_price <= signal['SL_Price']:
                 exit_status = "SL_HIT"
-            # <<< НОВАЯ ЛОГИКА ВЫХОДА С БУФЕРОМ >>>
-            # Выходим, только если K ниже D на величину буфера
             elif current_k < current_d and (current_d - current_k) >= KD_CROSS_BUFFER:
                 exit_status = "STOCHRSI_CROSS"
                 exit_detail = f"K:{current_k:.2f} | D:{current_d:.2f}"
@@ -69,8 +66,6 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         elif signal['side'] == 'SHORT':
             if last_price >= signal['SL_Price']:
                 exit_status = "SL_HIT"
-            # <<< НОВАЯ ЛОГИКА ВЫХОДА С БУФЕРОМ >>>
-            # Выходим, только если K выше D на величину буфера
             elif current_k > current_d and (current_k - current_d) >= KD_CROSS_BUFFER:
                 exit_status = "STOCHRSI_CROSS"
                 exit_detail = f"K:{current_k:.2f} | D:{current_d:.2f}"
@@ -85,6 +80,18 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
             emoji = "✅" if pnl_usd > 0 else "❌"
             msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({exit_status})</b>\n\n"
                    f"<b>Результат: ${pnl_usd:+.2f} ({pnl_percent_display:+.2f}%)</b>\n")
+            
+            # <<< ИСПРАВЛЕННАЯ ЛОГИКА ФОРМИРОВАНИЯ СООБЩЕНИЯ И ДЕТАЛЕЙ >>>
+            if exit_detail is None:
+                exit_detail = "" # Инициализируем пустой строкой, чтобы избежать ошибки
+
+            if current_atr:
+                # Добавляем ATR в детали, если он есть
+                exit_detail += f" | ATR: {current_atr:.4f}"
+            
+            # Убираем лишний разделитель в начале, если он есть
+            exit_detail = exit_detail.lstrip(" | ")
+
             if exit_detail:
                 msg += f"<b>Детали:</b> {exit_detail}"
 
