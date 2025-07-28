@@ -13,7 +13,7 @@ log = logging.getLogger("bot")
 # --- Конфигурация стратегии ---
 PAIR_TO_SCAN = 'SOL/USDT'
 TIMEFRAME = '1m'
-SCAN_INTERVAL = 5 
+SCAN_INTERVAL = 5
 
 # --- Параметры стратегии ---
 STOCHRSI_PERIOD = 14
@@ -21,6 +21,7 @@ STOCHRSI_K_PERIOD = 3
 STOCHRSI_D_PERIOD = 3
 EMA_PERIOD = 200
 ATR_PERIOD = 14
+# Возвращаем ваши настройки. UPPER_BAND используется для лонга, LOWER_BAND для шорта.
 STOCHRSI_UPPER_BAND = 20
 STOCHRSI_LOWER_BAND = 70
 PRICE_STOP_LOSS_PERCENT = 0.0005
@@ -148,39 +149,35 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
 
         if pd.isna(current_k) or pd.isna(prev_k) or pd.isna(current_ema) or pd.isna(prev_ema): return
 
-        # --- ИЗМЕНЕНИЕ: Новая логика входа в сделку ---
+        # --- ИСПРАВЛЕННАЯ ЛОГИКА ---
+        
+        # 1. Проверяем, пересекает ли ТЕКУЩАЯ свеча линию EMA 200
+        is_crossing = (prev_price < prev_ema and current_price > current_ema) or \
+                      (prev_price > prev_ema and current_price < prev_ema)
 
-        # 1. Проверяем, ждем ли мы свечу ПОСЛЕ пересечения EMA
-        if app.bot_data.get('ema_cross_pending_trade', False):
-            app.bot_data['ema_cross_pending_trade'] = False # Сбрасываем флаг
-            log.info("Evaluating trade on the candle AFTER EMA cross.")
-
-            side = None
-            # Если цена НАД EMA и StochRSI дает сигнал в лонг
-            if current_price > current_ema and (prev_k < STOCHRSI_UPPER_BAND and current_k >= STOCHRSI_UPPER_BAND):
+        if is_crossing:
+            log.info("EMA 200 cross detected. Skipping signal check on this candle.")
+            return  # Если свеча пересекает EMA, просто пропускаем эту проверку и ждем следующую.
+        
+        # 2. Если пересечения нет, применяем стандартные фильтры для поиска сигнала
+        side = None
+        # Условия для ЛОНГА: цена выше EMA и StochRSI пересекает ВЕРХНЮЮ границу (которая у вас 20)
+        if current_price > current_ema:
+            if prev_k < STOCHRSI_UPPER_BAND and current_k >= STOCHRSI_UPPER_BAND:
                 side = "LONG"
-            # Если цена ПОД EMA и StochRSI дает сигнал в шорт
-            elif current_price < current_ema and (prev_k > STOCHRSI_LOWER_BAND and current_k <= STOCHRSI_LOWER_BAND):
+        # Условия для ШОРТА: цена ниже EMA и StochRSI пересекает НИЖНЮЮ границу (которая у вас 70)
+        elif current_price < current_ema:
+            if prev_k > STOCHRSI_LOWER_BAND and current_k <= STOCHRSI_LOWER_BAND:
                 side = "SHORT"
-            
-            if side:
-                await execute_trade(app, broadcast_func, last_row, side)
-            return # Завершаем проверку в любом случае
+        
+        if side:
+            await execute_trade(app, broadcast_func, last_row, side)
+            return
 
-        # 2. Ищем новое пересечение EMA
-        up_cross = prev_price < prev_ema and current_price > current_ema
-        down_cross = prev_price > prev_ema and current_price < prev_ema
-
-        if up_cross or down_cross:
-            log.info(f"EMA cross detected ({'UP' if up_cross else 'DOWN'}). Waiting for the next candle to evaluate trade.")
-            app.bot_data['ema_cross_pending_trade'] = True # Устанавливаем флаг, чтобы проверить сделку на СЛЕДУЮЩЕЙ свече
-            return # На свече пересечения не торгуем
-
-        # Если не было пересечения и мы не ждем следующую свечу, просто выводим инфо
+        # Информационное сообщение, если сигналов нет
         if app.bot_data.get('live_info_on', False):
             trend = "UP" if current_price > current_ema else "DOWN"
-            info_msg = (f"<b>[INFO]</b> Trend: {trend}\n"
-                        f"StochRSI: <code>{current_k:.2f}</code> | "
+            info_msg = (f"<b>[INFO]</b> Trend: {trend} | StochRSI K: <code>{current_k:.2f}</code> | "
                         f"Close: <code>{current_price:.2f}</code> | EMA: <code>{current_ema:.2f}</code>")
             await broadcast_func(app, info_msg)
 
@@ -220,9 +217,6 @@ async def execute_trade(app, broadcast_func, features, side):
 
 async def scanner_main_loop(app: Application, broadcast_func):
     log.info("StochRSI Momentum K/D Cross Engine loop starting...")
-    
-    # Инициализируем флаг для логики пересечения EMA
-    app.bot_data['ema_cross_pending_trade'] = False
     
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     await exchange.load_markets()
