@@ -6,8 +6,8 @@ import pandas_ta as ta
 import ccxt.async_support as ccxt
 from telegram.ext import Application
 from datetime import datetime, timezone
-# ИЗМЕНЕНИЕ: Импортируем все необходимые функции
-from trade_executor import setup_sheets, log_open_trade, log_tsl_update, update_closed_trade
+# ИЗМЕНЕНИЕ: Убрали импорт setup_sheets
+from trade_executor import log_open_trade, log_tsl_update, update_closed_trade
 
 log = logging.getLogger("bot")
 
@@ -53,7 +53,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
                 signal['SL_Price'] = tsl['stop_price']
                 msg = f"🛡️ <b>СТОП-ЛОСС АКТИВИРОВАН</b>\n\nУровень: <code>{tsl['stop_price']:.4f}</code>"
                 await broadcast_func(app, msg)
-                await log_tsl_update(signal['Signal_ID'], tsl['stop_price']) # Логируем
+                await log_tsl_update(signal['Signal_ID'], tsl['stop_price'])
         else:
             next_trail_price = tsl['last_trail_price'] * (1 + TRAILING_STOP_STEP) if signal['side'] == 'LONG' else tsl['last_trail_price'] * (1 - TRAILING_STOP_STEP)
             if (signal['side'] == 'LONG' and last_price >= next_trail_price) or \
@@ -63,7 +63,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
                 signal['SL_Price'] = tsl['stop_price']
                 msg = f"⚙️ <b>СТОП-ЛОСС ПЕРЕДВИНУТ</b>\n\nНовый уровень: <code>{tsl['stop_price']:.4f}</code>"
                 await broadcast_func(app, msg)
-                await log_tsl_update(signal['Signal_ID'], tsl['stop_price']) # Логируем
+                await log_tsl_update(signal['Signal_ID'], tsl['stop_price'])
 
         if tsl['activated']:
             if (signal['side'] == 'LONG' and last_price <= tsl['stop_price']) or \
@@ -169,11 +169,8 @@ async def execute_trade(app, broadcast_func, features, side):
 async def scanner_main_loop(app: Application, broadcast_func):
     log.info("EMA Cross Strategy Engine loop starting...")
     
-    # ИЗМЕНЕНИЕ: Инициализируем Google Sheets при старте
-    setup_sheets()
-    
     app.bot_data['trade_state'] = 'SEARCHING_CROSS'
-    app.bot_data['cooldown_duration'] = 60 # Пауза после сделки
+    app.bot_data.setdefault('cooldown_duration', 60)
     
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     await exchange.load_markets()
