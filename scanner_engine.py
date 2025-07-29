@@ -6,14 +6,13 @@ import pandas_ta as ta
 import ccxt.async_support as ccxt
 from telegram.ext import Application
 from datetime import datetime, timezone
-# ИЗМЕНЕНИЕ: Убрали импорт setup_sheets
 from trade_executor import log_open_trade, log_tsl_update, update_closed_trade
 
 log = logging.getLogger("bot")
 
 # --- НАСТРОЙКИ СТРАТЕГИИ ---
 PAIR_TO_SCAN = 'SOL/USDT:USDT' 
-TIMEFRAME = '5m' 
+TIMEFRAME = '1m' # ИЗМЕНЕНИЕ: Возвращаем 1-минутный таймфрейм
 SCAN_INTERVAL = 5 
 EMA_PERIOD = 200
 TRAILING_STOP_STEP = 0.003
@@ -84,11 +83,6 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
             await broadcast_func(app, msg)
             await update_closed_trade(signal['Signal_ID'], 'CLOSED', last_price, pnl_usd, pnl_percent_display, exit_status)
             bot_data['monitored_signals'] = []
-            
-            cooldown_duration = bot_data.get('cooldown_duration', 60)
-            cooldown_end_time = time.time() + cooldown_duration
-            bot_data['cooldown_until'] = cooldown_end_time
-            await broadcast_func(app, f"⏱️ <b>ПАУЗА</b>. Поиск возобновится через {cooldown_duration} сек.")
 
     except Exception as e:
         log.error(f"Ошибка мониторинга: {e}", exc_info=True)
@@ -170,18 +164,13 @@ async def scanner_main_loop(app: Application, broadcast_func):
     log.info("EMA Cross Strategy Engine loop starting...")
     
     app.bot_data['trade_state'] = 'SEARCHING_CROSS'
-    app.bot_data.setdefault('cooldown_duration', 60)
     
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     await exchange.load_markets()
     
     while app.bot_data.get("bot_on", False):
-        cooldown_until = app.bot_data.get('cooldown_until', 0)
-        current_time = time.time()
-
         if not app.bot_data.get('monitored_signals'):
-            if current_time > cooldown_until:
-                await scan_for_signals(exchange, app, broadcast_func)
+            await scan_for_signals(exchange, app, broadcast_func)
         else:
             await monitor_active_trades(exchange, app, broadcast_func)
         
