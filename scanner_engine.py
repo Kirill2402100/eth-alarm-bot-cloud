@@ -17,6 +17,7 @@ SCAN_INTERVAL = 5
 EMA_PERIOD = 200
 TRAILING_STOP_STEP = 0.003
 
+# ... (функции calculate_features и monitor_active_trades без изменений) ...
 def calculate_features(ohlcv):
     if len(ohlcv) < EMA_PERIOD: return None
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -34,7 +35,6 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         last_row = features_df.iloc[-1]
         last_price = last_row['close']
         last_ema = last_row[f'EMA_{EMA_PERIOD}']
-        # Получаем цену открытия для установки стопа
         last_open_price = last_row['open'] 
         
         exit_status = None
@@ -44,25 +44,21 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 
         tsl = signal['trailing_stop']
         
-        # Активация трейлинг-стопа
         if not tsl['activated']:
             activation_price = signal['Entry_Price'] * (1 + TRAILING_STOP_STEP) if signal['side'] == 'LONG' else signal['Entry_Price'] * (1 - TRAILING_STOP_STEP)
             if (signal['side'] == 'LONG' and last_price >= activation_price) or \
                (signal['side'] == 'SHORT' and last_price <= activation_price):
                 tsl['activated'] = True
-                # ИСПРАВЛЕНИЕ: Ставим стоп на цену ОТКРЫТИЯ (open) свечи-триггера
                 tsl['stop_price'] = last_open_price 
                 tsl['last_trail_price'] = activation_price
                 signal['SL_Price'] = tsl['stop_price']
                 msg = f"🛡️ <b>СТОП-ЛОСС АКТИВИРОВАН</b>\n\nУровень: <code>{tsl['stop_price']:.4f}</code>"
                 await broadcast_func(app, msg)
                 await log_tsl_update(signal['Signal_ID'], tsl['stop_price'])
-        # Перемещение (трейлинг) стопа
         else:
             next_trail_price = tsl['last_trail_price'] * (1 + TRAILING_STOP_STEP) if signal['side'] == 'LONG' else tsl['last_trail_price'] * (1 - TRAILING_STOP_STEP)
             if (signal['side'] == 'LONG' and last_price >= next_trail_price) or \
                (signal['side'] == 'SHORT' and last_price <= next_trail_price):
-                # ИСПРАВЛЕНИЕ: Двигаем стоп на цену ОТКРЫТИЯ (open) свечи-триггера
                 tsl['stop_price'] = last_open_price
                 tsl['last_trail_price'] = next_trail_price
                 signal['SL_Price'] = tsl['stop_price']
@@ -92,6 +88,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 
     except Exception as e:
         log.error(f"Ошибка мониторинга: {e}", exc_info=True)
+
 
 async def scan_for_signals(exchange, app: Application, broadcast_func):
     bot_data = app.bot_data
@@ -127,7 +124,7 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
                 touches_ema = last_row['low'] <= current_ema <= last_row['high']
                 if touches_ema:
                     log.info(f"Candle {bot_data['candles_after_cross']} touches EMA. Waiting.")
-                    return
+                    return # Важно: выходим и ждем следующую свечу, состояние не сбрасываем
 
                 side = None
                 if bot_data['cross_direction'] == 'UP' and current_price > current_ema:
@@ -138,11 +135,14 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
                 if side:
                     log.info(f"Confirmation received. Executing {side} trade.")
                     await execute_trade(app, broadcast_func, last_row, side)
-                
-                bot_data['trade_state'] = 'SEARCHING_CROSS'
+                    # ИСПРАВЛЕНИЕ: Сбрасываем состояние ТОЛЬКО ПОСЛЕ успешного входа
+                    bot_data['trade_state'] = 'SEARCHING_CROSS'
+                # Если side is None, мы ничего не делаем и просто ждем следующую свечу,
+                # оставаясь в состоянии WAITING_CONFIRMATION
 
     except Exception as e:
         log.error(f"Ошибка сканирования: {e}", exc_info=True)
+
 
 async def execute_trade(app, broadcast_func, features, side):
     entry_price = features['close']
