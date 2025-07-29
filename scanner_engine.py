@@ -21,10 +21,9 @@ STOCHRSI_K_PERIOD = 3
 STOCHRSI_D_PERIOD = 3
 EMA_PERIOD = 200
 ATR_PERIOD = 14
-# Возвращаем ваши настройки. UPPER_BAND используется для лонга, LOWER_BAND для шорта.
 STOCHRSI_UPPER_BAND = 20
 STOCHRSI_LOWER_BAND = 70
-PRICE_STOP_LOSS_PERCENT = 0.001
+PRICE_STOP_LOSS_PERCENT = 0.0005
 TAKE_PROFIT_PERCENT = 0.001
 BREAK_EVEN_TRIGGER_PERCENT = 0.0005
 KD_CROSS_BUFFER = 2
@@ -51,6 +50,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         last_row = features_df.iloc[-1]
         last_price = last_row['close']
         
+        # --- Логика динамического стоп-лосса ---
         if not signal.get('break_even_activated', False):
             break_even_price_trigger = 0
             if signal['side'] == 'LONG':
@@ -61,6 +61,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
                     msg = (f"🛡️ <b>БЕЗУБЫТОК</b>\n\n"
                            f"<b>SL для {signal['side']} изменен на:</b> <code>{signal['SL_Price']:.4f}</code>")
                     await broadcast_func(app, msg)
+                    return # ИЗМЕНЕНИЕ: Завершаем итерацию, чтобы избежать мгновенного закрытия
             
             elif signal['side'] == 'SHORT':
                 break_even_price_trigger = signal['Entry_Price'] * (1 - BREAK_EVEN_TRIGGER_PERCENT)
@@ -70,6 +71,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
                     msg = (f"🛡️ <b>БЕЗУБЫТОК</b>\n\n"
                            f"<b>SL для {signal['side']} изменен на:</b> <code>{signal['SL_Price']:.4f}</code>")
                     await broadcast_func(app, msg)
+                    return # ИЗМЕНЕНИЕ: Завершаем итерацию, чтобы избежать мгновенного закрытия
 
         current_k, current_d = last_row['stochrsi_k'], last_row['stochrsi_d']
         current_atr = last_row.get(f'ATRr_{ATR_PERIOD}')
@@ -78,6 +80,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 
         exit_status, exit_price, exit_detail = None, last_price, None
         
+        # --- Проверка условий выхода (теперь в отдельной итерации после БУ) ---
         if signal['side'] == 'LONG':
             if last_price <= signal['SL_Price']:
                 exit_status = "SL_HIT"
@@ -149,23 +152,17 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
 
         if pd.isna(current_k) or pd.isna(prev_k) or pd.isna(current_ema) or pd.isna(prev_ema): return
 
-        # --- ИСПРАВЛЕННАЯ ЛОГИКА ---
-        
-        # 1. Проверяем, пересекает ли ТЕКУЩАЯ свеча линию EMA 200
         is_crossing = (prev_price < prev_ema and current_price > current_ema) or \
                       (prev_price > prev_ema and current_price < prev_ema)
 
         if is_crossing:
             log.info("EMA 200 cross detected. Skipping signal check on this candle.")
-            return  # Если свеча пересекает EMA, просто пропускаем эту проверку и ждем следующую.
+            return
         
-        # 2. Если пересечения нет, применяем стандартные фильтры для поиска сигнала
         side = None
-        # Условия для ЛОНГА: цена выше EMA и StochRSI пересекает ВЕРХНЮЮ границу (которая у вас 20)
         if current_price > current_ema:
             if prev_k < STOCHRSI_UPPER_BAND and current_k >= STOCHRSI_UPPER_BAND:
                 side = "LONG"
-        # Условия для ШОРТА: цена ниже EMA и StochRSI пересекает НИЖНЮЮ границу (которая у вас 70)
         elif current_price < current_ema:
             if prev_k > STOCHRSI_LOWER_BAND and current_k <= STOCHRSI_LOWER_BAND:
                 side = "SHORT"
@@ -174,7 +171,6 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
             await execute_trade(app, broadcast_func, last_row, side)
             return
 
-        # Информационное сообщение, если сигналов нет
         if app.bot_data.get('live_info_on', False):
             trend = "UP" if current_price > current_ema else "DOWN"
             info_msg = (f"<b>[INFO]</b> Trend: {trend} | StochRSI K: <code>{current_k:.2f}</code> | "
