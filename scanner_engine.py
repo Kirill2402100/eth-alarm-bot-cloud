@@ -5,15 +5,15 @@ import pandas as pd
 import pandas_ta as ta
 import ccxt.async_support as ccxt
 from telegram.ext import Application
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta # <- ДОБАВЛЕНО
 from trade_executor import log_open_trade, log_tsl_update, update_closed_trade
 
 log = logging.getLogger("bot")
 
 # --- НАСТРОЙКИ СТРАТЕГИИ ---
-PAIR_TO_SCAN = 'SOL/USDT:USDT' 
+PAIR_TO_SCAN = 'SOL/USDT:USDT'
 TIMEFRAME = '1m'
-SCAN_INTERVAL = 5 
+SCAN_INTERVAL = 5 # <- Этот параметр больше не используется для паузы, но может быть нужен в других местах
 EMA_PERIOD = 200
 TRAILING_STOP_STEP = 0.003
 
@@ -34,7 +34,6 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         last_row = features_df.iloc[-1]
         last_price = last_row['close']
         last_ema = last_row[f'EMA_{EMA_PERIOD}']
-        # ИЗМЕНЕНИЕ: Получаем цену открытия текущей свечи
         last_open_price = last_row['open']
         
         exit_status = None
@@ -50,8 +49,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
             if (signal['side'] == 'LONG' and last_price >= activation_price) or \
                (signal['side'] == 'SHORT' and last_price <= activation_price):
                 tsl['activated'] = True
-                # ИЗМЕНЕНИЕ: Ставим стоп на цену ОТКРЫТИЯ свечи-триггера
-                tsl['stop_price'] = last_open_price 
+                tsl['stop_price'] = last_open_price
                 tsl['last_trail_price'] = activation_price
                 signal['SL_Price'] = tsl['stop_price']
                 msg = f"🛡️ <b>СТОП-ЛОСС АКТИВИРОВАН</b>\n\nУровень: <code>{tsl['stop_price']:.4f}</code>"
@@ -62,7 +60,6 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
             next_trail_price = tsl['last_trail_price'] * (1 + TRAILING_STOP_STEP) if signal['side'] == 'LONG' else tsl['last_trail_price'] * (1 - TRAILING_STOP_STEP)
             if (signal['side'] == 'LONG' and last_price >= next_trail_price) or \
                (signal['side'] == 'SHORT' and last_price <= next_trail_price):
-                # ИЗМЕНЕНИЕ: Двигаем стоп на цену ОТКРЫТИЯ свечи-триггера
                 tsl['stop_price'] = last_open_price
                 tsl['last_trail_price'] = next_trail_price
                 signal['SL_Price'] = tsl['stop_price']
@@ -114,7 +111,7 @@ async def scan_for_signals(exchange, app: Application, broadcast_func):
 
         if state == 'SEARCHING_CROSS':
             is_crossing_up = prev_price < prev_ema and current_price > current_ema
-            is_crossing_down = prev_price > prev_ema and current_price < prev_ema
+            is_crossing_down = prev_price > prev_ema and current_price < current_ema
             if is_crossing_up or is_crossing_down:
                 bot_data['trade_state'] = 'WAITING_CONFIRMATION'
                 bot_data['candles_after_cross'] = 1
@@ -180,7 +177,25 @@ async def scanner_main_loop(app: Application, broadcast_func):
         else:
             await monitor_active_trades(exchange, app, broadcast_func)
         
-        await asyncio.sleep(SCAN_INTERVAL)
+        # --- ИЗМЕНЕНИЕ ---
+        # Удаляем старую неточную паузу:
+        # await asyncio.sleep(SCAN_INTERVAL)
         
+        # Добавляем "умную" паузу для синхронизации с закрытием свечи
+        API_BUFFER = 3  # 3 секунды запаса, чтобы биржа успела обработать и отдать данные о новой свече
+
+        now = datetime.now(timezone.utc)
+        
+        # Вычисляем время начала следующей минуты
+        next_minute = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        
+        # Вычисляем, сколько секунд спать до этого времени + буфер
+        sleep_duration = (next_minute - now).total_seconds() + API_BUFFER
+
+        # Убедимся, что не спим отрицательное время, если цикл "опоздал"
+        if sleep_duration > 0:
+            log.info(f"Синхронизация... спим {sleep_duration:.2f} секунд до следующей проверки.")
+            await asyncio.sleep(sleep_duration)
+            
     await exchange.close()
     log.info("EMA Cross Strategy Engine loop stopped.")
