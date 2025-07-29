@@ -34,8 +34,8 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         last_row = features_df.iloc[-1]
         last_price = last_row['close']
         last_ema = last_row[f'EMA_{EMA_PERIOD}']
-        # ИЗМЕНЕНИЕ: Получаем цену открытия текущей свечи
-        last_open_price = last_row['open']
+        # Получаем цену открытия для установки стопа
+        last_open_price = last_row['open'] 
         
         exit_status = None
         if (signal['side'] == 'LONG' and last_row['low'] <= last_ema) or \
@@ -50,7 +50,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
             if (signal['side'] == 'LONG' and last_price >= activation_price) or \
                (signal['side'] == 'SHORT' and last_price <= activation_price):
                 tsl['activated'] = True
-                # ИЗМЕНЕНИЕ: Ставим стоп на цену ОТКРЫТИЯ свечи-триггера
+                # ИСПРАВЛЕНИЕ: Ставим стоп на цену ОТКРЫТИЯ (open) свечи-триггера
                 tsl['stop_price'] = last_open_price 
                 tsl['last_trail_price'] = activation_price
                 signal['SL_Price'] = tsl['stop_price']
@@ -62,7 +62,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
             next_trail_price = tsl['last_trail_price'] * (1 + TRAILING_STOP_STEP) if signal['side'] == 'LONG' else tsl['last_trail_price'] * (1 - TRAILING_STOP_STEP)
             if (signal['side'] == 'LONG' and last_price >= next_trail_price) or \
                (signal['side'] == 'SHORT' and last_price <= next_trail_price):
-                # ИЗМЕНЕНИЕ: Двигаем стоп на цену ОТКРЫТИЯ свечи-триггера
+                # ИСПРАВЛЕНИЕ: Двигаем стоп на цену ОТКРЫТИЯ (open) свечи-триггера
                 tsl['stop_price'] = last_open_price
                 tsl['last_trail_price'] = next_trail_price
                 signal['SL_Price'] = tsl['stop_price']
