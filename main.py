@@ -1,23 +1,59 @@
 import os
 import asyncio
 import logging
+import json
 from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, PicklePersistence
-
-# ИЗМЕНЕНИЕ: Убраны неиспользуемые импорты (json, gspread, oauth2client)
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 import scanner_engine
 import trade_executor
 
 # --- Конфигурация ---
-BOT_VERSION = "EMACross-1.0" # Обновили версию для новой стратегии
+BOT_VERSION = "EMACross-1.1" 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Переменные для Google Sheets
+SHEET_ID = os.getenv("SHEET_ID")
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 
+log = logging.getLogger("bot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# ИЗМЕНЕНИЕ: ФУНКЦИЯ setup_sheets() ПОЛНОСТЬЮ УДАЛЕНА.
-# Вся логика теперь находится в trade_executor.py
+def setup_sheets():
+    """Настраивает доступ к Google Sheets и находит/создает рабочий лист."""
+    if not SHEET_ID or not GOOGLE_CREDENTIALS:
+        log.warning("Переменные для Google Sheets не найдены. Логирование отключено.")
+        return
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        gs = gspread.authorize(creds)
+        ss = gs.open_by_key(SHEET_ID)
+
+        trade_sheet_name = "Trading_Log"
+        try:
+            worksheet = ss.worksheet(trade_sheet_name)
+        except gspread.WorksheetNotFound:
+            log.info(f"Лист '{trade_sheet_name}' не найден. Создаю новый.")
+            headers = [
+                "Signal_ID", "Timestamp_UTC", "Pair", "Side", "Status", 
+                "Entry_Price", "Exit_Price", "Exit_Time_UTC", "Exit_Reason", 
+                "PNL_USD", "PNL_Percent", "TSL_History"
+            ]
+            worksheet = ss.add_worksheet(title=trade_sheet_name, rows="2000", cols=len(headers))
+            worksheet.append_row(headers)
+            worksheet.format("A1:L1", {"textFormat": {"bold": True}})
+        
+        # Передаем объект листа в trade_executor
+        trade_executor.TRADE_LOG_WS = worksheet
+        log.info(f"Google Sheets готов. Логирование в лист '{trade_sheet_name}'.")
+
+    except Exception as e:
+        log.error(f"Ошибка инициализации Google Sheets: {e}", exc_info=True)
+
 
 async def post_init(app: Application):
     log.info("Бот запущен. Проверяем, нужно ли запускать основной цикл...")
@@ -25,7 +61,6 @@ async def post_init(app: Application):
         log.info("Обнаружен флаг 'run_loop_on_startup'. Запускаю основной цикл.")
         asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
     
-    # ИЗМЕНЕНИЕ: Удалена команда /info
     await app.bot.set_my_commands([
         ('start', 'Запустить/перезапустить бота'),
         ('run', 'Запустить сканер'),
@@ -43,6 +78,7 @@ async def broadcast(app: Application, txt: str):
         except Exception as e:
             log.error(f"Send fail to {cid}: {e}")
 
+# ... (остальные команды без изменений) ...
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     ctx.bot_data.setdefault('chat_ids', set()).add(chat_id)
@@ -90,8 +126,6 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
            f"<b>Плечо:</b> x{bot_data.get('leverage', 100)}\n")
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
-# ИЗМЕНЕНИЕ: ФУНКЦИЯ cmd_info УДАЛЕНА
-
 async def cmd_deposit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         amount = float(ctx.args[0])
@@ -108,8 +142,9 @@ async def cmd_leverage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except (IndexError, ValueError):
         await update.message.reply_text("⚠️ Неверный формат. Используйте /leverage <число>")
 
+
 if __name__ == "__main__":
-    # ИЗМЕНЕНИЕ: вызов setup_sheets() удален отсюда
+    setup_sheets() # Вызываем настройку таблиц при старте
     persistence = PicklePersistence(filepath="bot_persistence")
     app = ApplicationBuilder().token(BOT_TOKEN).persistence(persistence).post_init(post_init).build()
     
@@ -117,7 +152,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
-    # ИЗМЕНЕНИЕ: обработчик для /info удален
     app.add_handler(CommandHandler("deposit", cmd_deposit))
     app.add_handler(CommandHandler("leverage", cmd_leverage))
     
