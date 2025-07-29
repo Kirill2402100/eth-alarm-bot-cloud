@@ -12,7 +12,7 @@ log = logging.getLogger("bot")
 
 # --- НАСТРОЙКИ СТРАТЕГИИ ---
 PAIR_TO_SCAN = 'SOL/USDT:USDT' 
-TIMEFRAME = '1m' # ИЗМЕНЕНИЕ: Возвращаем 1-минутный таймфрейм
+TIMEFRAME = '1m'
 SCAN_INTERVAL = 5 
 EMA_PERIOD = 200
 TRAILING_STOP_STEP = 0.003
@@ -34,6 +34,8 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
         last_row = features_df.iloc[-1]
         last_price = last_row['close']
         last_ema = last_row[f'EMA_{EMA_PERIOD}']
+        # ИЗМЕНЕНИЕ: Получаем цену открытия текущей свечи
+        last_open_price = last_row['open']
         
         exit_status = None
         if (signal['side'] == 'LONG' and last_row['low'] <= last_ema) or \
@@ -42,22 +44,26 @@ async def monitor_active_trades(exchange, app: Application, broadcast_func):
 
         tsl = signal['trailing_stop']
         
+        # Активация трейлинг-стопа
         if not tsl['activated']:
             activation_price = signal['Entry_Price'] * (1 + TRAILING_STOP_STEP) if signal['side'] == 'LONG' else signal['Entry_Price'] * (1 - TRAILING_STOP_STEP)
             if (signal['side'] == 'LONG' and last_price >= activation_price) or \
                (signal['side'] == 'SHORT' and last_price <= activation_price):
                 tsl['activated'] = True
-                tsl['stop_price'] = signal['Entry_Price']
+                # ИЗМЕНЕНИЕ: Ставим стоп на цену ОТКРЫТИЯ свечи-триггера
+                tsl['stop_price'] = last_open_price 
                 tsl['last_trail_price'] = activation_price
                 signal['SL_Price'] = tsl['stop_price']
                 msg = f"🛡️ <b>СТОП-ЛОСС АКТИВИРОВАН</b>\n\nУровень: <code>{tsl['stop_price']:.4f}</code>"
                 await broadcast_func(app, msg)
                 await log_tsl_update(signal['Signal_ID'], tsl['stop_price'])
+        # Перемещение (трейлинг) стопа
         else:
             next_trail_price = tsl['last_trail_price'] * (1 + TRAILING_STOP_STEP) if signal['side'] == 'LONG' else tsl['last_trail_price'] * (1 - TRAILING_STOP_STEP)
             if (signal['side'] == 'LONG' and last_price >= next_trail_price) or \
                (signal['side'] == 'SHORT' and last_price <= next_trail_price):
-                tsl['stop_price'] = tsl['last_trail_price']
+                # ИЗМЕНЕНИЕ: Двигаем стоп на цену ОТКРЫТИЯ свечи-триггера
+                tsl['stop_price'] = last_open_price
                 tsl['last_trail_price'] = next_trail_price
                 signal['SL_Price'] = tsl['stop_price']
                 msg = f"⚙️ <b>СТОП-ЛОСС ПЕРЕДВИНУТ</b>\n\nНовый уровень: <code>{tsl['stop_price']:.4f}</code>"
