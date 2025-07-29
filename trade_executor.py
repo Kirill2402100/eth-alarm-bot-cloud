@@ -1,55 +1,16 @@
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 import logging
 from datetime import datetime, timezone
 
 log = logging.getLogger("bot")
 
-# Глобальная переменная для хранения объекта рабочего листа
+# Глобальная переменная, которая будет установлена из main.py
 TRADE_LOG_WS = None
-
-# Название вашей Google таблицы
-SPREADSHEET_NAME = "Trading Bot Logs" 
-
-def setup_sheets():
-    """
-    Авторизуется в Google Sheets, создает новый лист для текущей сессии
-    и записывает в него заголовки.
-    """
-    global TRADE_LOG_WS
-    try:
-        scope = ["https://spreadsheets.google.com/feeds", 'https://www.googleapis.com/auth/spreadsheets',
-                 "https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-        client = gspread.authorize(creds)
-        
-        spreadsheet = client.open(SPREADSHEET_NAME)
-        
-        # Создаем новый лист с уникальным именем (дата и время)
-        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        worksheet_title = f"EMACross_{timestamp}"
-        TRADE_LOG_WS = spreadsheet.add_worksheet(title=worksheet_title, rows="1000", cols="20")
-        
-        # Заголовки для анализа
-        headers = [
-            "Signal_ID", "Timestamp_UTC", "Pair", "Side", "Status", 
-            "Entry_Price", "Exit_Price", "Exit_Time_UTC", "Exit_Reason", 
-            "PNL_USD", "PNL_Percent", "TSL_History"
-        ]
-        TRADE_LOG_WS.append_row(headers)
-        log.info(f"Google Sheet '{worksheet_title}' successfully set up.")
-        
-    except Exception as e:
-        log.error(f"Failed to setup Google Sheets: {e}", exc_info=True)
-        TRADE_LOG_WS = None
-
 
 async def log_open_trade(trade_data):
     """Логирует открытие новой сделки."""
     if not TRADE_LOG_WS: return
     try:
         headers = TRADE_LOG_WS.row_values(1)
-        # Добавляем пустую историю TSL при открытии
         trade_data['TSL_History'] = ''
         row_to_insert = [trade_data.get(header, '') for header in headers]
         TRADE_LOG_WS.append_row(row_to_insert)
@@ -68,7 +29,6 @@ async def log_tsl_update(signal_id, new_stop_price):
         row_index = cell.row
         tsl_col_index = TRADE_LOG_WS.row_values(1).index("TSL_History") + 1
         
-        # Получаем старую историю и добавляем новую запись
         current_history = TRADE_LOG_WS.cell(row_index, tsl_col_index).value or ""
         timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S')
         new_entry = f"{new_stop_price:.4f}@{timestamp}"
@@ -103,7 +63,6 @@ async def update_closed_trade(signal_id, status, exit_price, pnl_usd, pnl_percen
             "Exit_Reason": exit_reason
         }
         
-        # Обновляем ячейки по одной
         for key, value in updates.items():
             if key in headers:
                 col_index = headers.index(key) + 1
