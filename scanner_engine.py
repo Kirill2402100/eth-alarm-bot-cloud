@@ -20,12 +20,12 @@ from trade_executor import log_open_trade, log_tsl_update, update_closed_trade
 PAIR_TO_SCAN        = "SOL/USDT:USDT"
 TIMEFRAME           = "1m"
 EMA_PERIOD          = 200
-TRAILING_STOP_STEP  = 0.003        # 0.3 %
+TRAILING_STOP_STEP  = 0.003       # 0.3 %
 API_BUFFER          = 2
 PRICE_SOURCE        = "mark"
 HIST_MULTIPLIER     = 5
 
-FIXED_SL_DEP_PCT    = 0.15         # ← жёсткий стоп: 15 % депозита
+FIXED_SL_DEP_PCT    = 0.15          # ← жёсткий стоп: 15 % депозита
 
 log = logging.getLogger("ema_cross_bot")
 
@@ -45,8 +45,8 @@ def calculate_features(ohlcv: List[list], drop_last: bool = True) -> Optional[pd
 def calc_fixed_sl(entry: float, side: str, deposit: float, leverage: int) -> float:
     """Цена, при которой убыток составит FIXED_SL_DEP_PCT депозита."""
     loss_usd = deposit * FIXED_SL_DEP_PCT
-    pos_size = deposit * leverage          # сумма позиции
-    loss_pct = loss_usd / pos_size         # доля цены
+    pos_size = deposit * leverage        # сумма позиции
+    loss_pct = loss_usd / pos_size       # доля цены
     return entry * (1 - loss_pct) if side == "LONG" else entry * (1 + loss_pct)
 
 # ---------------------------------------------------------------------------
@@ -85,7 +85,7 @@ async def monitor_active_trades(exchange, app: Application, broadcast):
         tsl = signal["trailing_stop"]
         if not tsl["activated"]:
             activation = signal["Entry_Price"] * (1 + TRAILING_STOP_STEP) if signal["side"] == "LONG" \
-                        else signal["Entry_Price"] * (1 - TRAILING_STOP_STEP)
+                         else signal["Entry_Price"] * (1 - TRAILING_STOP_STEP)
             if (signal["side"] == "LONG"  and last_price >= activation) or \
                (signal["side"] == "SHORT" and last_price <= activation):
                 tsl.update({"activated":True,"stop_price":last_open,"last_trail_price":activation})
@@ -135,7 +135,7 @@ async def scan_for_signals(exchange, app: Application, broadcast):
         ohlcv = await exchange.fetch_ohlcv(
             PAIR_TO_SCAN,
             timeframe=TIMEFRAME,
-            limit=EMA_PERIOD * HIST_MULTIPLIER + 6,        # «прогрев» + небольшой запас
+            limit=EMA_PERIOD * HIST_MULTIPLIER + 6,       # «прогрев» + небольшой запас
             params={"type": "swap", "price": PRICE_SOURCE},
         )
         df = calculate_features(ohlcv, drop_last=True)
@@ -154,7 +154,7 @@ async def scan_for_signals(exchange, app: Application, broadcast):
             cross_down = prev["high"] > prev_ema and last["low"]  < cur_ema
             if cross_up or cross_down:
                 bot_data.update({
-                    "trade_state":          "WAITING_CONFIRMATION",
+                    "trade_state":         "WAITING_CONFIRMATION",
                     "candles_after_cross":  1,
                     "cross_direction":      "UP" if cross_up else "DOWN",
                 })
@@ -166,43 +166,46 @@ async def scan_for_signals(exchange, app: Application, broadcast):
 
         # 2) WAITING_CONFIRMATION ─ подтверждаем ИЛИ ловим обратный кросс
         elif state == "WAITING_CONFIRMATION":
-        candles_after += 1
-        bot_data["candles_after_cross"] = candles_after
+            candles_after += 1
+            bot_data["candles_after_cross"] = candles_after
 
-        # тело второй свечи касается EMA → ждём
-        body_min = min(last["open"], last["close"])
-        body_max = max(last["open"], last["close"])
-        if body_min <= cur_ema <= body_max:
-            log.info("Second candle touches EMA — still waiting …")
+            # тело второй свечи касается EMA → ждём
+            body_min = min(last["open"], last["close"])
+            body_max = max(last["open"], last["close"])
+            if body_min <= cur_ema <= body_max:
+                log.info("Second candle touches EMA — still waiting …")
+                return
+
+            # ───── проверяем подтверждение прежнего направления
+            side = None
+            if bot_data["cross_direction"] == "UP" and last["close"] > cur_ema:
+                side = "LONG"
+            elif bot_data["cross_direction"] == "DOWN" and last["close"] < cur_ema:
+                side = "SHORT"
+
+            if side:                        # подтверждение есть
+                log.info(f"Confirmation received. Executing {side} trade.")
+                await execute_trade(app, broadcast, last, side)
+                bot_data["trade_state"] = "SEARCHING_CROSS"
+                return
+
+            # ───── иначе: сразу фиксируем кросс в противоположную сторону
+            new_dir = "DOWN" if bot_data["cross_direction"] == "UP" else "UP"
+            bot_data.update({
+                "trade_state":        "WAITING_CONFIRMATION",
+                "candles_after_cross": 1,
+                "cross_direction":     new_dir,
+            })
+            side_hint = "SHORT" if new_dir == "DOWN" else "LONG"
+            await broadcast(
+                app,
+                f"🔔 EMA {EMA_PERIOD} CROSS DETECTED → предположительный {side_hint} (ждём подтверждение)"
+            )
+            log.info(f"Reversal cross detected ({new_dir}). Waiting new confirmation …")
             return
 
-        # ───── проверяем подтверждение прежнего направления
-        side = None
-        if bot_data["cross_direction"] == "UP" and last["close"] > cur_ema:
-            side = "LONG"
-        elif bot_data["cross_direction"] == "DOWN" and last["close"] < cur_ema:
-            side = "SHORT"
-
-        if side:                                # подтверждение есть
-            log.info(f"Confirmation received. Executing {side} trade.")
-            await execute_trade(app, broadcast, last, side)
-            bot_data["trade_state"] = "SEARCHING_CROSS"
-            return
-
-        # ───── иначе: сразу фиксируем кросс в противоположную сторону
-        new_dir = "DOWN" if bot_data["cross_direction"] == "UP" else "UP"
-        bot_data.update({
-            "trade_state":         "WAITING_CONFIRMATION",
-            "candles_after_cross": 1,
-            "cross_direction":     new_dir,
-        })
-        side_hint = "SHORT" if new_dir == "DOWN" else "LONG"
-        await broadcast(
-            app,
-            f"🔔 EMA {EMA_PERIOD} CROSS DETECTED → предположительный {side_hint} (ждём подтверждение)"
-        )
-        log.info(f"Reversal cross detected ({new_dir}). Waiting new confirmation …")
-        return
+    except Exception as e:
+        log.error(f"Scanner error: {e}", exc_info=True)
 
 # ---------------------------------------------------------------------------
 # EXECUTE TRADE
@@ -215,16 +218,16 @@ async def execute_trade(app: Application, broadcast, row: pd.Series, side: str):
     leverage = app.bot_data.get("leverage", 100)
 
     decision = {
-        "Signal_ID":     signal_id,
-        "Pair":          PAIR_TO_SCAN,
-        "side":          side,
-        "Entry_Price":   entry_price,
-        "Status":        "ACTIVE",
-        "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        "trailing_stop": {"activated": False, "stop_price": 0.0, "last_trail_price": 0.0},
+        "Signal_ID":       signal_id,
+        "Pair":            PAIR_TO_SCAN,
+        "side":            side,
+        "Entry_Price":     entry_price,
+        "Status":          "ACTIVE",
+        "Timestamp_UTC":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "trailing_stop":   {"activated": False, "stop_price": 0.0, "last_trail_price": 0.0},
         # жёсткий стоп 15 % депозита
-        "SL_Price":      calc_fixed_sl(entry_price, side, deposit, leverage),
-        "TP_Price":      0.0,
+        "SL_Price":        calc_fixed_sl(entry_price, side, deposit, leverage),
+        "TP_Price":        0.0,
     }
 
     app.bot_data.setdefault("monitored_signals", []).append(decision)
