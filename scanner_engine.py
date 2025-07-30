@@ -164,33 +164,45 @@ async def scan_for_signals(exchange, app: Application, broadcast):
                 )
                 log.info(f"EMA cross detected ({bot_data['cross_direction']}). Waiting confirmation …")
 
-        # 2) ждём закрытия второй свечи после кросса
-        elif state == "WAITING_CONFIRMATION":
-            candles_after += 1
-            bot_data["candles_after_cross"] = candles_after
+        # 2) WAITING_CONFIRMATION ─ подтверждаем ИЛИ ловим обратный кросс
+    elif state == "WAITING_CONFIRMATION":
+        candles_after += 1
+        bot_data["candles_after_cross"] = candles_after
 
-            # если тело второй свечи касается EMA — ждём дальше
-            body_min = min(last["open"], last["close"])
-            body_max = max(last["open"], last["close"])
-            if body_min <= cur_ema <= body_max:
-                log.info("Second candle touches EMA — still waiting …")
-                return
+        # тело второй свечи касается EMA → ждём
+        body_min = min(last["open"], last["close"])
+        body_max = max(last["open"], last["close"])
+        if body_min <= cur_ema <= body_max:
+            log.info("Second candle touches EMA — still waiting …")
+            return
 
-            side = None
-            if bot_data["cross_direction"] == "UP" and last["close"] > cur_ema:
-                side = "LONG"
-            elif bot_data["cross_direction"] == "DOWN" and last["close"] < cur_ema:
-                side = "SHORT"
+        # ───── проверяем подтверждение прежнего направления
+        side = None
+        if bot_data["cross_direction"] == "UP" and last["close"] > cur_ema:
+            side = "LONG"
+        elif bot_data["cross_direction"] == "DOWN" and last["close"] < cur_ema:
+            side = "SHORT"
 
-            if side:
-                log.info(f"Confirmation received. Executing {side} trade.")
-                await execute_trade(app, broadcast, last, side)
-
-            # cброс FSM вне зависимости от результата
+        if side:                                # подтверждение есть
+            log.info(f"Confirmation received. Executing {side} trade.")
+            await execute_trade(app, broadcast, last, side)
             bot_data["trade_state"] = "SEARCHING_CROSS"
+            return
 
-    except Exception as e:
-        log.error(f"Scan error: {e}", exc_info=True)
+        # ───── иначе: сразу фиксируем кросс в противоположную сторону
+        new_dir = "DOWN" if bot_data["cross_direction"] == "UP" else "UP"
+        bot_data.update({
+            "trade_state":         "WAITING_CONFIRMATION",
+            "candles_after_cross": 1,
+            "cross_direction":     new_dir,
+        })
+        side_hint = "SHORT" if new_dir == "DOWN" else "LONG"
+        await broadcast(
+            app,
+            f"🔔 EMA {EMA_PERIOD} CROSS DETECTED → предположительный {side_hint} (ждём подтверждение)"
+        )
+        log.info(f"Reversal cross detected ({new_dir}). Waiting new confirmation …")
+        return
 
 # ---------------------------------------------------------------------------
 # EXECUTE TRADE
