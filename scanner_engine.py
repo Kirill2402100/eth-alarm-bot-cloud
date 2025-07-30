@@ -165,7 +165,7 @@ async def scan_for_signals(exchange, app: Application, broadcast):
                 log.info(f"EMA cross detected ({bot_data['cross_direction']}). Waiting confirmation …")
 
         # 2) WAITING_CONFIRMATION ─ подтверждаем ИЛИ ловим обратный кросс
-    elif state == "WAITING_CONFIRMATION":
+        elif state == "WAITING_CONFIRMATION":
         candles_after += 1
         bot_data["candles_after_cross"] = candles_after
 
