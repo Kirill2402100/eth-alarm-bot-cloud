@@ -20,12 +20,12 @@ from trade_executor import log_open_trade, log_tsl_update, update_closed_trade
 PAIR_TO_SCAN        = "SOL/USDT:USDT"
 TIMEFRAME           = "1m"
 EMA_PERIOD          = 200
-TRAILING_STOP_STEP  = 0.003       # 0.3 %
+TRAILING_STOP_STEP  = 0.002       # 0.2 %
 API_BUFFER          = 2
 PRICE_SOURCE        = "mark"
 HIST_MULTIPLIER     = 5
 
-FIXED_SL_DEP_PCT    = 0.15          # ← жёсткий стоп: 15 % депозита
+FIXED_SL_DEP_PCT    = 0.10          # ← жёсткий стоп: 10 % депозита
 
 log = logging.getLogger("ema_cross_bot")
 
