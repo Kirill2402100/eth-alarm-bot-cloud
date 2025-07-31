@@ -26,7 +26,7 @@ PRICE_SOURCE        = "mark"
 HIST_MULTIPLIER     = 5
 TICK_INTERVAL       = 3           # сек; как часто опрашиваем цену при открытой сделке
 
-FIXED_SL_DEP_PCT    = 0.15          # ← жёсткий стоп: 15 % депозита
+FIXED_SL_DEP_PCT    = 0.1          # ← жёсткий стоп: 15 % депозита
 
 log = logging.getLogger("ema_cross_bot")
 
