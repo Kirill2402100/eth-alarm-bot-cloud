@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-01 — Triple-Trigger Strategy (v1.1 - fix)
+Version: 2025-08-01 — Triple-Trigger Strategy (v1.2 - optimized)
 """
 
 import asyncio
@@ -15,26 +15,19 @@ import pandas_ta as ta
 import ccxt.async_support as ccxt
 from telegram.ext import Application
 
-# Предполагается, что эти функции из trade_executor.py адаптированы
-# для работы с новой структурой данных сделки.
 from trade_executor import log_open_trade, update_closed_trade
 
 log = logging.getLogger("swing_bot_engine")
 
 # ===========================================================================
-# CONFIGURATION (вместо config.py)
+# CONFIGURATION
 # ===========================================================================
 class CONFIG:
-    # --- Strategy Parameters ---
     TIMEFRAME = "1h"
     POSITION_SIZE_USDT = 10.0
     LEVERAGE = 20
     MAX_CONCURRENT_POSITIONS = 10
-
-    # --- Market Filter ---
     MIN_DAILY_VOLATILITY_PCT = 3.0
-
-    # --- Entry Triggers ---
     EMA_FAST_PERIOD = 9
     EMA_SLOW_PERIOD = 21
     EMA_TREND_PERIOD = 200
@@ -43,17 +36,13 @@ class CONFIG:
     STOCH_RSI_D = 3
     STOCH_RSI_OVERBOUGHT = 0.80
     STOCH_RSI_OVERSOLD = 0.20
-
-    # --- Risk Management ---
     STOP_LOSS_PCT = 1.0
     TAKE_PROFIT_PCT = 3.0
-
-    # --- Timing ---
-    SCANNER_INTERVAL_SECONDS = 3600  # 1 час
-    TICK_MONITOR_INTERVAL_SECONDS = 5 # 5 секунд
+    SCANNER_INTERVAL_SECONDS = 3600
+    TICK_MONITOR_INTERVAL_SECONDS = 5
 
 # ===========================================================================
-# RISK MANAGEMENT (вместо risk.py)
+# RISK MANAGEMENT
 # ===========================================================================
 def calculate_sl_tp(entry_price: float, side: str) -> tuple[float, float]:
     """Рассчитывает уровни Stop Loss и Take Profit."""
@@ -69,24 +58,20 @@ def calculate_sl_tp(entry_price: float, side: str) -> tuple[float, float]:
 # MARKET SCANNER
 # ===========================================================================
 async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
-    """Отфильтровывает пары с достаточной суточной волатильностью."""
-    log.info("Filtering pairs by daily volatility...")
+    """Отфильтровывает пары, используя ОДИН эффективный вызов fetch_tickers."""
+    log.info("Filtering pairs by daily volatility using fetch_tickers()...")
     try:
-        markets = await exchange.load_markets()
-        symbols = [s['symbol'] for s in markets.values() if s.get('type') == 'swap' and s.get('quote') == 'USDT']
+        await exchange.load_markets()
+        tickers = await exchange.fetch_tickers()
         
-        tasks = [exchange.fetch_ohlcv(s, '1d', limit=2) for s in symbols]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
         volatile_pairs = []
-        for i, res in enumerate(results):
-            if isinstance(res, list) and len(res) == 2:
-                prev_close, last_close = res[0][4], res[1][4]
-                if prev_close > 0:
-                    volatility = abs(last_close - prev_close) / prev_close * 100
-                    if volatility >= CONFIG.MIN_DAILY_VOLATILITY_PCT:
-                        volatile_pairs.append(symbols[i])
-        
+        for symbol, data in tickers.items():
+            market = exchange.market(symbol)
+            if market.get('type') == 'swap' and market.get('quote') == 'USDT' and data.get('percentage') is not None:
+                volatility = abs(data['percentage'])
+                if volatility >= CONFIG.MIN_DAILY_VOLATILITY_PCT:
+                    volatile_pairs.append(symbol)
+
         log.info(f"Found {len(volatile_pairs)} volatile pairs.")
         return volatile_pairs
     except Exception as e:
@@ -127,8 +112,7 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     for symbol in volatile_pairs:
         try:
             if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
-                break # Прерываем цикл, если достигли лимита во время сканирования
-
+                break
             ohlcv = await exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=220)
             if not ohlcv or len(ohlcv) < CONFIG.EMA_TREND_PERIOD: continue
 
@@ -142,7 +126,6 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             side = check_entry_conditions(df)
             if side:
                 await open_new_trade(symbol, side, df.iloc[-1]['close'], app)
-
         except Exception as e:
             log.error(f"Error processing symbol {symbol}: {e}")
 
@@ -168,7 +151,6 @@ async def open_new_trade(symbol: str, side: str, entry_price: float, app: Applic
     bot_data.setdefault("active_trades", []).append(trade)
     log.info(f"New trade signal: {trade}")
     
-    # Уведомления и логирование
     broadcast = app.bot_data.get('broadcast_func')
     if broadcast:
         msg = (f"🔥 <b>НОВЫЙ СИГНАЛ ({side})</b>\n\n"
@@ -178,23 +160,6 @@ async def open_new_trade(symbol: str, side: str, entry_price: float, app: Applic
                f"<b>TP:</b> <code>{tp_price:.4f}</code> (3%)")
         await broadcast(app, msg)
     await log_open_trade(trade)
-
-async def check_early_exit(trade: Dict, df_1h: pd.DataFrame) -> Optional[str]:
-    """Проверяет условия досрочного выхода."""
-    last = df_1h.iloc[-1]
-    
-    # 1. Реверс по EMA 200
-    if (trade['Side'] == 'LONG' and last['close'] < last[f'EMA_{CONFIG.EMA_TREND_PERIOD}']) or \
-       (trade['Side'] == 'SHORT' and last['close'] > last[f'EMA_{CONFIG.EMA_TREND_PERIOD}']):
-        return "EMA_200_REVERSE"
-        
-    # 2. Выход из зоны StochRSI
-    stoch_k = last[f'STOCHRSIk_{CONFIG.STOCH_RSI_PERIOD}_{CONFIG.STOCH_RSI_K}_{CONFIG.STOCH_RSI_D}']
-    if (trade['Side'] == 'LONG' and stoch_k > CONFIG.STOCH_RSI_OVERSOLD + 0.05) or \
-       (trade['Side'] == 'SHORT' and stoch_k < CONFIG.STOCH_RSI_OVERBOUGHT - 0.05):
-        return "STOCH_EXIT"
-        
-    return None
 
 async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
     """Тиковый мониторинг активных позиций."""
@@ -214,7 +179,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
         last_price = tickers[trade['Pair']]['last']
         exit_reason = None
 
-        # Проверка SL/TP
         if trade['Side'] == 'LONG':
             if last_price <= trade['SL_Price']: exit_reason = "STOP_LOSS"
             elif last_price >= trade['TP_Price']: exit_reason = "TAKE_PROFIT"
@@ -225,7 +189,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
         if exit_reason:
             trades_to_close.append((trade, exit_reason, last_price))
 
-    # Закрытие сделок
     if trades_to_close:
         broadcast = app.bot_data.get('broadcast_func')
         for trade, reason, exit_price in trades_to_close:
@@ -251,7 +214,7 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
 async def scanner_main_loop(app: Application, broadcast):
     log.info("Swing Strategy Engine loop starting…")
     app.bot_data.setdefault("active_trades", [])
-    app.bot_data['broadcast_func'] = broadcast # Сохраняем функцию для доступа из других модулей
+    app.bot_data['broadcast_func'] = broadcast
 
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     
@@ -260,16 +223,13 @@ async def scanner_main_loop(app: Application, broadcast):
         try:
             current_time = time.time()
             
-            # --- Ежечасный сканер сигналов ---
             if current_time - last_scan_time >= CONFIG.SCANNER_INTERVAL_SECONDS:
                 log.info("--- Running Hourly Market Scan ---")
                 await find_trade_signals(exchange, app)
                 last_scan_time = current_time
                 log.info("--- Hourly Scan Finished ---")
 
-            # --- Быстрый мониторинг позиций ---
             await monitor_active_trades(exchange, app)
-            
             await asyncio.sleep(CONFIG.TICK_MONITOR_INTERVAL_SECONDS)
 
         except asyncio.CancelledError:
@@ -277,7 +237,7 @@ async def scanner_main_loop(app: Application, broadcast):
             break
         except Exception as e:
             log.error(f"Error in main loop: {e}", exc_info=True)
-            await asyncio.sleep(30) # Пауза в случае серьезной ошибки
+            await asyncio.sleep(30)
 
     await exchange.close()
     log.info("Swing Strategy Engine loop stopped.")
