@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-01 — Triple-Trigger Strategy (v1.5 - robust)
+Version: 2025-08-01 — Triple-Trigger Strategy (v1.6 - state check)
 """
 
 import asyncio
@@ -82,26 +82,32 @@ async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
         return []
 
 def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
-    """Проверяет условия 'тройного триггера' на последних двух свечах."""
-    if len(df) < 2: return None
+    """Проверяет условия 'тройного триггера' (проверка состояния)."""
+    if df.empty: return None
 
     ema_fast = f"EMA_{CONFIG.EMA_FAST_PERIOD}"
     ema_slow = f"EMA_{CONFIG.EMA_SLOW_PERIOD}"
     ema_trend = f"EMA_{CONFIG.EMA_TREND_PERIOD}"
     stoch_k = f"STOCHRSIk_{CONFIG.STOCH_RSI_PERIOD}_{CONFIG.STOCH_RSI_K}_{CONFIG.STOCH_RSI_D}"
 
-    # ИСПРАВЛЕНИЕ: Проверяем, что колонка StochRSI вообще существует.
     if stoch_k not in df.columns:
         return None
     
-    last, prev = df.iloc[-1], df.iloc[-2]
+    last = df.iloc[-1]
 
-    is_long_cross = prev[ema_fast] <= prev[ema_slow] and last[ema_fast] > last[ema_slow]
-    is_short_cross = prev[ema_fast] >= prev[ema_slow] and last[ema_fast] < last[ema_slow]
+    # НОВАЯ ЛОГИКА: Проверяем состояние EMA, а не пересечение
+    is_bullish_state = last[ema_fast] > last[ema_slow]
+    is_bearish_state = last[ema_fast] < last[ema_slow]
 
-    if is_long_cross and last['close'] > last[ema_trend] and last[stoch_k] < CONFIG.STOCH_RSI_OVERSOLD:
+    # Остальные условия
+    is_uptrend = last['close'] > last[ema_trend]
+    is_downtrend = last['close'] < last[ema_trend]
+    is_oversold = last[stoch_k] < CONFIG.STOCH_RSI_OVERSOLD
+    is_overbought = last[stoch_k] > CONFIG.STOCH_RSI_OVERBOUGHT
+
+    if is_bullish_state and is_uptrend and is_oversold:
         return "LONG"
-    if is_short_cross and last['close'] < last[ema_trend] and last[stoch_k] > CONFIG.STOCH_RSI_OVERBOUGHT:
+    if is_bearish_state and is_downtrend and is_overbought:
         return "SHORT"
         
     return None
@@ -233,11 +239,10 @@ async def scanner_main_loop(app: Application, broadcast):
     app.bot_data.setdefault("active_trades", [])
     app.bot_data['broadcast_func'] = broadcast
 
-    # ИСПРАВЛЕНИЕ: Добавлен rateLimit для более аккуратной работы с API
     exchange = ccxt.mexc({
         'options': {'defaultType': 'swap'},
         'enableRateLimit': True,
-        'rateLimit': 200,  # 200ms = 5 запросов/сек
+        'rateLimit': 200,
     })
     
     last_scan_time = 0
