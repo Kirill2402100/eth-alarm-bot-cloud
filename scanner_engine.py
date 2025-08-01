@@ -1,278 +1,283 @@
 # -*- coding: utf-8 -*-
 """
-EMA-Cross strategy bot (MEXC perpetuals, 1-min)
-Version: 2025-07-31  — tick-monitoring edition
+Swing-Trading Bot (MEXC Perpetuals, 1-hour)
+Version: 2025-08-01 — Triple-Trigger Strategy
 """
 
-import asyncio, time, logging
-from datetime import datetime, timezone, timedelta
-from typing import List, Optional
+import asyncio
+import time
+import logging
+from datetime import datetime, timezone
+from typing import List, Dict, Optional
 
-import pandas as pd, pandas_ta as ta
+import pandas as pd
+import pandas_ta as ta
 import ccxt.async_support as ccxt
 from telegram.ext import Application
 
-from trade_executor import log_open_trade, log_tsl_update, update_closed_trade
+# Предполагается, что эти функции из trade_executor.py адаптированы
+# для работы с новой структурой данных сделки.
+from trade_executor import log_open_trade, update_closed_trade
 
-# ---------------------------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------------------------
-PAIR_TO_SCAN        = "SOL/USDT:USDT"
-TIMEFRAME           = "1m"
-EMA_PERIOD          = 200
-TRAILING_STOP_STEP  = 0.002       # 0.2 %
-API_BUFFER          = 2
-PRICE_SOURCE        = "mark"
-HIST_MULTIPLIER     = 5
-TICK_INTERVAL       = 3           # сек; как часто опрашиваем цену при открытой сделке
+log = logging.getLogger("swing_bot_engine")
 
-FIXED_SL_DEP_PCT    = 0.1          # ← жёсткий стоп: 15 % депозита
+# ===========================================================================
+# CONFIGURATION (вместо config.py)
+# ===========================================================================
+class CONFIG:
+    # --- Strategy Parameters ---
+    TIMEFRAME = "1h"
+    POSITION_SIZE_USDT = 10.0
+    LEVERAGE = 20
+    MAX_CONCURRENT_POSITIONS = 10
 
-log = logging.getLogger("ema_cross_bot")
+    # --- Market Filter ---
+    MIN_DAILY_VOLATILITY_PCT = 3.0
 
-# ---------------------------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------------------------
-def calculate_features(ohlcv: List[list], drop_last: bool = True) -> Optional[pd.DataFrame]:
-    """Return DataFrame with EMA; optionally cut unfinished bar."""
-    if len(ohlcv) < EMA_PERIOD:
-        return None
-    if drop_last:
-        ohlcv = ohlcv[:-1]
-    df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
-    df[f"EMA_{EMA_PERIOD}"] = df.ta.ema(length=EMA_PERIOD)
-    return df
+    # --- Entry Triggers ---
+    EMA_FAST_PERIOD = 9
+    EMA_SLOW_PERIOD = 21
+    EMA_TREND_PERIOD = 200
+    STOCH_RSI_PERIOD = 14
+    STOCH_RSI_K = 3
+    STOCH_RSI_D = 3
+    STOCH_RSI_OVERBOUGHT = 0.80
+    STOCH_RSI_OVERSOLD = 0.20
 
-def calc_fixed_sl(entry: float, side: str, deposit: float, leverage: int) -> float:
-    """Цена, при которой убыток составит FIXED_SL_DEP_PCT депозита."""
-    loss_usd = deposit * FIXED_SL_DEP_PCT
-    pos_size = deposit * leverage        # сумма позиции
-    loss_pct = loss_usd / pos_size       # доля цены
-    return entry * (1 - loss_pct) if side == "LONG" else entry * (1 + loss_pct)
+    # --- Risk Management ---
+    STOP_LOSS_PCT = 1.0
+    TAKE_PROFIT_PCT = 3.0
 
-# ---------------------------------------------------------------------------
-# ACTIVE TRADE MONITOR
-# ---------------------------------------------------------------------------
-async def monitor_active_trades(exchange, app: Application, broadcast):
-    bot_data = app.bot_data
-    signal   = bot_data["monitored_signals"][0]
+    # --- Timing ---
+    SCANNER_INTERVAL_SECONDS = 3600  # 1 час
+    TICK_MONITOR_INTERVAL_SECONDS = 5 # 5 секунд
+
+# ===========================================================================
+# RISK MANAGEMENT (вместо risk.py)
+# ===========================================================================
+def calculate_sl_tp(entry_price: float, side: str) -> tuple[float, float]:
+    """Рассчитывает уровни Stop Loss и Take Profit."""
+    if side == "LONG":
+        sl_price = entry_price * (1 - CONFIG.STOP_LOSS_PCT / 100)
+        tp_price = entry_price * (1 + CONFIG.TAKE_PROFIT_PCT / 100)
+    else:  # SHORT
+        sl_price = entry_price * (1 + CONFIG.STOP_LOSS_PCT / 100)
+        tp_price = entry_price * (1 - CONFIG.TAKE_PROFIT_PCT / 100)
+    return sl_price, tp_price
+
+# ===========================================================================
+# MARKET SCANNER
+# ===========================================================================
+async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
+    """Отфильтровывает пары с достаточной суточной волатильностью."""
+    log.info("Filtering pairs by daily volatility...")
     try:
-        # При тиковом мониторинге используем fetch_ticker вместо fetch_ohlcv для скорости
-        ticker = await exchange.fetch_ticker(PAIR_TO_SCAN, params={"price": PRICE_SOURCE})
-        last_price = ticker["last"]
+        markets = await exchange.load_markets()
+        symbols = [s['symbol'] for s in markets.values() if s.get('type') == 'swap' and s.get('quote') == 'USDT']
         
-        # Для EMA и данных свечи продолжаем использовать OHLCV, но реже
-        # В реальной реализации можно было бы обновлять OHLCV в отдельном таске
-        ohlcv = await exchange.fetch_ohlcv(
-            PAIR_TO_SCAN, timeframe=TIMEFRAME, limit=EMA_PERIOD,
-            params={"type": "swap", "price": PRICE_SOURCE}
-        )
-        df = calculate_features(ohlcv, drop_last=False)
-        if df is None or df.empty: return
+        tasks = [exchange.fetch_ohlcv(s, '1d', limit=2) for s in symbols]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        row         = df.iloc[-1]
-        last_ema    = row[f"EMA_{EMA_PERIOD}"]
-        last_open   = row["open"]
-        exit_status = None
-
-        # 1) FIXED-SL — 15 % депозита
-        if (signal["side"] == "LONG"  and last_price <= signal["SL_Price"]) or \
-           (signal["side"] == "SHORT" and last_price >= signal["SL_Price"]):
-            exit_status = "FIXED_SL"
-
-        # 2) EMA-touch
-        if exit_status is None and (
-            (signal["side"] == "LONG"  and row["low"]  <= last_ema) or
-            (signal["side"] == "SHORT" and row["high"] >= last_ema)
-        ):
-            exit_status = "EMA_TOUCH"
-
-        # 3) trailing-stop — как раньше
-        tsl = signal["trailing_stop"]
-        if not tsl["activated"]:
-            activation = signal["Entry_Price"] * (1 + TRAILING_STOP_STEP) if signal["side"] == "LONG" \
-                         else signal["Entry_Price"] * (1 - TRAILING_STOP_STEP)
-            if (signal["side"] == "LONG"  and last_price >= activation) or \
-               (signal["side"] == "SHORT" and last_price <= activation):
-                # Для TSL используем цену открытия последней закрытой свечи, чтобы избежать "распилов"
-                tsl_price = df.iloc[-2]['open'] 
-                tsl.update({"activated":True,"stop_price":tsl_price,"last_trail_price":activation})
-                signal["SL_Price"] = tsl["stop_price"]
-                await broadcast(app,f"🛡️ <b>СТОП-ЛОСС АКТИВИРОВАН</b>\n\nУровень: <code>{tsl['stop_price']:.4f}</code>")
-                await log_tsl_update(signal["Signal_ID"], tsl["stop_price"])
-        else:
-            next_trail = tsl["last_trail_price"] * (1 + TRAILING_STOP_STEP) if signal["side"] == "LONG" \
-                         else tsl["last_trail_price"] * (1 - TRAILING_STOP_STEP)
-            if (signal["side"] == "LONG"  and last_price >= next_trail) or \
-               (signal["side"] == "SHORT" and last_price <= next_trail):
-                tsl_price = df.iloc[-2]['open']
-                tsl["stop_price"]       = tsl_price
-                tsl["last_trail_price"] = next_trail
-                signal["SL_Price"]      = tsl["stop_price"]
-                await broadcast(app,f"⚙️ <b>СТОП-ЛОСС ПЕРЕДВИНУТ</b>\n\nНовый уровень: <code>{tsl['stop_price']:.4f}</code>")
-                await log_tsl_update(signal["Signal_ID"], tsl["stop_price"])
-
-        if tsl["activated"] and exit_status is None and (
-            (signal["side"] == "LONG"  and last_price <= tsl["stop_price"]) or
-            (signal["side"] == "SHORT" and last_price >= tsl["stop_price"])
-        ):
-            exit_status = "TSL_HIT"
-
-        # --- finalize trade
-        if exit_status:
-            pnl_pct = ((last_price - signal["Entry_Price"]) / signal["Entry_Price"]) * (1 if signal["side"]=="LONG" else -1)
-            deposit  = bot_data.get("deposit", 50.0)
-            leverage = bot_data.get("leverage", 100)
-            pnl_usd  = deposit * leverage * pnl_pct
-            pnl_pct_display = pnl_pct * 100 * leverage
-            emoji = "✅" if pnl_usd > 0 else "❌"
-            await broadcast(app,
-                f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({exit_status})</b>\n\n"
-                f"<b>Результат: ${pnl_usd:+.2f} ({pnl_pct_display:+.2f}%)</b>"
-            )
-            await update_closed_trade(signal["Signal_ID"],"CLOSED",last_price,pnl_usd,pnl_pct_display,exit_status)
-            bot_data["monitored_signals"].clear()
-
+        volatile_pairs = []
+        for i, res in enumerate(results):
+            if isinstance(res, list) and len(res) == 2:
+                prev_close, last_close = res[0][4], res[1][4]
+                if prev_close > 0:
+                    volatility = abs(last_close - prev_close) / prev_close * 100
+                    if volatility >= CONFIG.MIN_DAILY_VOLATILITY_PCT:
+                        volatile_pairs.append(symbols[i])
+        
+        log.info(f"Found {len(volatile_pairs)} volatile pairs.")
+        return volatile_pairs
     except Exception as e:
-        log.error(f"Monitor error: {e}", exc_info=True)
+        log.error(f"Error filtering volatile pairs: {e}", exc_info=True)
+        return []
 
-# ---------------------------------------------------------------------------
-# SCAN FOR NEW SIGNALS
-# ---------------------------------------------------------------------------
-async def scan_for_signals(exchange, app: Application, broadcast):
-    bot_data = app.bot_data
-    try:
-        ohlcv = await exchange.fetch_ohlcv(
-            PAIR_TO_SCAN,
-            timeframe=TIMEFRAME,
-            limit=EMA_PERIOD * HIST_MULTIPLIER + 6,
-            params={"type": "swap", "price": PRICE_SOURCE},
-        )
-        df = calculate_features(ohlcv, drop_last=True)
-        if df is None or len(df) < 3:
-            return
+def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
+    """Проверяет условия 'тройного триггера' на последних двух свечах."""
+    if len(df) < 2: return None
+    
+    last, prev = df.iloc[-1], df.iloc[-2]
+    
+    ema_fast = f"EMA_{CONFIG.EMA_FAST_PERIOD}"
+    ema_slow = f"EMA_{CONFIG.EMA_SLOW_PERIOD}"
+    ema_trend = f"EMA_{CONFIG.EMA_TREND_PERIOD}"
+    stoch_k = f"STOCHRSIk_{CONFIG.STOCH_RSI_PERIOD}_{CONFIG.STOCH_RSI_K}_{CONFIG.STOCH_RSI_D}"
 
-        last, prev = df.iloc[-1], df.iloc[-2]
-        cur_ema, prev_ema = last[f"EMA_{EMA_PERIOD}"], prev[f"EMA_{EMA_PERIOD}"]
+    is_long_cross = prev[ema_fast] <= prev[ema_slow] and last[ema_fast] > last[ema_slow]
+    is_short_cross = prev[ema_fast] >= prev[ema_slow] and last[ema_fast] < last[ema_slow]
 
-        state         = bot_data.get("trade_state", "SEARCHING_CROSS")
+    if is_long_cross and last['close'] > last[ema_trend] and last[stoch_k] < CONFIG.STOCH_RSI_OVERSOLD:
+        return "LONG"
+    if is_short_cross and last['close'] < last[ema_trend] and last[stoch_k] > CONFIG.STOCH_RSI_OVERBOUGHT:
+        return "SHORT"
         
-        if state == "SEARCHING_CROSS":
-            cross_up   = prev["low"]  < prev_ema and last["high"] > cur_ema
-            cross_down = prev["high"] > prev_ema and last["low"]  < cur_ema
-            if cross_up or cross_down:
-                bot_data.update({
-                    "trade_state":         "WAITING_CONFIRMATION",
-                    "cross_direction":      "UP" if cross_up else "DOWN",
-                })
-                side_hint = "LONG" if cross_up else "SHORT"
-                await broadcast(app,
-                    f"🔔 EMA {EMA_PERIOD} CROSS DETECTED → предположительный {side_hint} (ждём подтверждение)"
-                )
-                log.info(f"EMA cross detected ({bot_data['cross_direction']}). Waiting confirmation …")
+    return None
 
-        elif state == "WAITING_CONFIRMATION":
-            body_min = min(last["open"], last["close"])
-            body_max = max(last["open"], last["close"])
-            if body_min <= cur_ema <= body_max:
-                log.info("Second candle touches EMA — still waiting …")
-                return
+async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
+    """Основная функция сканера: находит и обрабатывает новые сигналы."""
+    bot_data = app.bot_data
+    if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
+        log.info("Position limit reached. Skipping scan.")
+        return
 
-            side = None
-            if bot_data["cross_direction"] == "UP" and last["close"] > cur_ema:
-                side = "LONG"
-            elif bot_data["cross_direction"] == "DOWN" and last["close"] < cur_ema:
-                side = "SHORT"
+    volatile_pairs = await filter_volatile_pairs(exchange)
+    if not volatile_pairs: return
 
+    for symbol in volatile_pairs:
+        try:
+            if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
+                break # Прерываем цикл, если достигли лимита во время сканирования
+
+            ohlcv = await exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=220)
+            if not ohlcv or len(ohlcv) < CONFIG.EMA_TREND_PERIOD: continue
+
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df.ta.ema(length=CONFIG.EMA_FAST_PERIOD, append=True)
+            df.ta.ema(length=CONFIG.EMA_SLOW_PERIOD, append=True)
+            df.ta.ema(length=CONFIG.EMA_TREND_PERIOD, append=True)
+            df.ta.stochrsi(length=CONFIG.STOCH_RSI_PERIOD, k=CONFIG.STOCH_RSI_K, d=CONFIG.STOCH_RSI_D, append=True)
+            df.dropna(inplace=True)
+
+            side = check_entry_conditions(df)
             if side:
-                log.info(f"Confirmation received. Executing {side} trade.")
-                await execute_trade(app, broadcast, last, side)
-                bot_data["trade_state"] = "SEARCHING_CROSS"
-                return
-            
-            new_dir = "DOWN" if bot_data["cross_direction"] == "UP" else "UP"
-            bot_data.update({
-                "trade_state":        "WAITING_CONFIRMATION",
-                "cross_direction":     new_dir,
-            })
-            side_hint = "SHORT" if new_dir == "DOWN" else "LONG"
-            await broadcast(
-                app,
-                f"🔔 EMA {EMA_PERIOD} CROSS DETECTED → предположительный {side_hint} (ждём подтверждение)"
-            )
-            log.info(f"Reversal cross detected ({new_dir}). Waiting new confirmation …")
-            return
+                await open_new_trade(symbol, side, df.iloc[-1]['close'], app)
 
-    except Exception as e:
-        log.error(f"Scanner error: {e}", exc_info=True)
+        except Exception as e:
+            log.error(f"Error processing symbol {symbol}: {e}")
 
-# ---------------------------------------------------------------------------
-# EXECUTE TRADE
-# ---------------------------------------------------------------------------
-async def execute_trade(app: Application, broadcast, row: pd.Series, side: str):
-    entry_price = float(row["close"])
-    signal_id   = f"ema_cross_strat_{int(time.time()*1000)}"
-
-    deposit  = app.bot_data.get("deposit", 50)
-    leverage = app.bot_data.get("leverage", 100)
-
-    decision = {
-        "Signal_ID":       signal_id,
-        "Pair":            PAIR_TO_SCAN,
-        "side":            side,
-        "Entry_Price":     entry_price,
-        "Status":          "ACTIVE",
-        "Timestamp_UTC":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        "trailing_stop":   {"activated": False, "stop_price": 0.0, "last_trail_price": 0.0},
-        "SL_Price":        calc_fixed_sl(entry_price, side, deposit, leverage),
-        "TP_Price":        0.0,
+# ===========================================================================
+# TRADE MANAGER
+# ===========================================================================
+async def open_new_trade(symbol: str, side: str, entry_price: float, app: Application):
+    """Создает и логирует новую сделку."""
+    bot_data = app.bot_data
+    sl_price, tp_price = calculate_sl_tp(entry_price, side)
+    
+    trade = {
+        "Signal_ID": f"{symbol}_{int(time.time())}",
+        "Pair": symbol,
+        "Side": side,
+        "Entry_Price": entry_price,
+        "SL_Price": sl_price,
+        "TP_Price": tp_price,
+        "Status": "ACTIVE",
+        "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
     }
+    
+    bot_data.setdefault("active_trades", []).append(trade)
+    log.info(f"New trade signal: {trade}")
+    
+    # Уведомления и логирование
+    broadcast = app.job_queue.context.get('broadcast_func')
+    if broadcast:
+        msg = (f"🔥 <b>НОВЫЙ СИГНАЛ ({side})</b>\n\n"
+               f"<b>Пара:</b> {symbol}\n"
+               f"<b>Вход:</b> <code>{entry_price:.4f}</code>\n"
+               f"<b>SL:</b> <code>{sl_price:.4f}</code> (1%)\n"
+               f"<b>TP:</b> <code>{tp_price:.4f}</code> (3%)")
+        await broadcast(app, msg)
+    await log_open_trade(trade)
 
-    app.bot_data.setdefault("monitored_signals", []).append(decision)
-    await log_open_trade(decision)
+async def check_early_exit(trade: Dict, df_1h: pd.DataFrame) -> Optional[str]:
+    """Проверяет условия досрочного выхода."""
+    last = df_1h.iloc[-1]
+    
+    # 1. Реверс по EMA 200
+    if (trade['Side'] == 'LONG' and last['close'] < last[f'EMA_{CONFIG.EMA_TREND_PERIOD}']) or \
+       (trade['Side'] == 'SHORT' and last['close'] > last[f'EMA_{CONFIG.EMA_TREND_PERIOD}']):
+        return "EMA_200_REVERSE"
+        
+    # 2. Выход из зоны StochRSI
+    stoch_k = last[f'STOCHRSIk_{CONFIG.STOCH_RSI_PERIOD}_{CONFIG.STOCH_RSI_K}_{CONFIG.STOCH_RSI_D}']
+    if (trade['Side'] == 'LONG' and stoch_k > CONFIG.STOCH_RSI_OVERSOLD + 0.05) or \
+       (trade['Side'] == 'SHORT' and stoch_k < CONFIG.STOCH_RSI_OVERBOUGHT - 0.05):
+        return "STOCH_EXIT"
+        
+    return None
 
-    await broadcast(
-        app,
-        (
-            f"🔥 <b>НОВЫЙ СИГНАЛ ({side})</b>\n\n"
-            f"<b>Пара:</b> {PAIR_TO_SCAN}\n"
-            f"<b>Вход:</b> <code>{entry_price:.4f}</code>\n"
-            f"<b>Стоп:</b> <code>{decision['SL_Price']:.4f}</code> (15 % депозита)\n"
-            f"<b>Выход:</b> Касание EMA {EMA_PERIOD} или трейлинг-стоп."
-        ),
-    )
+async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
+    """Тиковый мониторинг активных позиций."""
+    bot_data = app.bot_data
+    active_trades = bot_data.get("active_trades", [])
+    if not active_trades: return
 
-# ---------------------------------------------------------------------------
+    symbols = [t['Pair'] for t in active_trades]
+    try:
+        tickers = await exchange.fetch_tickers(symbols)
+    except Exception as e:
+        log.error(f"Failed to fetch tickers for monitoring: {e}")
+        return
+
+    trades_to_close = []
+    for trade in active_trades:
+        last_price = tickers[trade['Pair']]['last']
+        exit_reason = None
+
+        # Проверка SL/TP
+        if trade['Side'] == 'LONG':
+            if last_price <= trade['SL_Price']: exit_reason = "STOP_LOSS"
+            elif last_price >= trade['TP_Price']: exit_reason = "TAKE_PROFIT"
+        else: # SHORT
+            if last_price >= trade['SL_Price']: exit_reason = "STOP_LOSS"
+            elif last_price <= trade['TP_Price']: exit_reason = "TAKE_PROFIT"
+        
+        if exit_reason:
+            trades_to_close.append((trade, exit_reason, last_price))
+
+    # Закрытие сделок
+    if trades_to_close:
+        broadcast = app.job_queue.context.get('broadcast_func')
+        for trade, reason, exit_price in trades_to_close:
+            pnl_pct = ((exit_price - trade['Entry_Price']) / trade['Entry_Price']) * (1 if trade['Side'] == "LONG" else -1)
+            pnl_usd = CONFIG.POSITION_SIZE_USDT * CONFIG.LEVERAGE * pnl_pct
+            pnl_display = pnl_pct * 100 * CONFIG.LEVERAGE
+            
+            if broadcast:
+                emoji = "✅" if pnl_usd > 0 else "❌"
+                msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({reason})</b>\n\n"
+                       f"<b>Пара:</b> {trade['Pair']}\n"
+                       f"<b>Результат: ${pnl_usd:+.2f} ({pnl_display:+.2f}%)</b>")
+                await broadcast(app, msg)
+            
+            await update_closed_trade(trade['Signal_ID'], "CLOSED", exit_price, pnl_usd, pnl_display, reason)
+            
+        closed_ids = {t['Signal_ID'] for t, _, _ in trades_to_close}
+        bot_data["active_trades"] = [t for t in active_trades if t['Signal_ID'] not in closed_ids]
+
+# ===========================================================================
 # MAIN LOOP
-# ---------------------------------------------------------------------------
+# ===========================================================================
 async def scanner_main_loop(app: Application, broadcast):
-    log.info("EMA Cross Strategy Engine loop starting …")
-    app.bot_data["trade_state"] = "SEARCHING_CROSS"
+    log.info("Swing Strategy Engine loop starting…")
+    app.bot_data.setdefault("active_trades", [])
+    app.job_queue.context['broadcast_func'] = broadcast # Сохраняем функцию для доступа из других модулей
 
-    exchange = ccxt.mexc({
-        "options": {"defaultType": "swap"}, 
-        "enableRateLimit": True,
-        "rateLimit": 100,  # 100 ms = 10 req/sec
-    })
-    await exchange.load_markets()
-
+    exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
+    
+    last_scan_time = 0
     while app.bot_data.get("bot_on", False):
         try:
-            if not app.bot_data.get("monitored_signals"):
-                await scan_for_signals(exchange, app, broadcast)
-            else:
-                await monitor_active_trades(exchange, app, broadcast)
-        finally:
-            if app.bot_data.get("monitored_signals"):
-                # есть позиция → быстрый опрос
-                await asyncio.sleep(TICK_INTERVAL)
-            else:
-                # ждём закрытия следующей минуты + буфер
-                now       = datetime.now(timezone.utc)
-                next_min  = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
-                sleep_sec = (next_min - now).total_seconds() + API_BUFFER
-                if sleep_sec > 0:
-                    await asyncio.sleep(sleep_sec)
+            current_time = time.time()
+            
+            # --- Ежечасный сканер сигналов ---
+            if current_time - last_scan_time >= CONFIG.SCANNER_INTERVAL_SECONDS:
+                log.info("--- Running Hourly Market Scan ---")
+                await find_trade_signals(exchange, app)
+                last_scan_time = current_time
+                log.info("--- Hourly Scan Finished ---")
+
+            # --- Быстрый мониторинг позиций ---
+            await monitor_active_trades(exchange, app)
+            
+            await asyncio.sleep(CONFIG.TICK_MONITOR_INTERVAL_SECONDS)
+
+        except asyncio.CancelledError:
+            log.info("Main loop cancelled.")
+            break
+        except Exception as e:
+            log.error(f"Error in main loop: {e}", exc_info=True)
+            await asyncio.sleep(30) # Пауза в случае серьезной ошибки
 
     await exchange.close()
-    log.info("EMA Cross Strategy Engine loop stopped.")
+    log.info("Swing Strategy Engine loop stopped.")
