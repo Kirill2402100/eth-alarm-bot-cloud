@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-01 — Triple-Trigger Strategy
+Version: 2025-08-01 — Triple-Trigger Strategy (v1.1 - fix)
 """
 
 import asyncio
@@ -169,7 +169,7 @@ async def open_new_trade(symbol: str, side: str, entry_price: float, app: Applic
     log.info(f"New trade signal: {trade}")
     
     # Уведомления и логирование
-    broadcast = app.job_queue.context.get('broadcast_func')
+    broadcast = app.bot_data.get('broadcast_func')
     if broadcast:
         msg = (f"🔥 <b>НОВЫЙ СИГНАЛ ({side})</b>\n\n"
                f"<b>Пара:</b> {symbol}\n"
@@ -227,7 +227,7 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
 
     # Закрытие сделок
     if trades_to_close:
-        broadcast = app.job_queue.context.get('broadcast_func')
+        broadcast = app.bot_data.get('broadcast_func')
         for trade, reason, exit_price in trades_to_close:
             pnl_pct = ((exit_price - trade['Entry_Price']) / trade['Entry_Price']) * (1 if trade['Side'] == "LONG" else -1)
             pnl_usd = CONFIG.POSITION_SIZE_USDT * CONFIG.LEVERAGE * pnl_pct
@@ -251,7 +251,7 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
 async def scanner_main_loop(app: Application, broadcast):
     log.info("Swing Strategy Engine loop starting…")
     app.bot_data.setdefault("active_trades", [])
-    app.job_queue.context['broadcast_func'] = broadcast # Сохраняем функцию для доступа из других модулей
+    app.bot_data['broadcast_func'] = broadcast # Сохраняем функцию для доступа из других модулей
 
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True})
     
