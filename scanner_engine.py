@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-01 — Triple-Trigger Strategy (v1.2 - optimized)
+Version: 2025-08-01 — Triple-Trigger Strategy (v1.3 - final fix)
 """
 
 import asyncio
@@ -66,7 +66,13 @@ async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
         
         volatile_pairs = []
         for symbol, data in tickers.items():
+            # ИСПРАВЛЕНИЕ: Проверяем, что биржа знает о таком фьючерсном рынке,
+            # прежде чем пытаться получить по нему детальную информацию.
+            if symbol not in exchange.markets:
+                continue
+
             market = exchange.market(symbol)
+            # Проверяем, что это USDT-фьючерс и есть данные о % изменении
             if market.get('type') == 'swap' and market.get('quote') == 'USDT' and data.get('percentage') is not None:
                 volatility = abs(data['percentage'])
                 if volatility >= CONFIG.MIN_DAILY_VOLATILITY_PCT:
