@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-01 — Triple-Trigger Strategy (v1.3 - final fix)
+Version: 2025-08-01 — Triple-Trigger Strategy (v1.4 - fully optimized)
 """
 
 import asyncio
@@ -66,13 +66,10 @@ async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
         
         volatile_pairs = []
         for symbol, data in tickers.items():
-            # ИСПРАВЛЕНИЕ: Проверяем, что биржа знает о таком фьючерсном рынке,
-            # прежде чем пытаться получить по нему детальную информацию.
             if symbol not in exchange.markets:
                 continue
 
             market = exchange.market(symbol)
-            # Проверяем, что это USDT-фьючерс и есть данные о % изменении
             if market.get('type') == 'swap' and market.get('quote') == 'USDT' and data.get('percentage') is not None:
                 volatility = abs(data['percentage'])
                 if volatility >= CONFIG.MIN_DAILY_VOLATILITY_PCT:
@@ -115,12 +112,26 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     volatile_pairs = await filter_volatile_pairs(exchange)
     if not volatile_pairs: return
 
-    for symbol in volatile_pairs:
+    # ОПТИМИЗАЦИЯ: Создаем список всех задач и выполняем их параллельно
+    tasks = [exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=220) for symbol in volatile_pairs]
+    log.info(f"Fetching OHLCV data for {len(volatile_pairs)} pairs concurrently...")
+    ohlcv_results = await asyncio.gather(*tasks, return_exceptions=True)
+    log.info("Finished fetching OHLCV data. Processing results...")
+
+    # Теперь обрабатываем полученные данные
+    for i, ohlcv in enumerate(ohlcv_results):
+        symbol = volatile_pairs[i]
         try:
+            # Пропускаем пары, для которых не удалось получить данные
+            if isinstance(ohlcv, Exception) or not ohlcv or len(ohlcv) < CONFIG.EMA_TREND_PERIOD:
+                if isinstance(ohlcv, Exception):
+                    log.warning(f"Could not fetch OHLCV for {symbol}: {ohlcv}")
+                continue
+            
+            # Проверяем лимит позиций еще раз перед обработкой
             if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
+                log.info("Position limit reached during signal processing. Halting.")
                 break
-            ohlcv = await exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=220)
-            if not ohlcv or len(ohlcv) < CONFIG.EMA_TREND_PERIOD: continue
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df.ta.ema(length=CONFIG.EMA_FAST_PERIOD, append=True)
