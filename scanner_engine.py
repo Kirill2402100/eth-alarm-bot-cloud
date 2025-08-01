@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-01 — Triple-Trigger Strategy (v1.6 - state check)
+Version: 2025-08-01 — Triple-Trigger Strategy (v1.7 - relaxed filters)
 """
 
 import asyncio
@@ -34,11 +34,13 @@ class CONFIG:
     STOCH_RSI_PERIOD = 14
     STOCH_RSI_K = 3
     STOCH_RSI_D = 3
-    STOCH_RSI_OVERBOUGHT = 0.80
-    STOCH_RSI_OVERSOLD = 0.20
+    # ИЗМЕНЕНО: Уровни StochRSI смягчены
+    STOCH_RSI_OVERBOUGHT = 0.70
+    STOCH_RSI_OVERSOLD = 0.30
     STOP_LOSS_PCT = 1.0
     TAKE_PROFIT_PCT = 3.0
-    SCANNER_INTERVAL_SECONDS = 3600
+    # ИЗМЕНЕНО: Интервал сканирования уменьшен до 10 минут
+    SCANNER_INTERVAL_SECONDS = 600
     TICK_MONITOR_INTERVAL_SECONDS = 5
 
 # ===========================================================================
@@ -95,11 +97,8 @@ def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
     
     last = df.iloc[-1]
 
-    # НОВАЯ ЛОГИКА: Проверяем состояние EMA, а не пересечение
     is_bullish_state = last[ema_fast] > last[ema_slow]
     is_bearish_state = last[ema_fast] < last[ema_slow]
-
-    # Остальные условия
     is_uptrend = last['close'] > last[ema_trend]
     is_downtrend = last['close'] < last[ema_trend]
     is_oversold = last[stoch_k] < CONFIG.STOCH_RSI_OVERSOLD
@@ -251,10 +250,10 @@ async def scanner_main_loop(app: Application, broadcast):
             current_time = time.time()
             
             if current_time - last_scan_time >= CONFIG.SCANNER_INTERVAL_SECONDS:
-                log.info("--- Running Hourly Market Scan ---")
+                log.info("--- Running Market Scan (every 10 mins) ---")
                 await find_trade_signals(exchange, app)
                 last_scan_time = current_time
-                log.info("--- Hourly Scan Finished ---")
+                log.info("--- Scan Finished ---")
 
             await monitor_active_trades(exchange, app)
             await asyncio.sleep(CONFIG.TICK_MONITOR_INTERVAL_SECONDS)
