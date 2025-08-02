@@ -1,8 +1,7 @@
-# scanner_engine.py
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Diagnostic Logging Edition
+Version: 2025-08-02 — Diagnostic Logging Edition (v1.8 - lenient logging)
 """
 
 import asyncio
@@ -98,11 +97,9 @@ def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
     
     last = df.iloc[-1]
     
-    # Определяем потенциальное направление
     side = "LONG" if last[ema_fast] > last[ema_slow] else "SHORT"
     
-    # Проверяем все условия
-    ema_ok = True  # Состояние EMA определяет направление
+    ema_ok = True
     trend_ok = (side == "LONG" and last['close'] > last[ema_trend]) or \
                (side == "SHORT" and last['close'] < last[ema_trend])
     stoch_ok = (side == "LONG" and last[stoch_k] < CONFIG.STOCH_RSI_OVERSOLD) or \
@@ -116,17 +113,20 @@ def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
         "Reason_For_Fail": ""
     }
 
-    # Если все условия выполнены - это сигнал
-    if all([ema_ok, trend_ok, stoch_ok]):
+    passed_count = sum([ema_ok, trend_ok, stoch_ok])
+
+    if passed_count == 3:
         return side, diagnosis
 
-    # Если нет - логируем для диагностики, если прошли 2 из 3
-    if sum([ema_ok, trend_ok, stoch_ok]) == 2:
-        if not trend_ok: diagnosis["Reason_For_Fail"] = "Trend Filter"
-        elif not stoch_ok: diagnosis["Reason_For_Fail"] = "StochRSI Filter"
-        return None, diagnosis # Возвращаем диагностику, но не сигнал
+    # ИЗМЕНЕНО: Логируем, если пройден хотя бы 1 фильтр
+    if passed_count >= 1:
+        failed_filters = []
+        if not trend_ok: failed_filters.append("Trend")
+        if not stoch_ok: failed_filters.append("StochRSI")
+        diagnosis["Reason_For_Fail"] = ", ".join(failed_filters) if failed_filters else "ALL_OK"
+        return None, diagnosis
 
-    return None, {} # Не прошло даже 2 фильтра
+    return None, {}
 
 async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     """Основная функция сканера: находит, диагностирует и обрабатывает сигналы."""
@@ -162,9 +162,9 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
 
             side, diagnosis = check_entry_conditions(df)
             
-            if side: # Если есть сигнал
+            if side:
                 await open_new_trade(symbol, side, df.iloc[-1]['close'], app)
-            elif diagnosis: # Если есть что записать в диагностику
+            elif diagnosis:
                 diagnosis.update({
                     "Pair": symbol,
                     "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
@@ -175,7 +175,7 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             log.error(f"Error processing symbol {symbol}: {e}")
 
 # ===========================================================================
-# TRADE MANAGER (без изменений)
+# TRADE MANAGER
 # ===========================================================================
 async def open_new_trade(symbol: str, side: str, entry_price: float, app: Application):
     bot_data = app.bot_data
@@ -252,7 +252,7 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
         bot_data["active_trades"] = [t for t in active_trades if t['Signal_ID'] not in closed_ids]
 
 # ===========================================================================
-# MAIN LOOP (без изменений)
+# MAIN LOOP
 # ===========================================================================
 async def scanner_main_loop(app: Application, broadcast):
     log.info("Swing Strategy Engine loop starting…")
