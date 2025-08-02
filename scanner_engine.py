@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Production Ready (v2.7 - history check fix)
+Version: 2025-08-02 — Production Ready (v2.8 - risk filters)
 """
 
 import asyncio
@@ -38,6 +38,10 @@ class CONFIG:
     STOCH_RSI_K = 3
     STOCH_RSI_D = 3
     STOCH_RSI_MID = 50
+    # ИСПРАВЛЕНО: Добавлены настройки для фильтра "шипов"
+    ATR_PERIOD = 14
+    ATR_SPIKE_MULT = 2.5
+    ATR_COOLDOWN_BARS = 2
     STOP_LOSS_PCT = 1.0
     TAKE_PROFIT_PCT = 3.0
     SCANNER_INTERVAL_SECONDS = 600
@@ -68,18 +72,14 @@ async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
         
         volatile_pairs = []
         for symbol, data in tickers.items():
-            if symbol not in exchange.markets:
-                continue
-
+            if symbol not in exchange.markets: continue
             market = exchange.market(symbol)
             if market.get('type') == 'swap' and market.get('quote') == 'USDT':
                 vol = data.get('percentage')
                 if vol is None and data.get('open') and data.get('last') and data['open'] > 0:
                     vol = abs(data['last'] - data['open']) / data['open'] * 100
-                
                 if vol is not None and CONFIG.MIN_DAILY_VOLATILITY_PCT <= vol <= CONFIG.MAX_DAILY_VOLATILITY_PCT:
                     volatile_pairs.append(symbol)
-
         log.info(f"Found {len(volatile_pairs)} volatile pairs.")
         return volatile_pairs
     except Exception as e:
@@ -87,7 +87,6 @@ async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
         return []
 
 def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
-    """Проверяет условия 'тройного триггера' и возвращает результат и диагностику."""
     if df.empty: return None, {}
 
     ema_fast = f"EMA_{CONFIG.EMA_FAST_PERIOD}"
@@ -95,42 +94,35 @@ def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
     ema_trend = f"EMA_{CONFIG.EMA_TREND_PERIOD}"
     
     stoch_k = next((c for c in df.columns if c.startswith("STOCHRSIk_")), None)
-    if not stoch_k:
-        return None, {"Reason_For_Fail": "No StochRSI column"}
+    if not stoch_k: return None, {"Reason_For_Fail": "No StochRSI column"}
     
     last = df.iloc[-1]
     
-    # --- EMA и Тренд с буфером ---
     long_ema_ok = last[ema_fast] > last[ema_slow]
     short_ema_ok = last[ema_fast] < last[ema_slow]
 
-    # ИСПРАВЛЕНО: Проверка на "зрелость" EMA-200 перед применением фильтра
     ema_trend_val = last[ema_trend]
     if pd.isna(ema_trend_val):
-        long_trend_ok = short_trend_ok = True  # EMA-200 еще не сформировалась, пропускаем фильтр
+        long_trend_ok = short_trend_ok = True
     else:
         buf = 1 + CONFIG.EMA_TREND_BUFFER_PCT / 100
         long_trend_ok = last['close'] > ema_trend_val * buf
         short_trend_ok = last['close'] < ema_trend_val / buf
 
-    # --- Новый фильтр StochRSI ---
     k_now = last[stoch_k]
     long_stoch_ok = k_now > CONFIG.STOCH_RSI_MID
     short_stoch_ok = k_now < CONFIG.STOCH_RSI_MID
 
-    # --- Оцениваем LONG-сценарий ---
     long_passed_count = sum([long_ema_ok, long_trend_ok, long_stoch_ok])
     if long_passed_count == 3:
         diagnosis = {"Side": "LONG", "EMA_State_OK": True, "Trend_OK": True, "Stoch_OK": True, "Reason_For_Fail": "ALL_OK"}
         return "LONG", diagnosis
 
-    # --- Оцениваем SHORT-сценарий ---
     short_passed_count = sum([short_ema_ok, short_trend_ok, short_stoch_ok])
     if short_passed_count == 3:
         diagnosis = {"Side": "SHORT", "EMA_State_OK": True, "Trend_OK": True, "Stoch_OK": True, "Reason_For_Fail": "ALL_OK"}
         return "SHORT", diagnosis
 
-    # --- Проверяем, нужно ли логировать для диагностики ---
     if long_passed_count >= 1 or short_passed_count >= 1:
         if long_passed_count >= short_passed_count:
             failed = [name for name, ok in [("Trend", long_trend_ok), ("Stoch>50", long_stoch_ok), ("EMA_State", long_ema_ok)] if not ok]
@@ -165,7 +157,12 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     for i, ohlcv in enumerate(ohlcv_results):
         symbol = volatile_pairs[i]
         try:
-            if isinstance(ohlcv, Exception) or not ohlcv or len(ohlcv) < 50: # Check for a minimal number of candles
+            # ИСПРАВЛЕНО: Фильтр "карантина" после убытка
+            cool = app.bot_data.get("loss_cooldown", {}).get(symbol)
+            if cool and time.time() - cool < CONFIG.SCANNER_INTERVAL_SECONDS * 2:
+                continue
+
+            if isinstance(ohlcv, Exception) or not ohlcv or len(ohlcv) < 50:
                 if isinstance(ohlcv, Exception):
                     log.warning(f"Could not fetch OHLCV for {symbol}: {ohlcv}")
                 continue
@@ -183,14 +180,20 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             df.ta.ema(length=CONFIG.EMA_SLOW_PERIOD, append=True)
             df.ta.ema(length=CONFIG.EMA_TREND_PERIOD, append=True)
             df.ta.stochrsi(length=CONFIG.STOCH_RSI_PERIOD, k=CONFIG.STOCH_RSI_K, d=CONFIG.STOCH_RSI_D, append=True)
+
+            # ИСПРАВЛЕНО: Расчёт и фильтрация по ATR/"шипам"
+            df.ta.atr(length=CONFIG.ATR_PERIOD, append=True)
+            df['range'] = df['high'] - df['low']
+            df['is_spike'] = df['range'] > df[f"ATR_{CONFIG.ATR_PERIOD}"] * CONFIG.ATR_SPIKE_MULT
             
-            # ВАЖНО: dropna() вызывается ПОСЛЕ проверки на зрелость EMA-200
-            side, diagnosis = check_entry_conditions(df.copy()) # Передаем копию, чтобы dropna() ниже не влиял
+            if df['is_spike'].iloc[-1]: continue
+            if df['is_spike'].iloc[-CONFIG.ATR_COOLDOWN_BARS:].any(): continue
+
+            side, diagnosis = check_entry_conditions(df.copy())
             
             if side:
                 if any(t["Pair"] == symbol for t in bot_data.get("active_trades", [])):
                     continue
-                # Для цены входа используем последнюю свечу из оригинального DF до dropna
                 await open_new_trade(symbol, side, df.iloc[-1]['close'], app)
             elif diagnosis:
                 diagnosis.update({ "Pair": symbol, "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')})
@@ -204,16 +207,13 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
 async def open_new_trade(symbol: str, side: str, entry_price: float, app: Application):
     bot_data = app.bot_data
     sl_price, tp_price = calculate_sl_tp(entry_price, side)
-    
     trade = {
         "Signal_ID": f"{symbol}_{int(time.time())}", "Pair": symbol, "Side": side,
         "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": tp_price,
         "Status": "ACTIVE", "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
     }
-    
     bot_data.setdefault("active_trades", []).append(trade)
     log.info(f"New trade signal: {trade}")
-    
     broadcast = app.bot_data.get('broadcast_func')
     if broadcast:
         msg = (f"🔥 <b>НОВЫЙ СИГНАЛ ({side})</b>\n\n"
@@ -257,6 +257,10 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
             pnl_usd = CONFIG.POSITION_SIZE_USDT * CONFIG.LEVERAGE * pnl_pct
             pnl_display = pnl_pct * 100 * CONFIG.LEVERAGE
             
+            # ИСПРАВЛЕНО: Записываем время убытка для "карантина"
+            if pnl_usd < 0:
+                app.bot_data.setdefault("loss_cooldown", {})[trade['Pair']] = time.time()
+            
             if broadcast:
                 emoji = "✅" if pnl_usd > 0 else "❌"
                 msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({reason})</b>\n\n"
@@ -274,11 +278,11 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
 async def scanner_main_loop(app: Application, broadcast):
     log.info("Swing Strategy Engine loop starting…")
     app.bot_data.setdefault("active_trades", [])
+    # ИСПРАВЛЕНО: Инициализация словаря для "карантина"
+    app.bot_data.setdefault("loss_cooldown", {})
     app.bot_data['broadcast_func'] = broadcast
 
-    exchange = ccxt.mexc({
-        'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 200,
-    })
+    exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 200})
     
     last_scan_time = 0
     while app.bot_data.get("bot_on", False):
