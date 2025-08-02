@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Production Ready (v2.2 - indicator name fix)
+Version: 2025-08-02 — Production Ready (v2.4 - volatility range filter)
 """
 
 import asyncio
@@ -27,7 +27,10 @@ class CONFIG:
     POSITION_SIZE_USDT = 10.0
     LEVERAGE = 20
     MAX_CONCURRENT_POSITIONS = 10
+    # ИСПРАВЛЕНО: Добавлен диапазон волатильности
     MIN_DAILY_VOLATILITY_PCT = 3.0
+    MAX_DAILY_VOLATILITY_PCT = 10.0
+    MIN_PRICE = 0.001
     EMA_FAST_PERIOD = 9
     EMA_SLOW_PERIOD = 21
     EMA_TREND_PERIOD = 200
@@ -76,7 +79,8 @@ async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
                 if vol is None and data.get('open') and data.get('last') and data['open'] > 0:
                     vol = abs(data['last'] - data['open']) / data['open'] * 100
                 
-                if vol is not None and vol >= CONFIG.MIN_DAILY_VOLATILITY_PCT:
+                # ИСПРАВЛЕНО: Проверка на попадание в диапазон волатильности
+                if vol is not None and CONFIG.MIN_DAILY_VOLATILITY_PCT <= vol <= CONFIG.MAX_DAILY_VOLATILITY_PCT:
                     volatile_pairs.append(symbol)
 
         log.info(f"Found {len(volatile_pairs)} volatile pairs.")
@@ -92,8 +96,6 @@ def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
     ema_fast = f"EMA_{CONFIG.EMA_FAST_PERIOD}"
     ema_slow = f"EMA_{CONFIG.EMA_SLOW_PERIOD}"
     ema_trend = f"EMA_{CONFIG.EMA_TREND_PERIOD}"
-    
-    # ИСПРАВЛЕНО: Динамический поиск имени колонки StochRSI
     stoch_k = next((c for c in df.columns if c.startswith("STOCHRSIk_")), None)
     if not stoch_k:
         return None, {"Reason_For_Fail": "No StochRSI column found"}
@@ -166,6 +168,10 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
                 break
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            
+            if not df.empty and df.iloc[-1]['close'] < CONFIG.MIN_PRICE:
+                continue
+
             df.ta.ema(length=CONFIG.EMA_FAST_PERIOD, append=True)
             df.ta.ema(length=CONFIG.EMA_SLOW_PERIOD, append=True)
             df.ta.ema(length=CONFIG.EMA_TREND_PERIOD, append=True)
