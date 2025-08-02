@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Production Ready (v3.3 - fixed PnL reporting)
+Version: 2025-08-02 — Production Ready (v3.4 - final logic refinement)
 """
 
 import asyncio
@@ -96,7 +96,7 @@ async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
         return []
 
 def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
-    if df.empty: return None, {}
+    if len(df) < 2: return None, {}
 
     ema_fast = f"EMA_{CONFIG.EMA_FAST_PERIOD}"
     ema_slow = f"EMA_{CONFIG.EMA_SLOW_PERIOD}"
@@ -118,9 +118,11 @@ def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
         long_trend_ok = last['close'] > ema_trend_val * buf
         short_trend_ok = last['close'] < ema_trend_val / buf
 
+    # ИСПРАВЛЕНО: Триггер по пересечению средней линии StochRSI
     k_now = last[stoch_k]
-    long_stoch_ok = k_now > CONFIG.STOCH_RSI_MID
-    short_stoch_ok = k_now < CONFIG.STOCH_RSI_MID
+    k_prev = df[stoch_k].iloc[-2]
+    long_stoch_ok = k_prev < CONFIG.STOCH_RSI_MID <= k_now
+    short_stoch_ok = k_prev > CONFIG.STOCH_RSI_MID >= k_now
 
     long_passed_count = sum([long_ema_ok, long_trend_ok, long_stoch_ok])
     if long_passed_count == 3:
@@ -134,11 +136,11 @@ def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
 
     if long_passed_count >= 1 or short_passed_count >= 1:
         if long_passed_count >= short_passed_count:
-            failed = [name for name, ok in [("Trend", long_trend_ok), ("Stoch>50", long_stoch_ok), ("EMA_State", long_ema_ok)] if not ok]
+            failed = [name for name, ok in [("Trend", long_trend_ok), ("StochCross↑", long_stoch_ok), ("EMA_State", long_ema_ok)] if not ok]
             diagnosis = {"Side": "LONG", "EMA_State_OK": long_ema_ok, "Trend_OK": long_trend_ok, "Stoch_OK": long_stoch_ok, "Reason_For_Fail": ", ".join(failed)}
             return None, diagnosis
         else:
-            failed = [name for name, ok in [("Trend", short_trend_ok), ("Stoch<50", short_stoch_ok), ("EMA_State", short_ema_ok)] if not ok]
+            failed = [name for name, ok in [("Trend", short_trend_ok), ("StochCross↓", short_stoch_ok), ("EMA_State", short_ema_ok)] if not ok]
             diagnosis = {"Side": "SHORT", "EMA_State_OK": short_ema_ok, "Trend_OK": short_trend_ok, "Stoch_OK": short_stoch_ok, "Reason_For_Fail": ", ".join(failed)}
             return None, diagnosis
 
@@ -181,6 +183,13 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
+            # ИСПРАВЛЕНО: Отбрасываем текущую, не до конца сформированную свечу
+            tf_ms = tf_seconds(CONFIG.TIMEFRAME) * 1000
+            if time.time() * 1000 - df['timestamp'].iloc[-1] < tf_ms:
+                df = df.iloc[:-1]
+            if len(df) < CONFIG.EMA_TREND_PERIOD:
+                continue
+
             if not df.empty and df.iloc[-1]['close'] < CONFIG.MIN_PRICE:
                 continue
 
@@ -272,7 +281,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
     if trades_to_close:
         broadcast = app.bot_data.get('broadcast_func')
         for trade, reason, exit_price in trades_to_close:
-            # ИСПРАВЛЕНО: Расчёт PnL теперь фиксированный для SL/TP
             if reason == "STOP_LOSS":
                 pnl_display = -CONFIG.STOP_LOSS_PCT * CONFIG.LEVERAGE
             elif reason == "TAKE_PROFIT":
@@ -282,7 +290,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                 pnl_display = pnl_pct * 100 * CONFIG.LEVERAGE
             
             pnl_usd = CONFIG.POSITION_SIZE_USDT * pnl_display / 100
-            
             app.bot_data.setdefault("trade_cooldown", {})[trade['Pair']] = time.time()
             
             if broadcast:
