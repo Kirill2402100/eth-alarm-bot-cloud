@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Production Ready (v3.0 - cooldown fix)
+Version: 2025-08-02 — Production Ready (v3.1 - precision fix)
 """
 
 import asyncio
@@ -44,7 +44,8 @@ class CONFIG:
     STOP_LOSS_PCT = 1.0
     TAKE_PROFIT_PCT = 3.0
     SCANNER_INTERVAL_SECONDS = 600
-    TICK_MONITOR_INTERVAL_SECONDS = 5
+    # ИСПРАВЛЕНО: Уменьшен интервал для более точного закрытия
+    TICK_MONITOR_INTERVAL_SECONDS = 2
     OHLCV_LIMIT = 250
 
 # ===========================================================================
@@ -166,7 +167,6 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     for i, ohlcv in enumerate(ohlcv_results):
         symbol = volatile_pairs[i]
         try:
-            # ИСПРАВЛЕНО: Фильтр "карантина" теперь использует таймфрейм
             cool = app.bot_data.get("loss_cooldown", {}).get(symbol)
             if cool and time.time() - cool < tf_seconds(CONFIG.TIMEFRAME) * 2:
                 continue
@@ -247,8 +247,16 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
 
     trades_to_close = []
     for trade in active_trades:
-        if trade['Pair'] not in tickers: continue
-        last_price = tickers[trade['Pair']]['last']
+        if trade['Pair'] not in tickers or tickers[trade['Pair']].get('last') is None:
+            continue
+            
+        # ИСПРАВЛЕНО: Используем bid/ask для более точного закрытия
+        ticker_data = tickers[trade['Pair']]
+        if trade['Side'] == 'LONG':
+            last_price = ticker_data.get('bid', ticker_data['last'])
+        else: # SHORT
+            last_price = ticker_data.get('ask', ticker_data['last'])
+
         exit_reason = None
 
         if trade['Side'] == 'LONG':
