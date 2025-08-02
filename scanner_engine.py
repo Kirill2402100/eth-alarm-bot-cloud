@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Production Ready (v2.6 - final logic)
+Version: 2025-08-02 — Production Ready (v2.7 - history check fix)
 """
 
 import asyncio
@@ -33,14 +33,10 @@ class CONFIG:
     EMA_FAST_PERIOD = 9
     EMA_SLOW_PERIOD = 21
     EMA_TREND_PERIOD = 200
-    # ИСПРАВЛЕНО: Добавлен буфер для EMA-200
     EMA_TREND_BUFFER_PCT = 0.5
     STOCH_RSI_PERIOD = 14
     STOCH_RSI_K = 3
     STOCH_RSI_D = 3
-    STOCH_RSI_OVERBOUGHT = 80 # Больше не используется для входа
-    STOCH_RSI_OVERSOLD = 20  # Больше не используется для входа
-    # ИСПРАВЛЕНО: Добавлен срединный уровень для StochRSI
     STOCH_RSI_MID = 50
     STOP_LOSS_PCT = 1.0
     TAKE_PROFIT_PCT = 3.0
@@ -108,14 +104,14 @@ def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
     long_ema_ok = last[ema_fast] > last[ema_slow]
     short_ema_ok = last[ema_fast] < last[ema_slow]
 
-    hist_ok = len(df) >= (CONFIG.EMA_TREND_PERIOD + CONFIG.STOCH_RSI_PERIOD * 2)
-    if not hist_ok:
-        long_trend_ok = short_trend_ok = True
+    # ИСПРАВЛЕНО: Проверка на "зрелость" EMA-200 перед применением фильтра
+    ema_trend_val = last[ema_trend]
+    if pd.isna(ema_trend_val):
+        long_trend_ok = short_trend_ok = True  # EMA-200 еще не сформировалась, пропускаем фильтр
     else:
-        # ИСПРАВЛЕНО: Добавлен буфер к проверке EMA-200
         buf = 1 + CONFIG.EMA_TREND_BUFFER_PCT / 100
-        long_trend_ok = last['close'] > last[ema_trend] * buf
-        short_trend_ok = last['close'] < last[ema_trend] / buf
+        long_trend_ok = last['close'] > ema_trend_val * buf
+        short_trend_ok = last['close'] < ema_trend_val / buf
 
     # --- Новый фильтр StochRSI ---
     k_now = last[stoch_k]
@@ -169,7 +165,7 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     for i, ohlcv in enumerate(ohlcv_results):
         symbol = volatile_pairs[i]
         try:
-            if isinstance(ohlcv, Exception) or not ohlcv or len(ohlcv) < CONFIG.EMA_TREND_PERIOD:
+            if isinstance(ohlcv, Exception) or not ohlcv or len(ohlcv) < 50: # Check for a minimal number of candles
                 if isinstance(ohlcv, Exception):
                     log.warning(f"Could not fetch OHLCV for {symbol}: {ohlcv}")
                 continue
@@ -187,13 +183,14 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             df.ta.ema(length=CONFIG.EMA_SLOW_PERIOD, append=True)
             df.ta.ema(length=CONFIG.EMA_TREND_PERIOD, append=True)
             df.ta.stochrsi(length=CONFIG.STOCH_RSI_PERIOD, k=CONFIG.STOCH_RSI_K, d=CONFIG.STOCH_RSI_D, append=True)
-            df.dropna(inplace=True)
-
-            side, diagnosis = check_entry_conditions(df)
+            
+            # ВАЖНО: dropna() вызывается ПОСЛЕ проверки на зрелость EMA-200
+            side, diagnosis = check_entry_conditions(df.copy()) # Передаем копию, чтобы dropna() ниже не влиял
             
             if side:
                 if any(t["Pair"] == symbol for t in bot_data.get("active_trades", [])):
                     continue
+                # Для цены входа используем последнюю свечу из оригинального DF до dropna
                 await open_new_trade(symbol, side, df.iloc[-1]['close'], app)
             elif diagnosis:
                 diagnosis.update({ "Pair": symbol, "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')})
