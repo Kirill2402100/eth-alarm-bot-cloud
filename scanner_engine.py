@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Production Ready (v2.5 - advanced logic)
+Version: 2025-08-02 — Production Ready (v2.6 - final logic)
 """
 
 import asyncio
@@ -33,11 +33,15 @@ class CONFIG:
     EMA_FAST_PERIOD = 9
     EMA_SLOW_PERIOD = 21
     EMA_TREND_PERIOD = 200
+    # ИСПРАВЛЕНО: Добавлен буфер для EMA-200
+    EMA_TREND_BUFFER_PCT = 0.5
     STOCH_RSI_PERIOD = 14
     STOCH_RSI_K = 3
     STOCH_RSI_D = 3
-    STOCH_RSI_OVERBOUGHT = 80
-    STOCH_RSI_OVERSOLD = 20
+    STOCH_RSI_OVERBOUGHT = 80 # Больше не используется для входа
+    STOCH_RSI_OVERSOLD = 20  # Больше не используется для входа
+    # ИСПРАВЛЕНО: Добавлен срединный уровень для StochRSI
+    STOCH_RSI_MID = 50
     STOP_LOSS_PCT = 1.0
     TAKE_PROFIT_PCT = 3.0
     SCANNER_INTERVAL_SECONDS = 600
@@ -90,35 +94,33 @@ def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
     """Проверяет условия 'тройного триггера' и возвращает результат и диагностику."""
     if df.empty: return None, {}
 
-    # --- Подготовка колонок ---
     ema_fast = f"EMA_{CONFIG.EMA_FAST_PERIOD}"
     ema_slow = f"EMA_{CONFIG.EMA_SLOW_PERIOD}"
     ema_trend = f"EMA_{CONFIG.EMA_TREND_PERIOD}"
-
+    
     stoch_k = next((c for c in df.columns if c.startswith("STOCHRSIk_")), None)
     if not stoch_k:
         return None, {"Reason_For_Fail": "No StochRSI column"}
-
-    stoch_d = stoch_k.replace("k_", "d_")
-
+    
     last = df.iloc[-1]
-    k_prev, k_now = df[stoch_k].iloc[-2:]
-    d_prev, d_now = df[stoch_d].iloc[-2:]
-
-    # --- EMA и тренд ---
+    
+    # --- EMA и Тренд с буфером ---
     long_ema_ok = last[ema_fast] > last[ema_slow]
     short_ema_ok = last[ema_fast] < last[ema_slow]
 
     hist_ok = len(df) >= (CONFIG.EMA_TREND_PERIOD + CONFIG.STOCH_RSI_PERIOD * 2)
     if not hist_ok:
-        long_trend_ok = short_trend_ok = True  # Снимаем ограничение
+        long_trend_ok = short_trend_ok = True
     else:
-        long_trend_ok = last['close'] > last[ema_trend]
-        short_trend_ok = last['close'] < last[ema_trend]
+        # ИСПРАВЛЕНО: Добавлен буфер к проверке EMA-200
+        buf = 1 + CONFIG.EMA_TREND_BUFFER_PCT / 100
+        long_trend_ok = last['close'] > last[ema_trend] * buf
+        short_trend_ok = last['close'] < last[ema_trend] / buf
 
-    # --- StochRSI кроссы ---
-    long_stoch_ok = (k_prev < d_prev) and (k_now > d_now) and (k_now < CONFIG.STOCH_RSI_OVERSOLD)
-    short_stoch_ok = (k_prev > d_prev) and (k_now < d_now) and (k_now > CONFIG.STOCH_RSI_OVERBOUGHT)
+    # --- Новый фильтр StochRSI ---
+    k_now = last[stoch_k]
+    long_stoch_ok = k_now > CONFIG.STOCH_RSI_MID
+    short_stoch_ok = k_now < CONFIG.STOCH_RSI_MID
 
     # --- Оцениваем LONG-сценарий ---
     long_passed_count = sum([long_ema_ok, long_trend_ok, long_stoch_ok])
@@ -135,11 +137,11 @@ def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
     # --- Проверяем, нужно ли логировать для диагностики ---
     if long_passed_count >= 1 or short_passed_count >= 1:
         if long_passed_count >= short_passed_count:
-            failed = [name for name, ok in [("Trend", long_trend_ok), ("StochRSI", long_stoch_ok), ("EMA_State", long_ema_ok)] if not ok]
+            failed = [name for name, ok in [("Trend", long_trend_ok), ("Stoch>50", long_stoch_ok), ("EMA_State", long_ema_ok)] if not ok]
             diagnosis = {"Side": "LONG", "EMA_State_OK": long_ema_ok, "Trend_OK": long_trend_ok, "Stoch_OK": long_stoch_ok, "Reason_For_Fail": ", ".join(failed)}
             return None, diagnosis
         else:
-            failed = [name for name, ok in [("Trend", short_trend_ok), ("StochRSI", short_stoch_ok), ("EMA_State", short_ema_ok)] if not ok]
+            failed = [name for name, ok in [("Trend", short_trend_ok), ("Stoch<50", short_stoch_ok), ("EMA_State", short_ema_ok)] if not ok]
             diagnosis = {"Side": "SHORT", "EMA_State_OK": short_ema_ok, "Trend_OK": short_trend_ok, "Stoch_OK": short_stoch_ok, "Reason_For_Fail": ", ".join(failed)}
             return None, diagnosis
 
@@ -190,7 +192,6 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             side, diagnosis = check_entry_conditions(df)
             
             if side:
-                # ИСПРАВЛЕНО: Пропускаем, если позиция по этой паре уже открыта
                 if any(t["Pair"] == symbol for t in bot_data.get("active_trades", [])):
                     continue
                 await open_new_trade(symbol, side, df.iloc[-1]['close'], app)
