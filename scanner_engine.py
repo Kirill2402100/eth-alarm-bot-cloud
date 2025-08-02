@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Diagnostic Logging Edition (v1.8 - lenient logging)
+Version: 2025-08-02 — Diagnostic Logging Edition (v1.9 - logic fix)
 """
 
 import asyncio
@@ -97,34 +97,37 @@ def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
     
     last = df.iloc[-1]
     
-    side = "LONG" if last[ema_fast] > last[ema_slow] else "SHORT"
-    
-    ema_ok = True
-    trend_ok = (side == "LONG" and last['close'] > last[ema_trend]) or \
-               (side == "SHORT" and last['close'] < last[ema_trend])
-    stoch_ok = (side == "LONG" and last[stoch_k] < CONFIG.STOCH_RSI_OVERSOLD) or \
-               (side == "SHORT" and last[stoch_k] > CONFIG.STOCH_RSI_OVERBOUGHT)
-               
-    diagnosis = {
-        "Side": side,
-        "EMA_State_OK": ema_ok,
-        "Trend_OK": trend_ok,
-        "Stoch_OK": stoch_ok,
-        "Reason_For_Fail": ""
-    }
+    # --- Оцениваем LONG-сценарий ---
+    long_ema_ok = last[ema_fast] > last[ema_slow]
+    long_trend_ok = last['close'] > last[ema_trend]
+    long_stoch_ok = last[stoch_k] < CONFIG.STOCH_RSI_OVERSOLD
+    long_passed_count = sum([long_ema_ok, long_trend_ok, long_stoch_ok])
 
-    passed_count = sum([ema_ok, trend_ok, stoch_ok])
+    if long_passed_count == 3:
+        diagnosis = {"Side": "LONG", "EMA_State_OK": True, "Trend_OK": True, "Stoch_OK": True, "Reason_For_Fail": "ALL_OK"}
+        return "LONG", diagnosis
 
-    if passed_count == 3:
-        return side, diagnosis
+    # --- Оцениваем SHORT-сценарий ---
+    short_ema_ok = last[ema_fast] < last[ema_slow]
+    short_trend_ok = last['close'] < last[ema_trend]
+    short_stoch_ok = last[stoch_k] > CONFIG.STOCH_RSI_OVERBOUGHT
+    short_passed_count = sum([short_ema_ok, short_trend_ok, short_stoch_ok])
 
-    # ИЗМЕНЕНО: Логируем, если пройден хотя бы 1 фильтр
-    if passed_count >= 1:
-        failed_filters = []
-        if not trend_ok: failed_filters.append("Trend")
-        if not stoch_ok: failed_filters.append("StochRSI")
-        diagnosis["Reason_For_Fail"] = ", ".join(failed_filters) if failed_filters else "ALL_OK"
-        return None, diagnosis
+    if short_passed_count == 3:
+        diagnosis = {"Side": "SHORT", "EMA_State_OK": True, "Trend_OK": True, "Stoch_OK": True, "Reason_For_Fail": "ALL_OK"}
+        return "SHORT", diagnosis
+
+    # --- Проверяем, нужно ли логировать для диагностики (пройден хотя бы 1 фильтр) ---
+    if long_passed_count >= 1 or short_passed_count >= 1:
+        # Выбираем для лога тот сценарий, где больше совпадений
+        if long_passed_count >= short_passed_count:
+            failed = [name for name, ok in [("Trend", long_trend_ok), ("StochRSI", long_stoch_ok), ("EMA_State", long_ema_ok)] if not ok]
+            diagnosis = {"Side": "LONG", "EMA_State_OK": long_ema_ok, "Trend_OK": long_trend_ok, "Stoch_OK": long_stoch_ok, "Reason_For_Fail": ", ".join(failed)}
+            return None, diagnosis
+        else: # short_passed_count > long_passed_count
+            failed = [name for name, ok in [("Trend", short_trend_ok), ("StochRSI", short_stoch_ok), ("EMA_State", short_ema_ok)] if not ok]
+            diagnosis = {"Side": "SHORT", "EMA_State_OK": short_ema_ok, "Trend_OK": short_trend_ok, "Stoch_OK": short_stoch_ok, "Reason_For_Fail": ", ".join(failed)}
+            return None, diagnosis
 
     return None, {}
 
