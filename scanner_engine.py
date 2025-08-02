@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Production Ready (v2.4 - volatility range filter)
+Version: 2025-08-02 — Production Ready (v2.5 - final debug)
 """
 
 import asyncio
@@ -27,7 +27,6 @@ class CONFIG:
     POSITION_SIZE_USDT = 10.0
     LEVERAGE = 20
     MAX_CONCURRENT_POSITIONS = 10
-    # ИСПРАВЛЕНО: Добавлен диапазон волатильности
     MIN_DAILY_VOLATILITY_PCT = 3.0
     MAX_DAILY_VOLATILITY_PCT = 10.0
     MIN_PRICE = 0.001
@@ -62,7 +61,6 @@ def calculate_sl_tp(entry_price: float, side: str) -> tuple[float, float]:
 # MARKET SCANNER
 # ===========================================================================
 async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
-    """Отфильтровывает пары, используя ОДИН эффективный вызов fetch_tickers."""
     log.info("Filtering pairs by daily volatility using fetch_tickers()...")
     try:
         await exchange.load_markets()
@@ -79,7 +77,6 @@ async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
                 if vol is None and data.get('open') and data.get('last') and data['open'] > 0:
                     vol = abs(data['last'] - data['open']) / data['open'] * 100
                 
-                # ИСПРАВЛЕНО: Проверка на попадание в диапазон волатильности
                 if vol is not None and CONFIG.MIN_DAILY_VOLATILITY_PCT <= vol <= CONFIG.MAX_DAILY_VOLATILITY_PCT:
                     volatile_pairs.append(symbol)
 
@@ -90,7 +87,6 @@ async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
         return []
 
 def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
-    """Проверяет условия 'тройного триггера' и возвращает результат и диагностику."""
     if df.empty: return None, {}
 
     ema_fast = f"EMA_{CONFIG.EMA_FAST_PERIOD}"
@@ -102,7 +98,6 @@ def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
     
     last = df.iloc[-1]
     
-    # --- Оцениваем LONG-сценарий ---
     long_ema_ok = last[ema_fast] > last[ema_slow]
     long_trend_ok = last['close'] > last[ema_trend]
     long_stoch_ok = last[stoch_k] < CONFIG.STOCH_RSI_OVERSOLD
@@ -112,7 +107,6 @@ def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
         diagnosis = {"Side": "LONG", "EMA_State_OK": True, "Trend_OK": True, "Stoch_OK": True, "Reason_For_Fail": "ALL_OK"}
         return "LONG", diagnosis
 
-    # --- Оцениваем SHORT-сценарий ---
     short_ema_ok = last[ema_fast] < last[ema_slow]
     short_trend_ok = last['close'] < last[ema_trend]
     short_stoch_ok = last[stoch_k] > CONFIG.STOCH_RSI_OVERBOUGHT
@@ -122,7 +116,6 @@ def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
         diagnosis = {"Side": "SHORT", "EMA_State_OK": True, "Trend_OK": True, "Stoch_OK": True, "Reason_For_Fail": "ALL_OK"}
         return "SHORT", diagnosis
 
-    # --- Проверяем, нужно ли логировать для диагностики (пройден хотя бы 1 фильтр) ---
     if long_passed_count >= 1 or short_passed_count >= 1:
         if long_passed_count >= short_passed_count:
             failed = [name for name, ok in [("Trend", long_trend_ok), ("StochRSI", long_stoch_ok), ("EMA_State", long_ema_ok)] if not ok]
@@ -136,7 +129,6 @@ def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
     return None, {}
 
 async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
-    """Основная функция сканера: находит, диагностирует и обрабатывает сигналы."""
     bot_data = app.bot_data
     if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
         log.info("Position limit reached. Skipping scan.")
@@ -183,6 +175,8 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             if side:
                 await open_new_trade(symbol, side, df.iloc[-1]['close'], app)
             elif diagnosis:
+                # ИЗМЕНЕНО: Добавлен отладочный лог перед записью в таблицу
+                log.info(f"DIAG→ {diagnosis}")
                 diagnosis.update({ "Pair": symbol, "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')})
                 await log_diagnostic_entry(diagnosis)
         except Exception as e:
