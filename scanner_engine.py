@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Production Ready (v3.2 - final improvements)
+Version: 2025-08-02 — Production Ready (v3.3 - fixed PnL reporting)
 """
 
 import asyncio
@@ -166,7 +166,6 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     for i, ohlcv in enumerate(ohlcv_results):
         symbol = volatile_pairs[i]
         try:
-            # ИСПРАВЛЕНО: Проверка универсального "карантина"
             cool = app.bot_data.get("trade_cooldown", {}).get(symbol)
             if cool and time.time() - cool < tf_seconds(CONFIG.TIMEFRAME) * 2:
                 continue
@@ -218,22 +217,17 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
 async def open_new_trade(symbol: str, side: str, entry_price: float, app: Application):
     bot_data = app.bot_data
     sl_price, tp_price = calculate_sl_tp(entry_price, side)
-    
     trade = {
         "Signal_ID": f"{symbol}_{int(time.time())}", "Pair": symbol, "Side": side,
         "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": tp_price,
         "Status": "ACTIVE", "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
     }
-    
     bot_data.setdefault("active_trades", []).append(trade)
     log.info(f"New trade signal: {trade}")
-    
     broadcast = app.bot_data.get('broadcast_func')
     if broadcast:
-        # ИСПРАВЛЕНО: Расчёт % для отображения с учётом плеча
         sl_disp = int(CONFIG.STOP_LOSS_PCT * CONFIG.LEVERAGE)
         tp_disp = int(CONFIG.TAKE_PROFIT_PCT * CONFIG.LEVERAGE)
-
         msg = (f"🔥 <b>НОВЫЙ СИГНАЛ ({side})</b>\n\n"
                f"<b>Пара:</b> {symbol}\n<b>Вход:</b> <code>{entry_price:.4f}</code>\n"
                f"<b>SL:</b> <code>{sl_price:.4f}</code> (-{sl_disp}%)\n"
@@ -265,7 +259,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
             last_price = ticker_data.get('ask', ticker_data['last'])
 
         exit_reason = None
-
         if trade['Side'] == 'LONG':
             if last_price <= trade['SL_Price']: exit_reason = "STOP_LOSS"
             elif last_price >= trade['TP_Price']: exit_reason = "TAKE_PROFIT"
@@ -279,11 +272,17 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
     if trades_to_close:
         broadcast = app.bot_data.get('broadcast_func')
         for trade, reason, exit_price in trades_to_close:
-            pnl_pct = ((exit_price - trade['Entry_Price']) / trade['Entry_Price']) * (1 if trade['Side'] == "LONG" else -1)
-            pnl_usd = CONFIG.POSITION_SIZE_USDT * CONFIG.LEVERAGE * pnl_pct
-            pnl_display = pnl_pct * 100 * CONFIG.LEVERAGE
+            # ИСПРАВЛЕНО: Расчёт PnL теперь фиксированный для SL/TP
+            if reason == "STOP_LOSS":
+                pnl_display = -CONFIG.STOP_LOSS_PCT * CONFIG.LEVERAGE
+            elif reason == "TAKE_PROFIT":
+                pnl_display = CONFIG.TAKE_PROFIT_PCT * CONFIG.LEVERAGE
+            else:
+                pnl_pct = ((exit_price - trade['Entry_Price']) / trade['Entry_Price']) * (1 if trade['Side'] == "LONG" else -1)
+                pnl_display = pnl_pct * 100 * CONFIG.LEVERAGE
             
-            # ИСПРАВЛЕНО: Записываем время закрытия для универсального "карантина"
+            pnl_usd = CONFIG.POSITION_SIZE_USDT * pnl_display / 100
+            
             app.bot_data.setdefault("trade_cooldown", {})[trade['Pair']] = time.time()
             
             if broadcast:
@@ -303,7 +302,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
 async def scanner_main_loop(app: Application, broadcast):
     log.info("Swing Strategy Engine loop starting…")
     app.bot_data.setdefault("active_trades", [])
-    # ИСПРАВЛЕНО: Инициализация универсального "карантина"
     app.bot_data.setdefault("trade_cooldown", {})
     app.bot_data['broadcast_func'] = broadcast
 
