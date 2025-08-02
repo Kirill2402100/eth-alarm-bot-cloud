@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Production Ready (v2.8 - risk filters)
+Version: 2025-08-02 — Production Ready (v2.9 - ATR fix)
 """
 
 import asyncio
@@ -38,7 +38,6 @@ class CONFIG:
     STOCH_RSI_K = 3
     STOCH_RSI_D = 3
     STOCH_RSI_MID = 50
-    # ИСПРАВЛЕНО: Добавлены настройки для фильтра "шипов"
     ATR_PERIOD = 14
     ATR_SPIKE_MULT = 2.5
     ATR_COOLDOWN_BARS = 2
@@ -157,7 +156,6 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     for i, ohlcv in enumerate(ohlcv_results):
         symbol = volatile_pairs[i]
         try:
-            # ИСПРАВЛЕНО: Фильтр "карантина" после убытка
             cool = app.bot_data.get("loss_cooldown", {}).get(symbol)
             if cool and time.time() - cool < CONFIG.SCANNER_INTERVAL_SECONDS * 2:
                 continue
@@ -180,14 +178,17 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             df.ta.ema(length=CONFIG.EMA_SLOW_PERIOD, append=True)
             df.ta.ema(length=CONFIG.EMA_TREND_PERIOD, append=True)
             df.ta.stochrsi(length=CONFIG.STOCH_RSI_PERIOD, k=CONFIG.STOCH_RSI_K, d=CONFIG.STOCH_RSI_D, append=True)
-
-            # ИСПРАВЛЕНО: Расчёт и фильтрация по ATR/"шипам"
-            df.ta.atr(length=CONFIG.ATR_PERIOD, append=True)
-            df['range'] = df['high'] - df['low']
-            df['is_spike'] = df['range'] > df[f"ATR_{CONFIG.ATR_PERIOD}"] * CONFIG.ATR_SPIKE_MULT
             
-            if df['is_spike'].iloc[-1]: continue
-            if df['is_spike'].iloc[-CONFIG.ATR_COOLDOWN_BARS:].any(): continue
+            # ИСПРАВЛЕНО: Динамический поиск ATR и фильтр "шипов"
+            df.ta.atr(length=CONFIG.ATR_PERIOD, append=True)
+            atr_col = next((c for c in df.columns if c.startswith("ATR") and c.endswith(str(CONFIG.ATR_PERIOD))), None)
+            if not atr_col:
+                log.warning(f"{symbol}: ATR column not found, skipping spike filter.")
+            else:
+                df['range'] = df['high'] - df['low']
+                df['is_spike'] = df['range'] > df[atr_col] * CONFIG.ATR_SPIKE_MULT
+                if df['is_spike'].iloc[-1]: continue
+                if df['is_spike'].iloc[-CONFIG.ATR_COOLDOWN_BARS:].any(): continue
 
             side, diagnosis = check_entry_conditions(df.copy())
             
@@ -257,7 +258,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
             pnl_usd = CONFIG.POSITION_SIZE_USDT * CONFIG.LEVERAGE * pnl_pct
             pnl_display = pnl_pct * 100 * CONFIG.LEVERAGE
             
-            # ИСПРАВЛЕНО: Записываем время убытка для "карантина"
             if pnl_usd < 0:
                 app.bot_data.setdefault("loss_cooldown", {})[trade['Pair']] = time.time()
             
@@ -278,7 +278,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
 async def scanner_main_loop(app: Application, broadcast):
     log.info("Swing Strategy Engine loop starting…")
     app.bot_data.setdefault("active_trades", [])
-    # ИСПРАВЛЕНО: Инициализация словаря для "карантина"
     app.bot_data.setdefault("loss_cooldown", {})
     app.bot_data['broadcast_func'] = broadcast
 
