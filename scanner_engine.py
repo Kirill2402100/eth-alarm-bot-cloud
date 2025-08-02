@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Production Ready (v3.1 - precision fix)
+Version: 2025-08-02 — Production Ready (v3.2 - final improvements)
 """
 
 import asyncio
@@ -44,7 +44,6 @@ class CONFIG:
     STOP_LOSS_PCT = 1.0
     TAKE_PROFIT_PCT = 3.0
     SCANNER_INTERVAL_SECONDS = 600
-    # ИСПРАВЛЕНО: Уменьшен интервал для более точного закрытия
     TICK_MONITOR_INTERVAL_SECONDS = 2
     OHLCV_LIMIT = 250
 
@@ -167,7 +166,8 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     for i, ohlcv in enumerate(ohlcv_results):
         symbol = volatile_pairs[i]
         try:
-            cool = app.bot_data.get("loss_cooldown", {}).get(symbol)
+            # ИСПРАВЛЕНО: Проверка универсального "карантина"
+            cool = app.bot_data.get("trade_cooldown", {}).get(symbol)
             if cool and time.time() - cool < tf_seconds(CONFIG.TIMEFRAME) * 2:
                 continue
 
@@ -218,18 +218,26 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
 async def open_new_trade(symbol: str, side: str, entry_price: float, app: Application):
     bot_data = app.bot_data
     sl_price, tp_price = calculate_sl_tp(entry_price, side)
+    
     trade = {
         "Signal_ID": f"{symbol}_{int(time.time())}", "Pair": symbol, "Side": side,
         "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": tp_price,
         "Status": "ACTIVE", "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
     }
+    
     bot_data.setdefault("active_trades", []).append(trade)
     log.info(f"New trade signal: {trade}")
+    
     broadcast = app.bot_data.get('broadcast_func')
     if broadcast:
+        # ИСПРАВЛЕНО: Расчёт % для отображения с учётом плеча
+        sl_disp = int(CONFIG.STOP_LOSS_PCT * CONFIG.LEVERAGE)
+        tp_disp = int(CONFIG.TAKE_PROFIT_PCT * CONFIG.LEVERAGE)
+
         msg = (f"🔥 <b>НОВЫЙ СИГНАЛ ({side})</b>\n\n"
                f"<b>Пара:</b> {symbol}\n<b>Вход:</b> <code>{entry_price:.4f}</code>\n"
-               f"<b>SL:</b> <code>{sl_price:.4f}</code> (1%)\n<b>TP:</b> <code>{tp_price:.4f}</code> (3%)")
+               f"<b>SL:</b> <code>{sl_price:.4f}</code> (-{sl_disp}%)\n"
+               f"<b>TP:</b> <code>{tp_price:.4f}</code> (+{tp_disp}%)")
         await broadcast(app, msg)
     await log_open_trade(trade)
 
@@ -250,7 +258,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
         if trade['Pair'] not in tickers or tickers[trade['Pair']].get('last') is None:
             continue
             
-        # ИСПРАВЛЕНО: Используем bid/ask для более точного закрытия
         ticker_data = tickers[trade['Pair']]
         if trade['Side'] == 'LONG':
             last_price = ticker_data.get('bid', ticker_data['last'])
@@ -276,8 +283,8 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
             pnl_usd = CONFIG.POSITION_SIZE_USDT * CONFIG.LEVERAGE * pnl_pct
             pnl_display = pnl_pct * 100 * CONFIG.LEVERAGE
             
-            if pnl_usd < 0:
-                app.bot_data.setdefault("loss_cooldown", {})[trade['Pair']] = time.time()
+            # ИСПРАВЛЕНО: Записываем время закрытия для универсального "карантина"
+            app.bot_data.setdefault("trade_cooldown", {})[trade['Pair']] = time.time()
             
             if broadcast:
                 emoji = "✅" if pnl_usd > 0 else "❌"
@@ -296,7 +303,8 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
 async def scanner_main_loop(app: Application, broadcast):
     log.info("Swing Strategy Engine loop starting…")
     app.bot_data.setdefault("active_trades", [])
-    app.bot_data.setdefault("loss_cooldown", {})
+    # ИСПРАВЛЕНО: Инициализация универсального "карантина"
+    app.bot_data.setdefault("trade_cooldown", {})
     app.bot_data['broadcast_func'] = broadcast
 
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 200})
