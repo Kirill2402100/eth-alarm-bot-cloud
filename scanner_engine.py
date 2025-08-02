@@ -1,21 +1,22 @@
+# scanner_engine.py
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-01 — Triple-Trigger Strategy (v1.7 - relaxed filters)
+Version: 2025-08-02 — Diagnostic Logging Edition
 """
 
 import asyncio
 import time
 import logging
 from datetime import datetime, timezone
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import pandas as pd
 import pandas_ta as ta
 import ccxt.async_support as ccxt
 from telegram.ext import Application
 
-from trade_executor import log_open_trade, update_closed_trade
+from trade_executor import log_open_trade, update_closed_trade, log_diagnostic_entry
 
 log = logging.getLogger("swing_bot_engine")
 
@@ -23,7 +24,7 @@ log = logging.getLogger("swing_bot_engine")
 # CONFIGURATION
 # ===========================================================================
 class CONFIG:
-    TIMEFRAME = "1h"
+    TIMEFRAME = "60m"
     POSITION_SIZE_USDT = 10.0
     LEVERAGE = 20
     MAX_CONCURRENT_POSITIONS = 10
@@ -34,12 +35,10 @@ class CONFIG:
     STOCH_RSI_PERIOD = 14
     STOCH_RSI_K = 3
     STOCH_RSI_D = 3
-    # ИЗМЕНЕНО: Уровни StochRSI смягчены
     STOCH_RSI_OVERBOUGHT = 0.70
     STOCH_RSI_OVERSOLD = 0.30
     STOP_LOSS_PCT = 1.0
     TAKE_PROFIT_PCT = 3.0
-    # ИЗМЕНЕНО: Интервал сканирования уменьшен до 10 минут
     SCANNER_INTERVAL_SECONDS = 600
     TICK_MONITOR_INTERVAL_SECONDS = 5
 
@@ -83,9 +82,11 @@ async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
         log.error(f"Error filtering volatile pairs: {e}", exc_info=True)
         return []
 
-def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
-    """Проверяет условия 'тройного триггера' (проверка состояния)."""
-    if df.empty: return None
+def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
+    """
+    Проверяет условия 'тройного триггера' и возвращает результат и диагностику.
+    """
+    if df.empty: return None, {}
 
     ema_fast = f"EMA_{CONFIG.EMA_FAST_PERIOD}"
     ema_slow = f"EMA_{CONFIG.EMA_SLOW_PERIOD}"
@@ -93,26 +94,42 @@ def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
     stoch_k = f"STOCHRSIk_{CONFIG.STOCH_RSI_PERIOD}_{CONFIG.STOCH_RSI_K}_{CONFIG.STOCH_RSI_D}"
 
     if stoch_k not in df.columns:
-        return None
+        return None, {"Reason_For_Fail": "No StochRSI data"}
     
     last = df.iloc[-1]
+    
+    # Определяем потенциальное направление
+    side = "LONG" if last[ema_fast] > last[ema_slow] else "SHORT"
+    
+    # Проверяем все условия
+    ema_ok = True  # Состояние EMA определяет направление
+    trend_ok = (side == "LONG" and last['close'] > last[ema_trend]) or \
+               (side == "SHORT" and last['close'] < last[ema_trend])
+    stoch_ok = (side == "LONG" and last[stoch_k] < CONFIG.STOCH_RSI_OVERSOLD) or \
+               (side == "SHORT" and last[stoch_k] > CONFIG.STOCH_RSI_OVERBOUGHT)
+               
+    diagnosis = {
+        "Side": side,
+        "EMA_State_OK": ema_ok,
+        "Trend_OK": trend_ok,
+        "Stoch_OK": stoch_ok,
+        "Reason_For_Fail": ""
+    }
 
-    is_bullish_state = last[ema_fast] > last[ema_slow]
-    is_bearish_state = last[ema_fast] < last[ema_slow]
-    is_uptrend = last['close'] > last[ema_trend]
-    is_downtrend = last['close'] < last[ema_trend]
-    is_oversold = last[stoch_k] < CONFIG.STOCH_RSI_OVERSOLD
-    is_overbought = last[stoch_k] > CONFIG.STOCH_RSI_OVERBOUGHT
+    # Если все условия выполнены - это сигнал
+    if all([ema_ok, trend_ok, stoch_ok]):
+        return side, diagnosis
 
-    if is_bullish_state and is_uptrend and is_oversold:
-        return "LONG"
-    if is_bearish_state and is_downtrend and is_overbought:
-        return "SHORT"
-        
-    return None
+    # Если нет - логируем для диагностики, если прошли 2 из 3
+    if sum([ema_ok, trend_ok, stoch_ok]) == 2:
+        if not trend_ok: diagnosis["Reason_For_Fail"] = "Trend Filter"
+        elif not stoch_ok: diagnosis["Reason_For_Fail"] = "StochRSI Filter"
+        return None, diagnosis # Возвращаем диагностику, но не сигнал
+
+    return None, {} # Не прошло даже 2 фильтра
 
 async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
-    """Основная функция сканера: находит и обрабатывает новые сигналы."""
+    """Основная функция сканера: находит, диагностирует и обрабатывает сигналы."""
     bot_data = app.bot_data
     if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
         log.info("Position limit reached. Skipping scan.")
@@ -130,8 +147,6 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
         symbol = volatile_pairs[i]
         try:
             if isinstance(ohlcv, Exception) or not ohlcv or len(ohlcv) < CONFIG.EMA_TREND_PERIOD:
-                if isinstance(ohlcv, Exception):
-                    log.warning(f"Could not fetch OHLCV for {symbol}: {ohlcv}")
                 continue
             
             if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
@@ -145,17 +160,24 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             df.ta.stochrsi(length=CONFIG.STOCH_RSI_PERIOD, k=CONFIG.STOCH_RSI_K, d=CONFIG.STOCH_RSI_D, append=True)
             df.dropna(inplace=True)
 
-            side = check_entry_conditions(df)
-            if side:
+            side, diagnosis = check_entry_conditions(df)
+            
+            if side: # Если есть сигнал
                 await open_new_trade(symbol, side, df.iloc[-1]['close'], app)
+            elif diagnosis: # Если есть что записать в диагностику
+                diagnosis.update({
+                    "Pair": symbol,
+                    "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+                })
+                await log_diagnostic_entry(diagnosis)
+
         except Exception as e:
             log.error(f"Error processing symbol {symbol}: {e}")
 
 # ===========================================================================
-# TRADE MANAGER
+# TRADE MANAGER (без изменений)
 # ===========================================================================
 async def open_new_trade(symbol: str, side: str, entry_price: float, app: Application):
-    """Создает и логирует новую сделку."""
     bot_data = app.bot_data
     sl_price, tp_price = calculate_sl_tp(entry_price, side)
     
@@ -184,7 +206,6 @@ async def open_new_trade(symbol: str, side: str, entry_price: float, app: Applic
     await log_open_trade(trade)
 
 async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
-    """Тиковый мониторинг активных позиций."""
     bot_data = app.bot_data
     active_trades = bot_data.get("active_trades", [])
     if not active_trades: return
@@ -231,7 +252,7 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
         bot_data["active_trades"] = [t for t in active_trades if t['Signal_ID'] not in closed_ids]
 
 # ===========================================================================
-# MAIN LOOP
+# MAIN LOOP (без изменений)
 # ===========================================================================
 async def scanner_main_loop(app: Application, broadcast):
     log.info("Swing Strategy Engine loop starting…")
