@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Production Ready (v2.1 - timeframe fix)
+Version: 2025-08-02 — Production Ready (v2.2 - indicator name fix)
 """
 
 import asyncio
@@ -23,7 +23,6 @@ log = logging.getLogger("swing_bot_engine")
 # CONFIGURATION
 # ===========================================================================
 class CONFIG:
-    # ИСПРАВЛЕНО: Возвращен корректный таймфрейм для MEXC
     TIMEFRAME = "1h"
     POSITION_SIZE_USDT = 10.0
     LEVERAGE = 20
@@ -35,8 +34,8 @@ class CONFIG:
     STOCH_RSI_PERIOD = 14
     STOCH_RSI_K = 3
     STOCH_RSI_D = 3
-    STOCH_RSI_OVERBOUGHT = 70
-    STOCH_RSI_OVERSOLD = 30
+    STOCH_RSI_OVERBOUGHT = 80
+    STOCH_RSI_OVERSOLD = 20
     STOP_LOSS_PCT = 1.0
     TAKE_PROFIT_PCT = 3.0
     SCANNER_INTERVAL_SECONDS = 600
@@ -93,10 +92,11 @@ def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
     ema_fast = f"EMA_{CONFIG.EMA_FAST_PERIOD}"
     ema_slow = f"EMA_{CONFIG.EMA_SLOW_PERIOD}"
     ema_trend = f"EMA_{CONFIG.EMA_TREND_PERIOD}"
-    stoch_k = f"STOCHRSIk_{CONFIG.STOCH_RSI_PERIOD}_{CONFIG.STOCH_RSI_K}_{CONFIG.STOCH_RSI_D}"
-
-    if stoch_k not in df.columns:
-        return None, {"Reason_For_Fail": "No StochRSI data"}
+    
+    # ИСПРАВЛЕНО: Динамический поиск имени колонки StochRSI
+    stoch_k = next((c for c in df.columns if c.startswith("STOCHRSIk_")), None)
+    if not stoch_k:
+        return None, {"Reason_For_Fail": "No StochRSI column found"}
     
     last = df.iloc[-1]
     
