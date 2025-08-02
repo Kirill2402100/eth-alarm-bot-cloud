@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Production Ready (v2.9 - ATR fix)
+Version: 2025-08-02 — Production Ready (v3.0 - cooldown fix)
 """
 
 import asyncio
@@ -48,8 +48,18 @@ class CONFIG:
     OHLCV_LIMIT = 250
 
 # ===========================================================================
-# RISK MANAGEMENT
+# HELPERS & RISK MANAGEMENT
 # ===========================================================================
+
+def tf_seconds(tf: str) -> int:
+    """Конвертирует строку таймфрейма в секунды."""
+    unit = tf[-1].lower()
+    n = int(tf[:-1])
+    if unit == "m": return n * 60
+    if unit == "h": return n * 3600
+    if unit == "d": return n * 86400
+    return 0
+
 def calculate_sl_tp(entry_price: float, side: str) -> tuple[float, float]:
     """Рассчитывает уровни Stop Loss и Take Profit."""
     if side == "LONG":
@@ -156,8 +166,9 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     for i, ohlcv in enumerate(ohlcv_results):
         symbol = volatile_pairs[i]
         try:
+            # ИСПРАВЛЕНО: Фильтр "карантина" теперь использует таймфрейм
             cool = app.bot_data.get("loss_cooldown", {}).get(symbol)
-            if cool and time.time() - cool < CONFIG.SCANNER_INTERVAL_SECONDS * 2:
+            if cool and time.time() - cool < tf_seconds(CONFIG.TIMEFRAME) * 2:
                 continue
 
             if isinstance(ohlcv, Exception) or not ohlcv or len(ohlcv) < 50:
@@ -179,7 +190,6 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             df.ta.ema(length=CONFIG.EMA_TREND_PERIOD, append=True)
             df.ta.stochrsi(length=CONFIG.STOCH_RSI_PERIOD, k=CONFIG.STOCH_RSI_K, d=CONFIG.STOCH_RSI_D, append=True)
             
-            # ИСПРАВЛЕНО: Динамический поиск ATR и фильтр "шипов"
             df.ta.atr(length=CONFIG.ATR_PERIOD, append=True)
             atr_col = next((c for c in df.columns if c.startswith("ATR") and c.endswith(str(CONFIG.ATR_PERIOD))), None)
             if not atr_col:
