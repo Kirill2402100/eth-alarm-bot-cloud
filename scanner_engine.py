@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Production Ready (v2.5 - final debug)
+Version: 2025-08-02 — Production Ready (v2.5 - advanced logic)
 """
 
 import asyncio
@@ -87,35 +87,52 @@ async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
         return []
 
 def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
+    """Проверяет условия 'тройного триггера' и возвращает результат и диагностику."""
     if df.empty: return None, {}
 
+    # --- Подготовка колонок ---
     ema_fast = f"EMA_{CONFIG.EMA_FAST_PERIOD}"
     ema_slow = f"EMA_{CONFIG.EMA_SLOW_PERIOD}"
     ema_trend = f"EMA_{CONFIG.EMA_TREND_PERIOD}"
+
     stoch_k = next((c for c in df.columns if c.startswith("STOCHRSIk_")), None)
     if not stoch_k:
-        return None, {"Reason_For_Fail": "No StochRSI column found"}
-    
-    last = df.iloc[-1]
-    
-    long_ema_ok = last[ema_fast] > last[ema_slow]
-    long_trend_ok = last['close'] > last[ema_trend]
-    long_stoch_ok = last[stoch_k] < CONFIG.STOCH_RSI_OVERSOLD
-    long_passed_count = sum([long_ema_ok, long_trend_ok, long_stoch_ok])
+        return None, {"Reason_For_Fail": "No StochRSI column"}
 
+    stoch_d = stoch_k.replace("k_", "d_")
+
+    last = df.iloc[-1]
+    k_prev, k_now = df[stoch_k].iloc[-2:]
+    d_prev, d_now = df[stoch_d].iloc[-2:]
+
+    # --- EMA и тренд ---
+    long_ema_ok = last[ema_fast] > last[ema_slow]
+    short_ema_ok = last[ema_fast] < last[ema_slow]
+
+    hist_ok = len(df) >= (CONFIG.EMA_TREND_PERIOD + CONFIG.STOCH_RSI_PERIOD * 2)
+    if not hist_ok:
+        long_trend_ok = short_trend_ok = True  # Снимаем ограничение
+    else:
+        long_trend_ok = last['close'] > last[ema_trend]
+        short_trend_ok = last['close'] < last[ema_trend]
+
+    # --- StochRSI кроссы ---
+    long_stoch_ok = (k_prev < d_prev) and (k_now > d_now) and (k_now < CONFIG.STOCH_RSI_OVERSOLD)
+    short_stoch_ok = (k_prev > d_prev) and (k_now < d_now) and (k_now > CONFIG.STOCH_RSI_OVERBOUGHT)
+
+    # --- Оцениваем LONG-сценарий ---
+    long_passed_count = sum([long_ema_ok, long_trend_ok, long_stoch_ok])
     if long_passed_count == 3:
         diagnosis = {"Side": "LONG", "EMA_State_OK": True, "Trend_OK": True, "Stoch_OK": True, "Reason_For_Fail": "ALL_OK"}
         return "LONG", diagnosis
 
-    short_ema_ok = last[ema_fast] < last[ema_slow]
-    short_trend_ok = last['close'] < last[ema_trend]
-    short_stoch_ok = last[stoch_k] > CONFIG.STOCH_RSI_OVERBOUGHT
+    # --- Оцениваем SHORT-сценарий ---
     short_passed_count = sum([short_ema_ok, short_trend_ok, short_stoch_ok])
-
     if short_passed_count == 3:
         diagnosis = {"Side": "SHORT", "EMA_State_OK": True, "Trend_OK": True, "Stoch_OK": True, "Reason_For_Fail": "ALL_OK"}
         return "SHORT", diagnosis
 
+    # --- Проверяем, нужно ли логировать для диагностики ---
     if long_passed_count >= 1 or short_passed_count >= 1:
         if long_passed_count >= short_passed_count:
             failed = [name for name, ok in [("Trend", long_trend_ok), ("StochRSI", long_stoch_ok), ("EMA_State", long_ema_ok)] if not ok]
@@ -173,10 +190,11 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             side, diagnosis = check_entry_conditions(df)
             
             if side:
+                # ИСПРАВЛЕНО: Пропускаем, если позиция по этой паре уже открыта
+                if any(t["Pair"] == symbol for t in bot_data.get("active_trades", [])):
+                    continue
                 await open_new_trade(symbol, side, df.iloc[-1]['close'], app)
             elif diagnosis:
-                # ИЗМЕНЕНО: Добавлен отладочный лог перед записью в таблицу
-                log.info(f"DIAG→ {diagnosis}")
                 diagnosis.update({ "Pair": symbol, "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')})
                 await log_diagnostic_entry(diagnosis)
         except Exception as e:
