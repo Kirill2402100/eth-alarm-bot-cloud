@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Production Ready (v3.4 - final logic refinement)
+Version: 2025-08-02 — Production Ready (v3.5 - Dynamic ATR Stop)
 """
 
 import asyncio
@@ -41,8 +41,11 @@ class CONFIG:
     ATR_PERIOD = 14
     ATR_SPIKE_MULT = 2.5
     ATR_COOLDOWN_BARS = 2
-    STOP_LOSS_PCT = 1.0
-    TAKE_PROFIT_PCT = 3.0
+    # ИСПРАВЛЕНО: Новые параметры для ATR-стопа
+    ATR_SL_MULT = 1.8
+    RISK_REWARD = 2
+    SL_MIN_PCT = 1.0
+    SL_MAX_PCT = 5.0
     SCANNER_INTERVAL_SECONDS = 600
     TICK_MONITOR_INTERVAL_SECONDS = 2
     OHLCV_LIMIT = 250
@@ -60,15 +63,18 @@ def tf_seconds(tf: str) -> int:
     if unit == "d": return n * 86400
     return 0
 
-def calculate_sl_tp(entry_price: float, side: str) -> tuple[float, float]:
-    """Рассчитывает уровни Stop Loss и Take Profit."""
+def atr_based_levels(entry: float, atr: float, side: str) -> tuple[float, float, float]:
+    """Возвращает (sl_price, tp_price, sl_pct) на основе ATR."""
+    sl_pct = CONFIG.ATR_SL_MULT * atr / entry * 100
+    sl_pct = min(max(sl_pct, CONFIG.SL_MIN_PCT), CONFIG.SL_MAX_PCT)
+
     if side == "LONG":
-        sl_price = entry_price * (1 - CONFIG.STOP_LOSS_PCT / 100)
-        tp_price = entry_price * (1 + CONFIG.TAKE_PROFIT_PCT / 100)
+        sl_price = entry * (1 - sl_pct / 100)
+        tp_price = entry * (1 + sl_pct * CONFIG.RISK_REWARD / 100)
     else:  # SHORT
-        sl_price = entry_price * (1 + CONFIG.STOP_LOSS_PCT / 100)
-        tp_price = entry_price * (1 - CONFIG.TAKE_PROFIT_PCT / 100)
-    return sl_price, tp_price
+        sl_price = entry * (1 + sl_pct / 100)
+        tp_price = entry * (1 - sl_pct * CONFIG.RISK_REWARD / 100)
+    return sl_price, tp_price, sl_pct
 
 # ===========================================================================
 # MARKET SCANNER
@@ -118,7 +124,6 @@ def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
         long_trend_ok = last['close'] > ema_trend_val * buf
         short_trend_ok = last['close'] < ema_trend_val / buf
 
-    # ИСПРАВЛЕНО: Триггер по пересечению средней линии StochRSI
     k_now = last[stoch_k]
     k_prev = df[stoch_k].iloc[-2]
     long_stoch_ok = k_prev < CONFIG.STOCH_RSI_MID <= k_now
@@ -173,8 +178,7 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
                 continue
 
             if isinstance(ohlcv, Exception) or not ohlcv or len(ohlcv) < 50:
-                if isinstance(ohlcv, Exception):
-                    log.warning(f"Could not fetch OHLCV for {symbol}: {ohlcv}")
+                if isinstance(ohlcv, Exception): log.warning(f"Could not fetch OHLCV for {symbol}: {ohlcv}")
                 continue
             
             if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
@@ -183,22 +187,19 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
-            # ИСПРАВЛЕНО: Отбрасываем текущую, не до конца сформированную свечу
             tf_ms = tf_seconds(CONFIG.TIMEFRAME) * 1000
             if time.time() * 1000 - df['timestamp'].iloc[-1] < tf_ms:
                 df = df.iloc[:-1]
-            if len(df) < CONFIG.EMA_TREND_PERIOD:
-                continue
+            if len(df) < CONFIG.EMA_TREND_PERIOD: continue
 
-            if not df.empty and df.iloc[-1]['close'] < CONFIG.MIN_PRICE:
-                continue
+            if not df.empty and df.iloc[-1]['close'] < CONFIG.MIN_PRICE: continue
 
             df.ta.ema(length=CONFIG.EMA_FAST_PERIOD, append=True)
             df.ta.ema(length=CONFIG.EMA_SLOW_PERIOD, append=True)
             df.ta.ema(length=CONFIG.EMA_TREND_PERIOD, append=True)
             df.ta.stochrsi(length=CONFIG.STOCH_RSI_PERIOD, k=CONFIG.STOCH_RSI_K, d=CONFIG.STOCH_RSI_D, append=True)
-            
             df.ta.atr(length=CONFIG.ATR_PERIOD, append=True)
+
             atr_col = next((c for c in df.columns if c.startswith("ATR") and c.endswith(str(CONFIG.ATR_PERIOD))), None)
             if not atr_col:
                 log.warning(f"{symbol}: ATR column not found, skipping spike filter.")
@@ -211,9 +212,9 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             side, diagnosis = check_entry_conditions(df.copy())
             
             if side:
-                if any(t["Pair"] == symbol for t in bot_data.get("active_trades", [])):
-                    continue
-                await open_new_trade(symbol, side, df.iloc[-1]['close'], app)
+                if any(t["Pair"] == symbol for t in bot_data.get("active_trades", [])): continue
+                atr_last = df[atr_col].iloc[-1] if atr_col else 0
+                await open_new_trade(symbol, side, df.iloc[-1]['close'], atr_last, app)
             elif diagnosis:
                 diagnosis.update({ "Pair": symbol, "Timestamp_UTC": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')})
                 await log_diagnostic_entry(diagnosis)
@@ -223,20 +224,25 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
 # ===========================================================================
 # TRADE MANAGER
 # ===========================================================================
-async def open_new_trade(symbol: str, side: str, entry_price: float, app: Application):
+async def open_new_trade(symbol: str, side: str, entry_price: float, atr_last: float, app: Application):
     bot_data = app.bot_data
-    sl_price, tp_price = calculate_sl_tp(entry_price, side)
+    sl_price, tp_price, sl_pct = atr_based_levels(entry_price, atr_last, side)
+    tp_pct = sl_pct * CONFIG.RISK_REWARD
+
     trade = {
         "Signal_ID": f"{symbol}_{int(time.time())}", "Pair": symbol, "Side": side,
         "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": tp_price,
         "Status": "ACTIVE", "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "sl_pct": sl_pct, "tp_pct": tp_pct # Сохраняем для отчётности
     }
+    
     bot_data.setdefault("active_trades", []).append(trade)
     log.info(f"New trade signal: {trade}")
+    
     broadcast = app.bot_data.get('broadcast_func')
     if broadcast:
-        sl_disp = int(CONFIG.STOP_LOSS_PCT * CONFIG.LEVERAGE)
-        tp_disp = int(CONFIG.TAKE_PROFIT_PCT * CONFIG.LEVERAGE)
+        sl_disp = round(sl_pct * CONFIG.LEVERAGE)
+        tp_disp = round(tp_pct * CONFIG.LEVERAGE)
         msg = (f"🔥 <b>НОВЫЙ СИГНАЛ ({side})</b>\n\n"
                f"<b>Пара:</b> {symbol}\n<b>Вход:</b> <code>{entry_price:.4f}</code>\n"
                f"<b>SL:</b> <code>{sl_price:.4f}</code> (-{sl_disp}%)\n"
@@ -258,8 +264,7 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
 
     trades_to_close = []
     for trade in active_trades:
-        if trade['Pair'] not in tickers or tickers[trade['Pair']].get('last') is None:
-            continue
+        if trade['Pair'] not in tickers or tickers[trade['Pair']].get('last') is None: continue
             
         ticker_data = tickers[trade['Pair']]
         if trade['Side'] == 'LONG':
@@ -281,13 +286,14 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
     if trades_to_close:
         broadcast = app.bot_data.get('broadcast_func')
         for trade, reason, exit_price in trades_to_close:
+            # ИСПРАВЛЕНО: Расчёт PnL теперь использует сохранённые % и фиксирован для SL/TP
             if reason == "STOP_LOSS":
-                pnl_display = -CONFIG.STOP_LOSS_PCT * CONFIG.LEVERAGE
+                pnl_display = -trade['sl_pct'] * CONFIG.LEVERAGE
             elif reason == "TAKE_PROFIT":
-                pnl_display = CONFIG.TAKE_PROFIT_PCT * CONFIG.LEVERAGE
-            else:
-                pnl_pct = ((exit_price - trade['Entry_Price']) / trade['Entry_Price']) * (1 if trade['Side'] == "LONG" else -1)
-                pnl_display = pnl_pct * 100 * CONFIG.LEVERAGE
+                pnl_display = trade['tp_pct'] * CONFIG.LEVERAGE
+            else: # Резервный расчёт для других причин (например, ручное закрытие)
+                pnl_pct_raw = ((exit_price - trade['Entry_Price']) / trade['Entry_Price']) * (1 if trade['Side'] == "LONG" else -1)
+                pnl_display = pnl_pct_raw * 100 * CONFIG.LEVERAGE
             
             pnl_usd = CONFIG.POSITION_SIZE_USDT * pnl_display / 100
             app.bot_data.setdefault("trade_cooldown", {})[trade['Pair']] = time.time()
