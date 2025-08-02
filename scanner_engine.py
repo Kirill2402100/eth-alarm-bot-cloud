@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Swing-Trading Bot (MEXC Perpetuals, 1-hour)
-Version: 2025-08-02 — Production Ready (v2.0)
+Version: 2025-08-02 — Production Ready (v2.1 - timeframe fix)
 """
 
 import asyncio
@@ -23,7 +23,8 @@ log = logging.getLogger("swing_bot_engine")
 # CONFIGURATION
 # ===========================================================================
 class CONFIG:
-    TIMEFRAME = "60m"
+    # ИСПРАВЛЕНО: Возвращен корректный таймфрейм для MEXC
+    TIMEFRAME = "1h"
     POSITION_SIZE_USDT = 10.0
     LEVERAGE = 20
     MAX_CONCURRENT_POSITIONS = 10
@@ -34,14 +35,12 @@ class CONFIG:
     STOCH_RSI_PERIOD = 14
     STOCH_RSI_K = 3
     STOCH_RSI_D = 3
-    # ИСПРАВЛЕНО: Пороги для шкалы 0-100
     STOCH_RSI_OVERBOUGHT = 80
     STOCH_RSI_OVERSOLD = 20
     STOP_LOSS_PCT = 1.0
     TAKE_PROFIT_PCT = 3.0
     SCANNER_INTERVAL_SECONDS = 600
     TICK_MONITOR_INTERVAL_SECONDS = 5
-    # ИСПРАВЛЕНО: Увеличен лимит для OHLCV
     OHLCV_LIMIT = 250
 
 # ===========================================================================
@@ -74,7 +73,6 @@ async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
 
             market = exchange.market(symbol)
             if market.get('type') == 'swap' and market.get('quote') == 'USDT':
-                # ИСПРАВЛЕНО: Резервный расчёт волатильности
                 vol = data.get('percentage')
                 if vol is None and data.get('open') and data.get('last') and data['open'] > 0:
                     vol = abs(data['last'] - data['open']) / data['open'] * 100
@@ -145,7 +143,6 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     volatile_pairs = await filter_volatile_pairs(exchange)
     if not volatile_pairs: return
 
-    # ИСПРАВЛЕНО: Добавлен семафор для контроля параллельных запросов
     sem = asyncio.Semaphore(8)
     async def safe_fetch_ohlcv(symbol):
         async with sem:
