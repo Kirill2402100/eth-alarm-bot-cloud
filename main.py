@@ -11,7 +11,7 @@ import scanner_engine
 import trade_executor
 
 # --- Конфигурация ---
-BOT_VERSION = "SwingBot-1.2"
+BOT_VERSION = "SwingBot-1.3"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 # Переменные для Google Sheets
 SHEET_ID = os.getenv("SHEET_ID")
@@ -40,7 +40,6 @@ def setup_sheets():
         headers_trade = ["Signal_ID", "Timestamp_UTC", "Pair", "Side", "Status", "Entry_Price", "Exit_Price", "Exit_Time_UTC", "Exit_Reason", "PNL_USD", "PNL_Percent"]
         try:
             worksheet_trade = ss.worksheet(trade_sheet_name)
-            # Обновляем заголовки, если они не соответствуют
             if worksheet_trade.row_values(1) != headers_trade:
                 worksheet_trade.clear()
                 worksheet_trade.append_row(headers_trade)
@@ -79,6 +78,7 @@ async def post_init(app: Application):
         log.info("Обнаружен флаг 'run_loop_on_startup'. Запускаю основной цикл.")
         asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
     
+    # ИСПРАВЛЕНО: Убраны неиспользуемые команды
     await app.bot.set_my_commands([
         ('start', 'Запустить/перезапустить бота'),
         ('run', 'Запустить сканер'),
@@ -133,17 +133,17 @@ async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     is_running = not (bot_data.get('main_loop_task') is None or bot_data['main_loop_task'].done())
     active_trades = bot_data.get('active_trades', [])
     
-    # ИСПРАВЛЕНИЕ: Берем данные из конфига движка для точности
+    # ИСПРАВЛЕНО: Отображение актуальных параметров ATR-стратегии
     cfg = scanner_engine.CONFIG
     
     msg = (f"<b>Состояние бота v{BOT_VERSION}</b>\n\n"
            f"<b>Основной цикл:</b> {'⚡️ RUNNING' if is_running else '🔌 STOPPED'}\n"
            f"<b>Активных сделок:</b> {len(active_trades)} / {cfg.MAX_CONCURRENT_POSITIONS}\n\n"
            f"<b><u>Параметры стратегии:</u></b>\n"
-           f"<b>Размер позиции:</b> ${cfg.POSITION_SIZE_USDT}\n"
+           f"<b>Таймфрейм:</b> {cfg.TIMEFRAME}\n"
            f"<b>Плечо:</b> x{cfg.LEVERAGE}\n"
-           f"<b>SL/TP:</b> {cfg.STOP_LOSS_PCT}% / {cfg.TAKE_PROFIT_PCT}%\n"
-           f"<b>Интервал сканера:</b> {cfg.SCANNER_INTERVAL_SECONDS // 60} мин.")
+           f"<b>SL:</b> {cfg.ATR_SL_MULT} × ATR (мин {cfg.SL_MIN_PCT}%, макс {cfg.SL_MAX_PCT}%)\n"
+           f"<b>RR:</b> 1:{cfg.RISK_REWARD}")
            
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
