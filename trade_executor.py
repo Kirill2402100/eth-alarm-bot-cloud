@@ -3,99 +3,98 @@
 import logging
 from datetime import datetime
 import numpy as np
+from typing import List, Dict
 
 log = logging.getLogger("bot")
 
+# --- Клиент для лога сделок ---
 TRADE_LOG_WS = None
-DIAGNOSTIC_LOG_WS = None
 
 # --- Кеш для заголовков ---
 TRADING_HEADERS_CACHE = None
-DIAGNOSTIC_HEADERS_CACHE = None
 
-# ===========================================================================
-# HELPER FUNCTIONS
-# ===========================================================================
+# --- Буфер для пакетной записи ---
+PENDING_TRADES: List[List] = []
 
 def _get_cached_headers(ws, cache_key):
     """Читает заголовки из кеша или запрашивает их, если кеш пуст."""
-    global TRADING_HEADERS_CACHE, DIAGNOSTIC_HEADERS_CACHE
-    
-    cache = TRADING_HEADERS_CACHE if cache_key == 'trading' else DIAGNOSTIC_HEADERS_CACHE
-    
-    if cache is None:
-        log.info(f"Headers for '{cache_key}' not cached. Fetching from Google Sheets...")
-        cache = ws.row_values(1)
-        if cache_key == 'trading':
-            TRADING_HEADERS_CACHE = cache
-        else:
-            DIAGNOSTIC_HEADERS_CACHE = cache
-    return cache
+    global TRADING_HEADERS_CACHE
+    if TRADING_HEADERS_CACHE is None:
+        log.info(f"Headers for 'trading' not cached. Fetching from Google Sheets...")
+        TRADING_HEADERS_CACHE = ws.row_values(1)
+    return TRADING_HEADERS_CACHE
 
 def _make_serializable(value):
     """Приводит значение к типу, который поддерживается JSON."""
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, (datetime,)):
-        return value.strftime('%Y-%m-%d %H:%M:%S')
-    if isinstance(value, bool):
-        return str(value).upper()
+    if isinstance(value, np.generic): return value.item()
+    if isinstance(value, datetime): return value.strftime('%Y-%m-%d %H:%M:%S')
+    if isinstance(value, bool): return str(value).upper()
     return value
 
 def _prepare_row(headers: list, data: dict) -> list:
     """Подготавливает строку данных для записи в Google Sheets."""
     return [_make_serializable(data.get(h, '')) for h in headers]
 
-# ===========================================================================
-# LOGGING FUNCTIONS
-# ===========================================================================
-
-async def log_open_trade(trade_data):
+async def log_open_trade(trade_data: Dict):
+    """ДОБАВЛЯЕТ сделку в буфер для последующей пакетной записи."""
     if not TRADE_LOG_WS: return
     try:
-        headers = _get_cached_headers(TRADE_LOG_WS, 'trading') # Используем кеш
+        headers = _get_cached_headers(TRADE_LOG_WS, 'trading')
         trade_data.update({
             "Exit_Price": "", "Exit_Time_UTC": "", "Exit_Reason": "",
             "PNL_USD": "", "PNL_Percent": ""
         })
         row_to_insert = _prepare_row(headers, trade_data)
-        TRADE_LOG_WS.append_row(row_to_insert)
-        log.info(f"Signal {trade_data.get('Signal_ID')} logged to Trading_Log.")
+        PENDING_TRADES.append(row_to_insert)
+        log.info(f"Signal {trade_data.get('Signal_ID')} buffered for logging.")
     except Exception as e:
-        log.error(f"Error logging open trade: {e}", exc_info=True)
+        log.error(f"Error buffering open trade: {e}", exc_info=True)
 
 async def update_closed_trade(signal_id, status, exit_price, pnl_usd, pnl_percent, exit_reason):
+    """Обновляет закрытую сделку ОДНИМ пакетным запросом."""
     if not TRADE_LOG_WS: return
     try:
         cell = TRADE_LOG_WS.find(signal_id)
         if not cell:
             log.error(f"Could not find trade {signal_id} to update.")
             return
-            
+
         row_index = cell.row
-        headers = _get_cached_headers(TRADE_LOG_WS, 'trading') # Используем кеш
+        headers = _get_cached_headers(TRADE_LOG_WS, 'trading')
         
-        updates = {
+        updates_data = {
             "Status": status, "Exit_Time_UTC": datetime.now(), "Exit_Price": exit_price,
             "PNL_USD": f"{pnl_usd:.2f}", "PNL_Percent": f"{pnl_percent:.2f}%", "Exit_Reason": exit_reason
         }
         
-        for key, value in updates.items():
+        batch_updates = []
+        for key, value in updates_data.items():
             if key in headers:
                 col_index = headers.index(key) + 1
                 sanitized_value = _make_serializable(value)
-                TRADE_LOG_WS.update_cell(row_index, col_index, sanitized_value)
+                batch_updates.append({
+                    'range': f"{chr(ord('A') + col_index - 1)}{row_index}",
+                    'values': [[sanitized_value]],
+                })
         
-        log.info(f"Trade {signal_id} updated in Trading_Log with status {status}.")
+        if batch_updates:
+            TRADE_LOG_WS.batch_update(batch_updates)
+            log.info(f"Trade {signal_id} updated in Trading_Log with status {status}.")
+
     except Exception as e:
         log.error(f"Error updating closed trade {signal_id}: {e}", exc_info=True)
 
-async def log_diagnostic_entry(data):
-    if not DIAGNOSTIC_LOG_WS: return
-    try:
-        headers = _get_cached_headers(DIAGNOSTIC_LOG_WS, 'diagnostic') # Используем кеш
-        row_to_insert = _prepare_row(headers, data)
-        DIAGNOSTIC_LOG_WS.append_row(row_to_insert)
-        log.info(f"Diagnostic entry for {data.get('Pair')} logged.")
-    except Exception as e:
-        log.error(f"Error logging diagnostic entry: {e}", exc_info=True)
+async def log_diagnostic_entry(data: Dict):
+    """Функция отключена."""
+    pass
+
+async def flush_log_buffers():
+    """Отправляет накопленные логи сделок в Google Sheets."""
+    global PENDING_TRADES
+    if PENDING_TRADES:
+        try:
+            log.info(f"Flushing {len(PENDING_TRADES)} trade(s) to Google Sheets...")
+            TRADE_LOG_WS.append_rows(PENDING_TRADES, value_input_option='USER_ENTERED')
+            PENDING_TRADES = []
+        except Exception as e:
+            log.error(f"Error flushing trade logs: {e}", exc_info=True)
