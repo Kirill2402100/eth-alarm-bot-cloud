@@ -13,11 +13,9 @@ from telegram.ext import Application
 
 from trade_executor import log_open_trade, update_closed_trade, log_diagnostic_entry, flush_log_buffers
 
+# ... остальная часть файла без изменений ...
 log = logging.getLogger("swing_bot_engine")
 
-# ===========================================================================
-# CONFIGURATION
-# ===========================================================================
 class CONFIG:
     TIMEFRAME = "15m"
     POSITION_SIZE_USDT = 10.0
@@ -43,12 +41,8 @@ class CONFIG:
     SL_MAX_PCT = 5.0
     SCANNER_INTERVAL_SECONDS = 300
     TICK_MONITOR_INTERVAL_SECONDS = 10
-    OHLCV_LIMIT = 250 # ИЗМЕНЕНО: Уменьшен лимит для оптимизации
+    OHLCV_LIMIT = 250
 
-# ===========================================================================
-# HELPERS & RISK MANAGEMENT
-# ===========================================================================
-# ... функции tf_seconds и atr_based_levels без изменений ...
 def tf_seconds(tf: str) -> int:
     unit = tf[-1].lower(); n = int(tf[:-1])
     if unit == "m": return n * 60
@@ -67,10 +61,8 @@ def atr_based_levels(entry: float, atr: float, side: str) -> tuple[float, float,
         tp_price = entry * (1 - sl_pct * CONFIG.RISK_REWARD / 100)
     return sl_price, tp_price, sl_pct
 
-# ===========================================================================
-# MARKET SCANNER
-# ===========================================================================
-# ... функции filter_volatile_pairs, check_entry_conditions, find_trade_signals и open_new_trade без изменений ...
+# --- Функции filter_volatile_pairs, check_entry_conditions, find_trade_signals, open_new_trade без изменений ---
+
 async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
     log.info("Filtering pairs by daily volatility using fetch_tickers()...")
     try:
@@ -186,14 +178,12 @@ async def open_new_trade(symbol: str, side: str, entry_price: float, atr_last: f
 # TRADE MANAGER
 # ===========================================================================
 async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
-    """ИЗМЕНЕНО: Параллельный сбор данных и улучшенные проверки."""
     bot_data = app.bot_data
     active_trades = bot_data.get("active_trades", [])
     if not active_trades: return
 
     trades_to_close = []
     
-    # --- Шаг 1: Параллельный сбор OHLCV для всех активных сделок ---
     symbols = [t['Pair'] for t in active_trades]
     sem = asyncio.Semaphore(8)
     async def safe_fetch_ohlcv(symbol):
@@ -202,7 +192,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
     tasks = [safe_fetch_ohlcv(s) for s in symbols]
     ohlcv_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # --- Шаг 2: Обработка каждой сделки с её данными ---
     for i, trade in enumerate(active_trades):
         try:
             ohlcv = ohlcv_results[i]
@@ -211,10 +200,23 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                 continue
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df_indicators = df.iloc[:-1] if time.time() * 1000 - df['timestamp'].iloc[-1] < tf_seconds(CONFIG.TIMEFRAME) * 1000 else df
+
+            # --- НАЧАЛО ИЗМЕНЕНИЙ ---
+            # Считаем свечу достаточно "сформированной", если прошло 2/3 её времени
+            age_ms = time.time() * 1000 - df['timestamp'].iloc[-1]
+            tf_ms = tf_seconds(CONFIG.TIMEFRAME) * 1000
+            
+            # Используем .copy() для избежания SettingWithCopyWarning
+            if age_ms < tf_ms * (2/3):
+                df_indicators = df.iloc[:-1].copy() # Свеча слишком "молодая", игнорируем её
+            else:
+                df_indicators = df.copy() # Свеча достаточно сформирована, включаем в расчёт
+            # --- КОНЕЦ ИЗМЕНЕНИЙ ---
+
             if len(df_indicators) < CONFIG.EMA_TREND_PERIOD: continue
 
-            df_indicators.ta.ema(length=CONFIG.EMA_FAST_PERIOD, append=True); df_indicators.ta.ema(length=CONFIG.EMA_SLOW_PERIOD, append=True)
+            df_indicators.ta.ema(length=CONFIG.EMA_FAST_PERIOD, append=True)
+            df_indicators.ta.ema(length=CONFIG.EMA_SLOW_PERIOD, append=True)
             df_indicators.ta.ema(length=CONFIG.EMA_TREND_PERIOD, append=True)
             df_indicators.ta.stochrsi(length=CONFIG.STOCH_RSI_PERIOD, k=CONFIG.STOCH_RSI_K, d=CONFIG.STOCH_RSI_D, append=True)
 
@@ -223,9 +225,8 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
             exit_reason = None
             
             stoch_k_col = next((c for c in df_indicators.columns if c.startswith("STOCHRSIk_")), None)
-            if not stoch_k_col: continue # ИЗМЕНЕНО: Проверка на наличие StochRSI
+            if not stoch_k_col: continue
 
-            # Проверка основного SL/TP
             if trade['Side'] == 'LONG':
                 if current_price <= trade['SL_Price']: exit_reason = "STOP_LOSS"
                 elif current_price >= trade['TP_Price']: exit_reason = "TAKE_PROFIT"
@@ -233,7 +234,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                 if current_price >= trade['SL_Price']: exit_reason = "STOP_LOSS"
                 elif current_price <= trade['TP_Price']: exit_reason = "TAKE_PROFIT"
 
-            # Проверка мягких стопов (условия невалидности)
             if not exit_reason:
                 ema_fast = last[f"EMA_{CONFIG.EMA_FAST_PERIOD}"]; ema_slow = last[f"EMA_{CONFIG.EMA_SLOW_PERIOD}"]
                 ema_trend = last[f"EMA_{CONFIG.EMA_TREND_PERIOD}"]
@@ -258,7 +258,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
         except Exception as e:
             log.error(f"Error monitoring trade for {trade['Pair']}: {e}", exc_info=True)
 
-    # --- Шаг 3: Закрытие сделок ---
     if trades_to_close:
         broadcast = app.bot_data.get('broadcast_func')
         for trade, reason, exit_price in trades_to_close:
@@ -277,10 +276,7 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
         closed_ids = {t['Signal_ID'] for t, _, _ in trades_to_close}
         bot_data["active_trades"] = [t for t in active_trades if t['Signal_ID'] not in closed_ids]
 
-# ===========================================================================
-# MAIN LOOP
-# ===========================================================================
-# ... функция scanner_main_loop без изменений ...
+# --- функция scanner_main_loop без изменений ---
 async def scanner_main_loop(app: Application, broadcast):
     log.info("Scanner Engine loop starting…")
     app.bot_data.setdefault("active_trades", [])
