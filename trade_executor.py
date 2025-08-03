@@ -9,9 +9,28 @@ log = logging.getLogger("bot")
 TRADE_LOG_WS = None
 DIAGNOSTIC_LOG_WS = None
 
+# --- Кеш для заголовков ---
+TRADING_HEADERS_CACHE = None
+DIAGNOSTIC_HEADERS_CACHE = None
+
 # ===========================================================================
-# HELPER FUNCTIONS FOR DATA SANITIZATION
+# HELPER FUNCTIONS
 # ===========================================================================
+
+def _get_cached_headers(ws, cache_key):
+    """Читает заголовки из кеша или запрашивает их, если кеш пуст."""
+    global TRADING_HEADERS_CACHE, DIAGNOSTIC_HEADERS_CACHE
+    
+    cache = TRADING_HEADERS_CACHE if cache_key == 'trading' else DIAGNOSTIC_HEADERS_CACHE
+    
+    if cache is None:
+        log.info(f"Headers for '{cache_key}' not cached. Fetching from Google Sheets...")
+        cache = ws.row_values(1)
+        if cache_key == 'trading':
+            TRADING_HEADERS_CACHE = cache
+        else:
+            DIAGNOSTIC_HEADERS_CACHE = cache
+    return cache
 
 def _make_serializable(value):
     """Приводит значение к типу, который поддерживается JSON."""
@@ -34,7 +53,7 @@ def _prepare_row(headers: list, data: dict) -> list:
 async def log_open_trade(trade_data):
     if not TRADE_LOG_WS: return
     try:
-        headers = TRADE_LOG_WS.row_values(1)
+        headers = _get_cached_headers(TRADE_LOG_WS, 'trading') # Используем кеш
         trade_data.update({
             "Exit_Price": "", "Exit_Time_UTC": "", "Exit_Reason": "",
             "PNL_USD": "", "PNL_Percent": ""
@@ -54,15 +73,11 @@ async def update_closed_trade(signal_id, status, exit_price, pnl_usd, pnl_percen
             return
             
         row_index = cell.row
-        headers = TRADE_LOG_WS.row_values(1)
+        headers = _get_cached_headers(TRADE_LOG_WS, 'trading') # Используем кеш
         
         updates = {
-            "Status": status,
-            "Exit_Time_UTC": datetime.now(),
-            "Exit_Price": exit_price,
-            "PNL_USD": f"{pnl_usd:.2f}",
-            "PNL_Percent": f"{pnl_percent:.2f}%",
-            "Exit_Reason": exit_reason
+            "Status": status, "Exit_Time_UTC": datetime.now(), "Exit_Price": exit_price,
+            "PNL_USD": f"{pnl_usd:.2f}", "PNL_Percent": f"{pnl_percent:.2f}%", "Exit_Reason": exit_reason
         }
         
         for key, value in updates.items():
@@ -78,7 +93,7 @@ async def update_closed_trade(signal_id, status, exit_price, pnl_usd, pnl_percen
 async def log_diagnostic_entry(data):
     if not DIAGNOSTIC_LOG_WS: return
     try:
-        headers = DIAGNOSTIC_LOG_WS.row_values(1)
+        headers = _get_cached_headers(DIAGNOSTIC_LOG_WS, 'diagnostic') # Используем кеш
         row_to_insert = _prepare_row(headers, data)
         DIAGNOSTIC_LOG_WS.append_row(row_to_insert)
         log.info(f"Diagnostic entry for {data.get('Pair')} logged.")
