@@ -23,7 +23,7 @@ log = logging.getLogger("swing_bot_engine")
 # CONFIGURATION
 # ===========================================================================
 class CONFIG:
-    TIMEFRAME = "1h"
+    TIMEFRAME = "15m"
     POSITION_SIZE_USDT = 10.0
     LEVERAGE = 20
     MAX_CONCURRENT_POSITIONS = 10
@@ -46,9 +46,9 @@ class CONFIG:
     RISK_REWARD = 2
     SL_MIN_PCT = 1.0
     SL_MAX_PCT = 5.0
-    SCANNER_INTERVAL_SECONDS = 600
+    SCANNER_INTERVAL_SECONDS = 300
     TICK_MONITOR_INTERVAL_SECONDS = 2
-    OHLCV_LIMIT = 250
+    OHLCV_LIMIT = 1000
 
 # ===========================================================================
 # HELPERS & RISK MANAGEMENT
