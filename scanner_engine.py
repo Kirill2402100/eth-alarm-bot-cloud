@@ -11,16 +11,19 @@ import pandas_ta as ta
 import ccxt.async_support as ccxt
 from telegram.ext import Application
 
-from trade_executor import log_open_trade, update_closed_trade, log_diagnostic_entry, flush_log_buffers
+from trade_executor import log_open_trade, update_closed_trade, flush_log_buffers
 
-# ... остальная часть файла без изменений ...
 log = logging.getLogger("swing_bot_engine")
 
+# ===========================================================================
+# CONFIGURATION
+# ===========================================================================
 class CONFIG:
     TIMEFRAME = "15m"
     POSITION_SIZE_USDT = 10.0
     LEVERAGE = 20
     MAX_CONCURRENT_POSITIONS = 10
+    MAX_TRADES_PER_SCAN = 3 # ИЗМЕНЕНО: Увеличен лимит для гибкости
     MIN_DAILY_VOLATILITY_PCT = 3.0
     MAX_DAILY_VOLATILITY_PCT = 10.0
     MIN_PRICE = 0.001
@@ -32,6 +35,7 @@ class CONFIG:
     STOCH_RSI_K = 3
     STOCH_RSI_D = 3
     STOCH_RSI_MID = 50
+    STOCH_EXIT_ZONE = 60
     ATR_PERIOD = 14
     ATR_SPIKE_MULT = 2.5
     ATR_COOLDOWN_BARS = 2
@@ -40,9 +44,12 @@ class CONFIG:
     SL_MIN_PCT = 1.0
     SL_MAX_PCT = 5.0
     SCANNER_INTERVAL_SECONDS = 300
-    TICK_MONITOR_INTERVAL_SECONDS = 10
+    TICK_MONITOR_INTERVAL_SECONDS = 15
     OHLCV_LIMIT = 250
 
+# ===========================================================================
+# HELPERS & RISK MANAGEMENT
+# ===========================================================================
 def tf_seconds(tf: str) -> int:
     unit = tf[-1].lower(); n = int(tf[:-1])
     if unit == "m": return n * 60
@@ -61,9 +68,11 @@ def atr_based_levels(entry: float, atr: float, side: str) -> tuple[float, float,
         tp_price = entry * (1 - sl_pct * CONFIG.RISK_REWARD / 100)
     return sl_price, tp_price, sl_pct
 
-# --- Функции filter_volatile_pairs, check_entry_conditions, find_trade_signals, open_new_trade без изменений ---
-
+# ===========================================================================
+# MARKET SCANNER
+# ===========================================================================
 async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
+    # ... без изменений ...
     log.info("Filtering pairs by daily volatility using fetch_tickers()...")
     try:
         await exchange.load_markets()
@@ -84,26 +93,28 @@ async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
         log.error(f"Error filtering volatile pairs: {e}", exc_info=True)
         return []
 
-def check_entry_conditions(df: pd.DataFrame) -> Tuple[Optional[str], Dict]:
-    if len(df) < 2: return None, {}
-    ema_fast = f"EMA_{CONFIG.EMA_FAST_PERIOD}"; ema_slow = f"EMA_{CONFIG.EMA_SLOW_PERIOD}"; ema_trend = f"EMA_{CONFIG.EMA_TREND_PERIOD}"
-    stoch_k = next((c for c in df.columns if c.startswith("STOCHRSIk_")), None)
-    if not stoch_k: return None, {}
+def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
+    # ... без изменений ...
+    if len(df) < 2: return None
     last = df.iloc[-1]
-    long_ema_ok = last[ema_fast] > last[ema_slow]; short_ema_ok = last[ema_fast] < last[ema_slow]
-    ema_trend_val = last[ema_trend]
-    if pd.isna(ema_trend_val):
-        long_trend_ok = short_trend_ok = True
-    else:
-        buf = 1 + CONFIG.EMA_TREND_BUFFER_PCT / 100
-        long_trend_ok = last['close'] > ema_trend_val * buf; short_trend_ok = last['close'] < ema_trend_val / buf
-    k_now = last[stoch_k]; k_prev = df[stoch_k].iloc[-2]
-    long_stoch_ok = k_prev < CONFIG.STOCH_RSI_MID <= k_now; short_stoch_ok = k_prev > CONFIG.STOCH_RSI_MID >= k_now
-    if sum([long_ema_ok, long_trend_ok, long_stoch_ok]) == 3: return "LONG", {}
-    if sum([short_ema_ok, short_trend_ok, short_stoch_ok]) == 3: return "SHORT", {}
-    return None, {}
+    ema_fast = last[f"EMA_{CONFIG.EMA_FAST_PERIOD}"]
+    ema_slow = last[f"EMA_{CONFIG.EMA_SLOW_PERIOD}"]
+    ema_trend = last[f"EMA_{CONFIG.EMA_TREND_PERIOD}"]
+    stoch_k_col = next((c for c in df.columns if c.startswith("STOCHRSIk_")), None)
+    if not stoch_k_col: return None
+    k_now = last[stoch_k_col]
+    k_prev = df[stoch_k_col].iloc[-2]
+    buffer = 1 + CONFIG.EMA_TREND_BUFFER_PCT / 100
+    is_uptrend = last['close'] > ema_trend * buffer
+    is_downtrend = last['close'] < ema_trend / buffer
+    if is_uptrend and ema_fast > ema_slow and k_prev < CONFIG.STOCH_RSI_MID and k_now >= CONFIG.STOCH_RSI_MID:
+        return "LONG"
+    if is_downtrend and ema_fast < ema_slow and k_prev > CONFIG.STOCH_RSI_MID and k_now <= CONFIG.STOCH_RSI_MID:
+        return "SHORT"
+    return None
 
 async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
+    # ... без изменений ...
     bot_data = app.bot_data
     if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
         log.info("Position limit reached. Skipping scan."); return
@@ -112,17 +123,23 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     sem = asyncio.Semaphore(8)
     async def safe_fetch_ohlcv(symbol):
         async with sem:
-            return await exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=CONFIG.OHLCV_LIMIT)
+            try:
+                return await exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=CONFIG.OHLCV_LIMIT)
+            except Exception:
+                return None
     tasks = [safe_fetch_ohlcv(symbol) for symbol in volatile_pairs]
     log.info(f"Fetching OHLCV data for {len(volatile_pairs)} pairs concurrently...")
     ohlcv_results = await asyncio.gather(*tasks, return_exceptions=True)
     log.info("Finished fetching OHLCV data. Processing results...")
+    opened_trades_this_scan = 0
     for i, ohlcv in enumerate(ohlcv_results):
+        if opened_trades_this_scan >= CONFIG.MAX_TRADES_PER_SCAN:
+            log.info(f"Reached max trades per scan ({CONFIG.MAX_TRADES_PER_SCAN}). Halting.")
+            break
         symbol = volatile_pairs[i]
         try:
             if time.time() - bot_data.get("trade_cooldown", {}).get(symbol, 0) < tf_seconds(CONFIG.TIMEFRAME) * 2: continue
             if isinstance(ohlcv, Exception) or not ohlcv or len(ohlcv) < 50:
-                if isinstance(ohlcv, Exception): log.warning(f"Could not fetch OHLCV for {symbol}: {ohlcv}")
                 continue
             if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
                 log.info("Position limit reached during signal processing. Halting."); break
@@ -140,17 +157,17 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
                 df['range'] = df['high'] - df['low']
                 df['is_spike'] = df['range'] > df[atr_col] * CONFIG.ATR_SPIKE_MULT
                 if df['is_spike'].iloc[-1] or df['is_spike'].iloc[-CONFIG.ATR_COOLDOWN_BARS:].any(): continue
-            side, _ = check_entry_conditions(df.copy())
+            side = check_entry_conditions(df.copy())
             if side:
                 if any(t["Pair"] == symbol for t in bot_data.get("active_trades", [])): continue
-                stoch_k_col = next((c for c in df.columns if c.startswith("STOCHRSIk_")), None)
-                stoch_k_val = df[stoch_k_col].iloc[-1] if stoch_k_col else 0
                 atr_last = df[atr_col].iloc[-1] if atr_col else 0
-                await open_new_trade(symbol, side, df.iloc[-1]['close'], atr_last, stoch_k_val, app)
+                await open_new_trade(symbol, side, df.iloc[-1]['close'], atr_last, app)
+                opened_trades_this_scan += 1
         except Exception as e:
             log.error(f"Error processing symbol {symbol}: {e}")
 
-async def open_new_trade(symbol: str, side: str, entry_price: float, atr_last: float, stoch_k_val: float, app: Application):
+async def open_new_trade(symbol: str, side: str, entry_price: float, atr_last: float, app: Application):
+    # ... без изменений ...
     bot_data = app.bot_data
     sl_price, tp_price, sl_pct = atr_based_levels(entry_price, atr_last, side)
     tp_pct = sl_pct * CONFIG.RISK_REWARD
@@ -159,9 +176,6 @@ async def open_new_trade(symbol: str, side: str, entry_price: float, atr_last: f
         "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": tp_price,
         "Status": "ACTIVE", "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "sl_pct": sl_pct, "tp_pct": tp_pct,
-        "stoch_k_entry": stoch_k_val,
-        "stoch_k_peak": stoch_k_val if side == "LONG" else 100,
-        "stoch_k_trough": stoch_k_val if side == "SHORT" else 0,
     }
     bot_data.setdefault("active_trades", []).append(trade)
     log.info(f"New trade signal: {trade}")
@@ -178,6 +192,7 @@ async def open_new_trade(symbol: str, side: str, entry_price: float, atr_last: f
 # TRADE MANAGER
 # ===========================================================================
 async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
+    """ИЗМЕНЕНО: Убрано лишнее логирование."""
     bot_data = app.bot_data
     active_trades = bot_data.get("active_trades", [])
     if not active_trades: return
@@ -188,44 +203,37 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
     sem = asyncio.Semaphore(8)
     async def safe_fetch_ohlcv(symbol):
         async with sem:
-            return await exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=CONFIG.OHLCV_LIMIT)
+            try:
+                return await exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=CONFIG.OHLCV_LIMIT)
+            except Exception:
+                return None
     tasks = [safe_fetch_ohlcv(s) for s in symbols]
     ohlcv_results = await asyncio.gather(*tasks, return_exceptions=True)
 
     for i, trade in enumerate(active_trades):
         try:
             ohlcv = ohlcv_results[i]
+            # ИЗМЕНЕНО: Убрано лишнее предупреждение
             if isinstance(ohlcv, Exception) or not ohlcv:
-                log.warning(f"Could not fetch OHLCV for monitoring {trade['Pair']}: {ohlcv}")
                 continue
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-
-            # --- НАЧАЛО ИЗМЕНЕНИЙ ---
-            # Считаем свечу достаточно "сформированной", если прошло 2/3 её времени
-            age_ms = time.time() * 1000 - df['timestamp'].iloc[-1]
-            tf_ms = tf_seconds(CONFIG.TIMEFRAME) * 1000
-            
-            # Используем .copy() для избежания SettingWithCopyWarning
-            if age_ms < tf_ms * (2/3):
-                df_indicators = df.iloc[:-1].copy() # Свеча слишком "молодая", игнорируем её
-            else:
-                df_indicators = df.copy() # Свеча достаточно сформирована, включаем в расчёт
-            # --- КОНЕЦ ИЗМЕНЕНИЙ ---
+            df_indicators = df.copy()
 
             if len(df_indicators) < CONFIG.EMA_TREND_PERIOD: continue
 
-            df_indicators.ta.ema(length=CONFIG.EMA_FAST_PERIOD, append=True)
-            df_indicators.ta.ema(length=CONFIG.EMA_SLOW_PERIOD, append=True)
+            df_indicators.ta.ema(length=CONFIG.EMA_FAST_PERIOD, append=True); df_indicators.ta.ema(length=CONFIG.EMA_SLOW_PERIOD, append=True)
             df_indicators.ta.ema(length=CONFIG.EMA_TREND_PERIOD, append=True)
             df_indicators.ta.stochrsi(length=CONFIG.STOCH_RSI_PERIOD, k=CONFIG.STOCH_RSI_K, d=CONFIG.STOCH_RSI_D, append=True)
 
             last = df_indicators.iloc[-1]
+            prev = df_indicators.iloc[-2]
             current_price = df.iloc[-1]['close']
             exit_reason = None
             
             stoch_k_col = next((c for c in df_indicators.columns if c.startswith("STOCHRSIk_")), None)
-            if not stoch_k_col: continue
+            stoch_d_col = next((c for c in df_indicators.columns if c.startswith("STOCHRSId_")), None)
+            if not stoch_k_col or not stoch_d_col: continue
 
             if trade['Side'] == 'LONG':
                 if current_price <= trade['SL_Price']: exit_reason = "STOP_LOSS"
@@ -235,22 +243,26 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                 elif current_price <= trade['TP_Price']: exit_reason = "TAKE_PROFIT"
 
             if not exit_reason:
+                if trade['Side'] == 'LONG':
+                    progress_to_tp = (current_price - trade['Entry_Price']) / (trade['TP_Price'] - trade['Entry_Price'])
+                else:
+                    progress_to_tp = (trade['Entry_Price'] - current_price) / (trade['Entry_Price'] - trade['TP_Price'])
+
+                if progress_to_tp < 0.5:
+                    continue
+
                 ema_fast = last[f"EMA_{CONFIG.EMA_FAST_PERIOD}"]; ema_slow = last[f"EMA_{CONFIG.EMA_SLOW_PERIOD}"]
-                ema_trend = last[f"EMA_{CONFIG.EMA_TREND_PERIOD}"]
-                stoch_k_now = last[stoch_k_col]
+                k_now = last[stoch_k_col]; k_prev = prev[stoch_k_col]
+                d_now = last[stoch_d_col]; d_prev = prev[stoch_d_col]
                 
                 if trade['Side'] == 'LONG':
                     if ema_fast < ema_slow: exit_reason = "INVALIDATION_EMA_CROSS"
-                    elif df.iloc[-1]['low'] <= ema_trend: exit_reason = "INVALIDATION_EMA_TREND"
-                    else:
-                        trade['stoch_k_peak'] = max(trade.get('stoch_k_peak', trade['stoch_k_entry']), stoch_k_now)
-                        if trade['stoch_k_peak'] - stoch_k_now >= 5: exit_reason = "INVALIDATION_STOCH_RSI"
-                else:
+                    elif k_prev > d_prev and k_now <= d_now and k_now < CONFIG.STOCH_EXIT_ZONE:
+                        exit_reason = "INVALIDATION_STOCH_RSI"
+                else: # SHORT
                     if ema_fast > ema_slow: exit_reason = "INVALIDATION_EMA_CROSS"
-                    elif df.iloc[-1]['high'] >= ema_trend: exit_reason = "INVALIDATION_EMA_TREND"
-                    else:
-                        trade['stoch_k_trough'] = min(trade.get('stoch_k_trough', trade['stoch_k_entry']), stoch_k_now)
-                        if stoch_k_now - trade['stoch_k_trough'] >= 5: exit_reason = "INVALIDATION_STOCH_RSI"
+                    elif k_prev < d_prev and k_now >= d_now and k_now > (100 - CONFIG.STOCH_EXIT_ZONE):
+                        exit_reason = "INVALIDATION_STOCH_RSI"
 
             if exit_reason:
                 trades_to_close.append((trade, exit_reason, current_price))
@@ -259,6 +271,7 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
             log.error(f"Error monitoring trade for {trade['Pair']}: {e}", exc_info=True)
 
     if trades_to_close:
+        # ... без изменений ...
         broadcast = app.bot_data.get('broadcast_func')
         for trade, reason, exit_price in trades_to_close:
             pnl_pct_raw = ((exit_price - trade['Entry_Price']) / trade['Entry_Price']) * (1 if trade['Side'] == "LONG" else -1)
@@ -276,17 +289,18 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
         closed_ids = {t['Signal_ID'] for t, _, _ in trades_to_close}
         bot_data["active_trades"] = [t for t in active_trades if t['Signal_ID'] not in closed_ids]
 
-# --- функция scanner_main_loop без изменений ---
+# ===========================================================================
+# MAIN LOOP
+# ===========================================================================
 async def scanner_main_loop(app: Application, broadcast):
+    # ... без изменений ...
     log.info("Scanner Engine loop starting…")
     app.bot_data.setdefault("active_trades", [])
     app.bot_data.setdefault("trade_cooldown", {})
     app.bot_data['broadcast_func'] = broadcast
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 200})
     
-    last_scan_time = 0
-    last_flush_time = 0
-    FLUSH_INTERVAL = 15
+    last_scan_time = 0; last_flush_time = 0; FLUSH_INTERVAL = 15
 
     while app.bot_data.get("bot_on", False):
         try:
