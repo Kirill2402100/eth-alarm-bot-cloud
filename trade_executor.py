@@ -13,11 +13,16 @@ TRADING_HEADERS_CACHE = None
 PENDING_TRADES: List[List] = []
 SAFE_CHAR = '⧗'
 
+# ===========================================================================
+# HELPER FUNCTIONS
+# ===========================================================================
+
 def safe_id(text: str) -> str:
+    """Заменяет небезопасные символы (':', '/') в ID для Google Sheets."""
     return text.replace(":", SAFE_CHAR).replace("/", SAFE_CHAR)
 
 def get_headers(worksheet: gspread.Worksheet):
-    """ИЗМЕНЕНО: Надежное чтение всех колонок."""
+    """Надежно читает все колонки из заголовка и кэширует их."""
     global TRADING_HEADERS_CACHE
     if TRADING_HEADERS_CACHE is None:
         log.info(f"Reading headers from worksheet '{worksheet.title}' for the first time...")
@@ -26,18 +31,21 @@ def get_headers(worksheet: gspread.Worksheet):
     return TRADING_HEADERS_CACHE
 
 def _prepare_row(headers: list, data: dict) -> list:
+    """Подготавливает строку данных, используя безопасный ID."""
     if 'Signal_ID' in data:
         data['Signal_ID'] = safe_id(data['Signal_ID'])
+    # Убедимся, что все поля из extra_fields присутствуют, даже если пустые
+    for key in ['MFE_Price', 'MFE_ATR', 'MFE_TP_Pct']:
+        data.setdefault(key, '')
     return [data.get(h, '') for h in headers]
+
+# ===========================================================================
+# LOGGING FUNCTIONS
+# ===========================================================================
 
 async def log_open_trade(trade_data: Dict):
     if not TRADE_LOG_WS: return
     try:
-        # При открытии сделки, MFE-поля могут быть не заданы, добавляем заглушки
-        trade_data.setdefault('MFE_Price', '')
-        trade_data.setdefault('MFE_ATR', '')
-        trade_data.setdefault('MFE_TP_Pct', '')
-
         headers = get_headers(TRADE_LOG_WS)
         row_to_insert = _prepare_row(headers, trade_data)
         PENDING_TRADES.append(row_to_insert)
@@ -62,6 +70,7 @@ async def update_closed_trade(
     signal_id: str, status: str, exit_price: float, 
     pnl_usd: float, pnl_display: float, reason: str, 
     extra_fields: Optional[Dict] = None):
+    """ИЗМЕНЕНО: Автоматически добавляет недостающие колонки в заголовок."""
     if not TRADE_LOG_WS: return
     try:
         headers = get_headers(TRADE_LOG_WS)
@@ -72,7 +81,6 @@ async def update_closed_trade(
         except gspread.CellNotFound:
             log.warning(f"Trade {id_clean} not found. Appending as a new closed row.")
             placeholder_row = [''] * len(headers)
-            # Убедимся, что колонка существует перед записью
             if 'Signal_ID' in headers:
                 placeholder_row[headers.index('Signal_ID')] = id_clean
             TRADE_LOG_WS.append_row(placeholder_row, value_input_option='USER_ENTERED')
@@ -91,13 +99,28 @@ async def update_closed_trade(
         }
         updated_row_dict.update(base_update)
         
+        # --- ИЗМЕНЕНО: Авто-добавление недостающих колонок ---
+        if extra_fields:
+            headers_updated = False
+            for key in extra_fields:
+                if key not in headers:
+                    headers.append(key)
+                    TRADE_LOG_WS.update_cell(1, len(headers), key)
+                    headers_updated = True
+            
+            # Обновляем кэш, если структура таблицы изменилась
+            if headers_updated:
+                global TRADING_HEADERS_CACHE
+                TRADING_HEADERS_CACHE = headers
+        # ----------------------------------------------------
+        
         if extra_fields:
             updated_row_dict.update(extra_fields)
 
         final_row_data = [updated_row_dict.get(h, '') for h in headers]
         
-        last_col_a1 = gspread.utils.rowcol_to_a1(row_idx, len(headers))
-        range_to_update = f"A{row_idx}:{last_col_a1}"
+        end_a1 = gspread.utils.rowcol_to_a1(row_idx, len(headers))
+        range_to_update = f"A{row_idx}:{end_a1}"
         
         TRADE_LOG_WS.update(range_to_update, [final_row_data])
         
