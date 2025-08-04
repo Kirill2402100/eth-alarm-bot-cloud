@@ -13,6 +13,7 @@ import pandas as pd
 import pandas_ta as ta
 import ccxt.async_support as ccxt
 from telegram.ext import Application
+import gspread # Добавлен импорт для gspread.WorksheetNotFound
 
 import trade_executor
 
@@ -21,6 +22,7 @@ log = logging.getLogger("swing_bot_engine")
 # ===========================================================================
 # CONFIGURATION
 # ===========================================================================
+# ... без изменений ...
 class CONFIG:
     MARKET_REGIME_FILTER = True
     MARKET_REGIME_CACHE_TTL_SECONDS = 1800
@@ -55,9 +57,32 @@ class CONFIG:
     CONCURRENCY_SEMAPHORE = 8
 
 # ===========================================================================
-# HELPERS
+# HELPERS & MARKET REGIME
 # ===========================================================================
-# ... без изменений ...
+async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
+    """ИЗМЕНЕНО: Создаёт лист 'Trading_Log_v2' с полной шапкой, если его ещё нет."""
+    title = "Trading_Log_v2"
+    try:
+        ws = gfile.worksheet(title)
+        log.info(f"Worksheet '{title}' already exists.")
+    except gspread.WorksheetNotFound:
+        log.warning(f"Worksheet '{title}' not found. Creating...")
+        ws = gfile.add_worksheet(title=title, rows=1000, cols=20)
+        headers = [
+            "Signal_ID", "Timestamp_UTC", "Pair", "Side", "Status",
+            "Entry_Price", "Exit_Price", "Exit_Time_UTC",
+            "Exit_Reason", "PNL_USD", "PNL_Percent",
+            "MFE_Price", "MFE_ATR", "MFE_TP_Pct"
+        ]
+        ws.append_row(headers, value_input_option="USER_ENTERED")
+        log.info(f"Worksheet '{title}' created with all required headers.")
+    
+    # Перенаправляем executor на новый/проверенный лист
+    trade_executor.TRADE_LOG_WS = ws
+    # Сбрасываем кэш, чтобы executor перечитал заголовки из правильного листа
+    trade_executor.TRADING_HEADERS_CACHE = None
+
+# ... остальные helpers без изменений ...
 def format_price(price: float) -> str:
     if price < 0.01: return f"{price:.6f}"
     elif price < 1.0: return f"{price:.5f}"
@@ -124,10 +149,10 @@ def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
     return None
 
 # ===========================================================================
-# MARKET SCANNER
+# MARKET SCANNER & TRADE MANAGER
 # ===========================================================================
+# ... функции find_trade_signals, open_new_trade, monitor_active_trades без изменений ...
 async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
-    # ... без изменений ...
     bot_data = app.bot_data
     if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
         log.info("Position limit reached. Skipping scan."); return
@@ -204,7 +229,6 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
         msg = (f"🔍 <b>SCAN ({CONFIG.TIMEFRAME})</b>\n\n"f"Найдено сигналов: LONG-<b>{len(long_candidates)}</b> | SHORT-<b>{len(short_candidates)}</b>\n"f"Открыто (лучшие по score): LONG-<b>{opened_long}</b> | SHORT-<b>{opened_short}</b>")
         if broadcast := app.bot_data.get('broadcast_func'):
             await broadcast(app, msg)
-
 async def open_new_trade(symbol: str, side: str, entry_price: float, atr_last: float, app: Application):
     bot_data = app.bot_data
     sl_price, tp_price, sl_pct = atr_based_levels(entry_price, atr_last, side)
@@ -217,7 +241,6 @@ async def open_new_trade(symbol: str, side: str, entry_price: float, atr_last: f
         msg = (f"🔥 <b>НОВЫЙ СИГНАЛ ({side})</b>\n\n"f"<b>Пара:</b> {symbol}\n<b>Вход:</b> <code>{format_price(entry_price)}</code>\n"f"<b>SL:</b> <code>{format_price(sl_price)}</code> (-{sl_disp}%)\n"f"<b>TP:</b> <code>{format_price(tp_price)}</code> (+{tp_disp}%)")
         await broadcast(app, msg)
     await trade_executor.log_open_trade(trade)
-
 async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
     bot_data = app.bot_data
     active_trades = bot_data.get("active_trades", [])
@@ -239,7 +262,7 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
             current_price = df.iloc[-1]['close']
             if trade['Side'] == 'LONG':
                 trade['MFE_Price'] = max(trade.get('MFE_Price', current_price), current_price)
-            else: # SHORT
+            else:
                 trade['MFE_Price'] = min(trade.get('MFE_Price', current_price), current_price)
             df_indicators = df.copy()
             if len(df_indicators) < CONFIG.EMA_TREND_PERIOD: continue
@@ -324,12 +347,17 @@ async def scanner_main_loop(app: Application, broadcast):
         creds = json.loads(creds_json)
         gc = gspread.service_account_from_dict(creds)
         sheet = gc.open_by_key(sheet_key)
-        trade_executor.TRADE_LOG_WS = sheet.worksheet("Trading_Log")
+        
+        # ИЗМЕНЕНО: Вызываем новую функцию для создания/проверки листа
+        await ensure_new_log_sheet(sheet)
+        
+        # Загружаем заголовки уже из нового, правильного листа
         trade_executor.get_headers(trade_executor.TRADE_LOG_WS)
         log.info("Google Sheets initialized successfully.")
     except Exception as e:
         log.critical(f"Could not initialize Google Sheets: {e}", exc_info=True)
         raise
+    
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 200})
     last_scan_time = 0; last_flush_time = 0; FLUSH_INTERVAL = 15
     while app.bot_data.get("bot_on", False):
