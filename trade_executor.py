@@ -16,22 +16,17 @@ SAFE_CHAR = '⧗'
 # ===========================================================================
 # HELPER FUNCTIONS
 # ===========================================================================
-
+# ... без изменений ...
 def safe_id(text: str) -> str:
-    """Заменяет небезопасные символы (':', '/') в ID для Google Sheets."""
     return text.replace(":", SAFE_CHAR).replace("/", SAFE_CHAR)
-
 def get_headers(worksheet: gspread.Worksheet):
-    """Надежно читает все колонки из заголовка и кэширует их."""
     global TRADING_HEADERS_CACHE
     if TRADING_HEADERS_CACHE is None:
         log.info(f"Reading headers from worksheet '{worksheet.title}' for the first time...")
         all_values = worksheet.get_all_values()
         TRADING_HEADERS_CACHE = all_values[0] if all_values else []
     return TRADING_HEADERS_CACHE
-
 def _prepare_row(headers: list, data: dict) -> list:
-    """Подготавливает строку данных, используя безопасный ID."""
     if 'Signal_ID' in data:
         data['Signal_ID'] = safe_id(data['Signal_ID'])
     return [data.get(h, '') for h in headers]
@@ -41,36 +36,15 @@ def _prepare_row(headers: list, data: dict) -> list:
 # ===========================================================================
 
 async def log_open_trade(trade_data: Dict):
-    """ИЗМЕНЕНО: Автоматически добавляет MFE-колонки, если их нет."""
+    """ИЗМЕНЕНО: Логика авто-добавления колонок удалена."""
     if not TRADE_LOG_WS: return
     try:
         headers = get_headers(TRADE_LOG_WS)
-
-        # --- авто-добавление, если колонок ещё нет ---
-        headers_updated = False
-        # Убедимся, что все поля из extra_fields присутствуют в заголовках
-        for key in ['MFE_Price', 'MFE_ATR', 'MFE_TP_Pct']:
-            if key not in headers:
-                headers.append(key)
-                TRADE_LOG_WS.update_cell(1, len(headers), key)
-                headers_updated = True
-        
-        if headers_updated:
-            global TRADING_HEADERS_CACHE
-            TRADING_HEADERS_CACHE = headers
-            log.info(f"Added new columns to the sheet. New headers: {headers}")
-        # ---------------------------------------------
-
-        # Добавляем заглушки для новых полей, если их нет в trade_data
-        for key in ['MFE_Price', 'MFE_ATR', 'MFE_TP_Pct']:
-            trade_data.setdefault(key, '')
-
         row_to_insert = _prepare_row(headers, trade_data)
         PENDING_TRADES.append(row_to_insert)
         log.info(f"Signal {safe_id(trade_data.get('Signal_ID', ''))} buffered for logging.")
     except Exception as e:
         log.error(f"Error buffering open trade: {e}", exc_info=True)
-
 
 async def flush_log_buffers():
     global PENDING_TRADES
@@ -89,6 +63,7 @@ async def update_closed_trade(
     signal_id: str, status: str, exit_price: float, 
     pnl_usd: float, pnl_display: float, reason: str, 
     extra_fields: Optional[Dict] = None):
+    """ИЗМЕНЕНО: Логика авто-добавления колонок удалена."""
     if not TRADE_LOG_WS: return
     try:
         headers = get_headers(TRADE_LOG_WS)
