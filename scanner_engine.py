@@ -55,13 +55,13 @@ class CONFIG:
     CONCURRENCY_SEMAPHORE = 8
 
 # ===========================================================================
-# HELPERS & MARKET REGIME
+# HELPERS
 # ===========================================================================
+# ... без изменений ...
 def format_price(price: float) -> str:
     if price < 0.01: return f"{price:.6f}"
     elif price < 1.0: return f"{price:.5f}"
     else: return f"{price:.4f}"
-
 async def get_market_regime(exchange: ccxt.Exchange, app: Application) -> Optional[bool]:
     bot_data = app.bot_data
     now = time.time()
@@ -73,7 +73,6 @@ async def get_market_regime(exchange: ccxt.Exchange, app: Application) -> Option
     regime = await _is_bull_market_uncached(exchange)
     bot_data["market_regime_cache"] = {'regime': regime, 'timestamp': now}
     return regime
-
 async def _is_bull_market_uncached(exchange: ccxt.Exchange) -> Optional[bool]:
     try:
         btc_ohlcv = await exchange.fetch_ohlcv("BTC/USDT:USDT", "4h", limit=250)
@@ -89,14 +88,12 @@ async def _is_bull_market_uncached(exchange: ccxt.Exchange) -> Optional[bool]:
     except Exception as e:
         log.error(f"Could not determine market regime: {e}")
         return None
-
 def tf_seconds(tf: str) -> int:
     unit = tf[-1].lower(); n = int(tf[:-1])
     if unit == "m": return n * 60
     if unit == "h": return n * 3600
     if unit == "d": return n * 86400
     return 0
-
 def atr_based_levels(entry: float, atr: float, side: str) -> tuple[float, float, float]:
     sl_pct = CONFIG.ATR_SL_MULT * atr / entry * 100
     sl_pct = min(max(sl_pct, CONFIG.SL_MIN_PCT), CONFIG.SL_MAX_PCT)
@@ -107,10 +104,6 @@ def atr_based_levels(entry: float, atr: float, side: str) -> tuple[float, float,
         sl_price = entry * (1 + sl_pct / 100)
         tp_price = entry * (1 - sl_pct * CONFIG.RISK_REWARD / 100)
     return sl_price, tp_price, sl_pct
-
-# ===========================================================================
-# MARKET SCANNER
-# ===========================================================================
 def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
     if len(df) < 2: return None
     last = df.iloc[-1]
@@ -130,18 +123,20 @@ def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
         return "SHORT"
     return None
 
+# ===========================================================================
+# MARKET SCANNER
+# ===========================================================================
 async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
+    # ... без изменений ...
     bot_data = app.bot_data
     if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
         log.info("Position limit reached. Skipping scan."); return
-    
     market_is_bull = None
     if CONFIG.MARKET_REGIME_FILTER:
         market_is_bull = await get_market_regime(exchange, app)
         if market_is_bull is True: log.info("Market Regime: BULL. Penalizing SHORT signals.")
         elif market_is_bull is False: log.info("Market Regime: BEAR. Penalizing LONG signals.")
         else: log.info("Market Regime: NEUTRAL/FLAT. All signals allowed.")
-
     try:
         tickers = await exchange.fetch_tickers()
         liquid_pairs = [ s for s, t in tickers.items() if (t.get('quoteVolume') or 0) > CONFIG.MIN_VOL_USD and exchange.market(s).get('type') == 'swap' and s.endswith("USDT:USDT") ]
@@ -149,7 +144,6 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     except Exception as e:
         log.error(f"Could not fetch tickers or filter by volume: {e}"); return
     if not liquid_pairs: return
-
     long_candidates, short_candidates = [], []
     sem = asyncio.Semaphore(CONFIG.CONCURRENCY_SEMAPHORE)
     async def safe_fetch_ohlcv(symbol):
@@ -158,7 +152,6 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             except Exception: return None
     tasks = [safe_fetch_ohlcv(symbol) for symbol in liquid_pairs]
     ohlcv_results = await asyncio.gather(*tasks)
-    
     for i, ohlcv in enumerate(ohlcv_results):
         symbol = liquid_pairs[i]
         try:
@@ -174,9 +167,10 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             df.ta.atr(length=CONFIG.ATR_PERIOD, append=True)
             atr_col = next((c for c in df.columns if c.startswith("ATR")), None)
             if not atr_col or (df['high'] - df['low']).tail(CONFIG.ATR_COOLDOWN_BARS).max() > df[atr_col].tail(10).mean() * CONFIG.ATR_SPIKE_MULT: continue
-
             side = check_entry_conditions(df.copy())
             if side:
+                if side == "SHORT" and market_is_bull is True: continue
+                if side == "LONG" and market_is_bull is False: continue
                 entry_price = df.iloc[-1]['close']
                 atr = df[atr_col].iloc[-1]
                 if atr == 0: continue
@@ -186,14 +180,11 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
                 risk_norm = np.tanh(risk_usd_raw / CONFIG.RISK_SCALE)
                 quote_volume = tickers.get(symbol, {}).get('quoteVolume') or CONFIG.MIN_VOL_USD
                 score = (0.45 * np.log10(quote_volume) - 0.25 * risk_norm + 0.30 * edge)
-                if side == "SHORT" and market_is_bull is True: score *= 0.6
-                if side == "LONG" and market_is_bull is False: score *= 0.6
                 candidate_data = {'symbol': symbol, 'side': side, 'entry_price': entry_price, 'atr': atr, 'score': score}
                 if side == "LONG": long_candidates.append(candidate_data)
                 else: short_candidates.append(candidate_data)
         except Exception as e:
             log.error(f"Error processing symbol {symbol}: {e}")
-            
     long_cand_sorted = sorted(long_candidates, key=lambda x: x['score'], reverse=True)
     short_cand_sorted = sorted(short_candidates, key=lambda x: x['score'], reverse=True)
     n_long = min(len(long_cand_sorted), CONFIG.MAX_TRADES_PER_SCAN // 2)
@@ -203,15 +194,12 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     if remaining_slots > 0:
         remaining_pool = sorted(long_cand_sorted[n_long:] + short_cand_sorted[n_short:], key=lambda x: x['score'], reverse=True)
         selected_candidates.extend(remaining_pool[:remaining_slots])
-
     opened_long, opened_short = 0, 0
     trades_left_to_open = CONFIG.MAX_CONCURRENT_POSITIONS - len(bot_data.get("active_trades", []))
-    
     for candidate in selected_candidates[:trades_left_to_open]:
         await open_new_trade(candidate['symbol'], candidate['side'], candidate['entry_price'], candidate['atr'], app)
         if candidate['side'] == "LONG": opened_long += 1
         else: opened_short += 1
-
     if long_candidates or short_candidates:
         msg = (f"🔍 <b>SCAN ({CONFIG.TIMEFRAME})</b>\n\n"f"Найдено сигналов: LONG-<b>{len(long_candidates)}</b> | SHORT-<b>{len(short_candidates)}</b>\n"f"Открыто (лучшие по score): LONG-<b>{opened_long}</b> | SHORT-<b>{opened_short}</b>")
         if broadcast := app.bot_data.get('broadcast_func'):
@@ -221,7 +209,7 @@ async def open_new_trade(symbol: str, side: str, entry_price: float, atr_last: f
     bot_data = app.bot_data
     sl_price, tp_price, sl_pct = atr_based_levels(entry_price, atr_last, side)
     tp_pct = sl_pct * CONFIG.RISK_REWARD
-    trade = {"Signal_ID": f"{symbol}_{int(time.time())}", "Pair": symbol, "Side": side, "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": tp_price, "Status": "ACTIVE", "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "sl_pct": sl_pct, "tp_pct": tp_pct}
+    trade = {"Signal_ID": f"{symbol}_{int(time.time())}", "Pair": symbol, "Side": side, "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": tp_price, "Status": "ACTIVE", "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "sl_pct": sl_pct, "tp_pct": tp_pct, "ATR_Entry": atr_last, "MFE_Price": entry_price}
     bot_data.setdefault("active_trades", []).append(trade)
     log.info(f"New trade signal: {trade}")
     if broadcast := app.bot_data.get('broadcast_func'):
@@ -248,13 +236,18 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
             ohlcv = ohlcv_results[i]
             if not ohlcv: continue
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            current_price = df.iloc[-1]['close']
+            if trade['Side'] == 'LONG':
+                trade['MFE_Price'] = max(trade.get('MFE_Price', current_price), current_price)
+            else: # SHORT
+                trade['MFE_Price'] = min(trade.get('MFE_Price', current_price), current_price)
             df_indicators = df.copy()
             if len(df_indicators) < CONFIG.EMA_TREND_PERIOD: continue
             df_indicators.ta.ema(length=CONFIG.EMA_FAST_PERIOD, append=True); df_indicators.ta.ema(length=CONFIG.EMA_SLOW_PERIOD, append=True)
             df_indicators.ta.ema(length=CONFIG.EMA_TREND_PERIOD, append=True)
             df_indicators.ta.stochrsi(length=CONFIG.STOCH_RSI_PERIOD, k=CONFIG.STOCH_RSI_K, d=CONFIG.STOCH_RSI_D, append=True)
+            df_indicators.ta.atr(length=CONFIG.ATR_PERIOD, append=True)
             last = df_indicators.iloc[-1]; prev = df_indicators.iloc[-2]
-            current_price = df.iloc[-1]['close']
             exit_reason = None
             stoch_k_col = next((c for c in df_indicators.columns if c.startswith("STOCHRSIk_")), None)
             stoch_d_col = next((c for c in df_indicators.columns if c.startswith("STOCHRSId_")), None)
@@ -280,23 +273,35 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                     if ema_fast > ema_slow: exit_reason = "INVALIDATION_EMA_CROSS"
                     elif k_prev < d_prev and k_now >= d_now and k_now > CONFIG.STOCH_OVERSOLD_LEVEL:
                         exit_reason = "INVALIDATION_STOCH_RSI"
-            if exit_reason: trades_to_close.append((trade, exit_reason, current_price))
+            if exit_reason: trades_to_close.append((trade, exit_reason, df_indicators))
         except Exception as e:
             log.error(f"Error monitoring trade for {trade['Pair']}: {e}", exc_info=True)
     if trades_to_close:
         broadcast = app.bot_data.get('broadcast_func')
-        for trade, reason, exit_price in trades_to_close:
+        for trade, reason, df_final in trades_to_close:
+            exit_price = df_final.iloc[-1]['close']
             pnl_pct_raw = ((exit_price - trade['Entry_Price']) / trade['Entry_Price']) * (1 if trade['Side'] == "LONG" else -1)
             pnl_display = pnl_pct_raw * 100 * CONFIG.LEVERAGE
             if reason == "STOP_LOSS": pnl_display = -trade['sl_pct'] * CONFIG.LEVERAGE
             if reason == "TAKE_PROFIT": pnl_display = trade['tp_pct'] * CONFIG.LEVERAGE
             pnl_usd = CONFIG.POSITION_SIZE_USDT * pnl_display / 100
             app.bot_data.setdefault("trade_cooldown", {})[trade['Pair']] = time.time()
+            mfe_atr, mfe_tp_pct = 0, 0
+            atr_col = next((c for c in df_final.columns if c.startswith("ATR")), None)
+            current_atr = df_final[atr_col].iloc[-1] if atr_col else trade.get("ATR_Entry")
+            if current_atr and current_atr > 0:
+                mfe_atr = abs(trade['MFE_Price'] - trade['Entry_Price']) / current_atr
+            tp_diff = abs(trade['TP_Price'] - trade['Entry_Price'])
+            if tp_diff > 0:
+                mfe_tp_pct = abs(trade['MFE_Price'] - trade['Entry_Price']) / tp_diff
+            else: mfe_tp_pct = 0
+            extra_fields = {"MFE_Price": trade['MFE_Price'], "MFE_ATR": round(mfe_atr, 2), "MFE_TP_Pct": round(mfe_tp_pct, 3)}
             if broadcast:
                 emoji = {"STOP_LOSS":"❌", "TAKE_PROFIT":"✅"}.get(reason, "⚠️")
-                msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({reason})</b>\n\n"f"<b>Пара:</b> {trade['Pair']}\n<b>Выход:</b> <code>{format_price(exit_price)}</code>\n"f"<b>Результат: ${pnl_usd:+.2f} ({pnl_display:+.2f}%)</b>")
+                mfe_info = f"MFE: {mfe_tp_pct:.1%} of TP ({mfe_atr:.1f} ATR)"
+                msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({reason})</b>\n\n"f"<b>Пара:</b> {trade['Pair']}\n"f"<b>Выход:</b> <code>{format_price(exit_price)}</code>\n"f"<b>Результат: ${pnl_usd:+.2f} ({pnl_display:+.2f}%)</b>\n"f"<i>{mfe_info}</i>")
                 await broadcast(app, msg)
-            await trade_executor.update_closed_trade(trade['Signal_ID'], "CLOSED", exit_price, pnl_usd, pnl_display, reason)
+            await trade_executor.update_closed_trade(trade['Signal_ID'], "CLOSED", exit_price, pnl_usd, pnl_display, reason, extra_fields=extra_fields)
         closed_ids = {t['Signal_ID'] for t, _, _ in trades_to_close}
         bot_data["active_trades"] = [t for t in active_trades if t['Signal_ID'] not in closed_ids]
 
@@ -309,28 +314,22 @@ async def scanner_main_loop(app: Application, broadcast):
     app.bot_data.setdefault("trade_cooldown", {})
     app.bot_data.setdefault("market_regime_cache", {})
     app.bot_data['broadcast_func'] = broadcast
-    
     try:
         import gspread
-        
         creds_json = os.environ.get("GOOGLE_CREDENTIALS")
         sheet_key = os.environ.get("SHEET_ID")
-
         if not creds_json or not sheet_key:
             log.critical("GOOGLE_CREDENTIALS or SHEET_ID environment variables not set. Cannot start.")
             return
-
         creds = json.loads(creds_json)
         gc = gspread.service_account_from_dict(creds)
         sheet = gc.open_by_key(sheet_key)
-        
         trade_executor.TRADE_LOG_WS = sheet.worksheet("Trading_Log")
         trade_executor.get_headers(trade_executor.TRADE_LOG_WS)
         log.info("Google Sheets initialized successfully.")
     except Exception as e:
         log.critical(f"Could not initialize Google Sheets: {e}", exc_info=True)
         raise
-    
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 200})
     last_scan_time = 0; last_flush_time = 0; FLUSH_INTERVAL = 15
     while app.bot_data.get("bot_on", False):
