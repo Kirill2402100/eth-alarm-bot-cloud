@@ -1,7 +1,7 @@
 # trade_executor.py
 
 import gspread
-import gspread.utils # ИЗМЕНЕНО: Добавлен необходимый импорт
+import gspread.utils
 import logging
 from datetime import datetime, timezone
 from typing import Dict, List
@@ -79,28 +79,24 @@ async def update_closed_trade(signal_id: str, status: str, exit_price: float, pn
         
         row_idx = cell.row
         
-        # Получаем текущие значения, чтобы не затереть существующие данные
         current_row_values = TRADE_LOG_WS.row_values(row_idx)
         updated_row_dict = dict(zip(headers, current_row_values))
 
-        # Обновляем нужные поля
+        # ИЗМЕНЕНО: Ключи словаря теперь точно соответствуют заголовкам в таблице
         updated_row_dict.update({
             'Status': status, 
             'Exit_Price': exit_price, 
-            'Close_Reason': reason, 
-            'PnL_USD': pnl_usd, 
-            'PnL_Display_Pct': pnl_display,
+            'Exit_Reason': reason,          # <-- Исправлено
+            'PNL_USD': pnl_usd,             # <-- Исправлено
+            'PNL_Percent': pnl_display,     # <-- Исправлено
             'Exit_Time_UTC': datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         })
 
-        # Собираем финальную строку в правильном порядке
         final_row_data = [updated_row_dict.get(h, '') for h in headers]
         
-        # ИЗМЕНЕНО: Надежный расчет диапазона для >26 колонок
         last_col_letter = gspread.utils.rowcol_to_a1(1, len(headers)).rstrip('1')
         range_to_update = f"A{row_idx}:{last_col_letter}{row_idx}"
         
-        # ИЗМЕНЕНО: Используем Worksheet.update для всей строки
         TRADE_LOG_WS.update(range_to_update, [final_row_data])
         
         log.info(f"Successfully updated/closed trade {id_clean} at row {row_idx}.")
