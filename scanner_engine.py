@@ -4,6 +4,8 @@ import asyncio
 import time
 import logging
 import numpy as np
+import os
+import json
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 
@@ -21,7 +23,7 @@ log = logging.getLogger("swing_bot_engine")
 # ===========================================================================
 class CONFIG:
     MARKET_REGIME_FILTER = True
-    MARKET_REGIME_CACHE_TTL_SECONDS = 1800 # ИЗМЕНЕНО: Константа восстановлена
+    MARKET_REGIME_CACHE_TTL_SECONDS = 1800
     TIMEFRAME = "15m"
     POSITION_SIZE_USDT = 10.0
     LEVERAGE = 20
@@ -55,7 +57,6 @@ class CONFIG:
 # ===========================================================================
 # HELPERS & MARKET REGIME
 # ===========================================================================
-# ... без изменений ...
 def format_price(price: float) -> str:
     if price < 0.01: return f"{price:.6f}"
     elif price < 1.0: return f"{price:.5f}"
@@ -110,7 +111,6 @@ def atr_based_levels(entry: float, atr: float, side: str) -> tuple[float, float,
 # ===========================================================================
 # MARKET SCANNER
 # ===========================================================================
-# ... без изменений ...
 def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
     if len(df) < 2: return None
     last = df.iloc[-1]
@@ -226,10 +226,7 @@ async def open_new_trade(symbol: str, side: str, entry_price: float, atr_last: f
     log.info(f"New trade signal: {trade}")
     if broadcast := app.bot_data.get('broadcast_func'):
         sl_disp = round(sl_pct * CONFIG.LEVERAGE); tp_disp = round(tp_pct * CONFIG.LEVERAGE)
-        msg = (f"🔥 <b>НОВЫЙ СИГНАЛ ({side})</b>\n\n"
-               f"<b>Пара:</b> {symbol}\n<b>Вход:</b> <code>{format_price(entry_price)}</code>\n"
-               f"<b>SL:</b> <code>{format_price(sl_price)}</code> (-{sl_disp}%)\n"
-               f"<b>TP:</b> <code>{format_price(tp_price)}</code> (+{tp_disp}%)")
+        msg = (f"🔥 <b>НОВЫЙ СИГНАЛ ({side})</b>\n\n"f"<b>Пара:</b> {symbol}\n<b>Вход:</b> <code>{format_price(entry_price)}</code>\n"f"<b>SL:</b> <code>{format_price(sl_price)}</code> (-{sl_disp}%)\n"f"<b>TP:</b> <code>{format_price(tp_price)}</code> (+{tp_disp}%)")
         await broadcast(app, msg)
     await trade_executor.log_open_trade(trade)
 
@@ -281,8 +278,7 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                         exit_reason = "INVALIDATION_STOCH_RSI"
                 else: # SHORT
                     if ema_fast > ema_slow: exit_reason = "INVALIDATION_EMA_CROSS"
-                    # ИЗМЕНЕНО: Исправлена логика выхода для SHORT на симметричную
-                    elif k_prev < d_prev and k_now >= d_now and k_now > CONFIG.STOCH_OVERBOUGHT_LEVEL:
+                    elif k_prev < d_prev and k_now >= d_now and k_now > CONFIG.STOCH_OVERSOLD_LEVEL:
                         exit_reason = "INVALIDATION_STOCH_RSI"
             if exit_reason: trades_to_close.append((trade, exit_reason, current_price))
         except Exception as e:
@@ -298,31 +294,43 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
             app.bot_data.setdefault("trade_cooldown", {})[trade['Pair']] = time.time()
             if broadcast:
                 emoji = {"STOP_LOSS":"❌", "TAKE_PROFIT":"✅"}.get(reason, "⚠️")
-                msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({reason})</b>\n\n"
-                       f"<b>Пара:</b> {trade['Pair']}\n"
-                       f"<b>Выход:</b> <code>{format_price(exit_price)}</code>\n"
-                       f"<b>Результат: ${pnl_usd:+.2f} ({pnl_display:+.2f}%)</b>")
+                msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({reason})</b>\n\n"f"<b>Пара:</b> {trade['Pair']}\n<b>Выход:</b> <code>{format_price(exit_price)}</code>\n"f"<b>Результат: ${pnl_usd:+.2f} ({pnl_display:+.2f}%)</b>")
                 await broadcast(app, msg)
             await trade_executor.update_closed_trade(trade['Signal_ID'], "CLOSED", exit_price, pnl_usd, pnl_display, reason)
         closed_ids = {t['Signal_ID'] for t, _, _ in trades_to_close}
         bot_data["active_trades"] = [t for t in active_trades if t['Signal_ID'] not in closed_ids]
 
+# ===========================================================================
+# MAIN LOOP
+# ===========================================================================
 async def scanner_main_loop(app: Application, broadcast):
     log.info("Scanner Engine loop starting…")
     app.bot_data.setdefault("active_trades", [])
     app.bot_data.setdefault("trade_cooldown", {})
     app.bot_data.setdefault("market_regime_cache", {})
     app.bot_data['broadcast_func'] = broadcast
+    
     try:
         import gspread
-        gc = gspread.service_account() 
-        sheet = gc.open_by_key("YOUR_GOOGLE_SHEET_KEY_HERE")
+        
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+        sheet_key = os.environ.get("SHEET_ID")
+
+        if not creds_json or not sheet_key:
+            log.critical("GOOGLE_CREDENTIALS or SHEET_ID environment variables not set. Cannot start.")
+            return
+
+        creds = json.loads(creds_json)
+        gc = gspread.service_account_from_dict(creds)
+        sheet = gc.open_by_key(sheet_key)
+        
         trade_executor.TRADE_LOG_WS = sheet.worksheet("Trading_Log")
         trade_executor.get_headers(trade_executor.TRADE_LOG_WS)
         log.info("Google Sheets initialized successfully.")
     except Exception as e:
-        log.critical(f"Could not initialize Google Sheets: {e}")
-        return
+        log.critical(f"Could not initialize Google Sheets: {e}", exc_info=True)
+        raise
+    
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 200})
     last_scan_time = 0; last_flush_time = 0; FLUSH_INTERVAL = 15
     while app.bot_data.get("bot_on", False):
