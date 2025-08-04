@@ -34,9 +34,6 @@ def _prepare_row(headers: list, data: dict) -> list:
     """Подготавливает строку данных, используя безопасный ID."""
     if 'Signal_ID' in data:
         data['Signal_ID'] = safe_id(data['Signal_ID'])
-    # Убедимся, что все поля из extra_fields присутствуют, даже если пустые
-    for key in ['MFE_Price', 'MFE_ATR', 'MFE_TP_Pct']:
-        data.setdefault(key, '')
     return [data.get(h, '') for h in headers]
 
 # ===========================================================================
@@ -44,14 +41,36 @@ def _prepare_row(headers: list, data: dict) -> list:
 # ===========================================================================
 
 async def log_open_trade(trade_data: Dict):
+    """ИЗМЕНЕНО: Автоматически добавляет MFE-колонки, если их нет."""
     if not TRADE_LOG_WS: return
     try:
         headers = get_headers(TRADE_LOG_WS)
+
+        # --- авто-добавление, если колонок ещё нет ---
+        headers_updated = False
+        # Убедимся, что все поля из extra_fields присутствуют в заголовках
+        for key in ['MFE_Price', 'MFE_ATR', 'MFE_TP_Pct']:
+            if key not in headers:
+                headers.append(key)
+                TRADE_LOG_WS.update_cell(1, len(headers), key)
+                headers_updated = True
+        
+        if headers_updated:
+            global TRADING_HEADERS_CACHE
+            TRADING_HEADERS_CACHE = headers
+            log.info(f"Added new columns to the sheet. New headers: {headers}")
+        # ---------------------------------------------
+
+        # Добавляем заглушки для новых полей, если их нет в trade_data
+        for key in ['MFE_Price', 'MFE_ATR', 'MFE_TP_Pct']:
+            trade_data.setdefault(key, '')
+
         row_to_insert = _prepare_row(headers, trade_data)
         PENDING_TRADES.append(row_to_insert)
-        log.info(f"Signal {safe_id(trade_data.get('Signal_ID'))} buffered for logging.")
+        log.info(f"Signal {safe_id(trade_data.get('Signal_ID', ''))} buffered for logging.")
     except Exception as e:
         log.error(f"Error buffering open trade: {e}", exc_info=True)
+
 
 async def flush_log_buffers():
     global PENDING_TRADES
@@ -70,7 +89,6 @@ async def update_closed_trade(
     signal_id: str, status: str, exit_price: float, 
     pnl_usd: float, pnl_display: float, reason: str, 
     extra_fields: Optional[Dict] = None):
-    """ИЗМЕНЕНО: Автоматически добавляет недостающие колонки в заголовок."""
     if not TRADE_LOG_WS: return
     try:
         headers = get_headers(TRADE_LOG_WS)
@@ -98,21 +116,6 @@ async def update_closed_trade(
             'Exit_Time_UTC': datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         }
         updated_row_dict.update(base_update)
-        
-        # --- ИЗМЕНЕНО: Авто-добавление недостающих колонок ---
-        if extra_fields:
-            headers_updated = False
-            for key in extra_fields:
-                if key not in headers:
-                    headers.append(key)
-                    TRADE_LOG_WS.update_cell(1, len(headers), key)
-                    headers_updated = True
-            
-            # Обновляем кэш, если структура таблицы изменилась
-            if headers_updated:
-                global TRADING_HEADERS_CACHE
-                TRADING_HEADERS_CACHE = headers
-        # ----------------------------------------------------
         
         if extra_fields:
             updated_row_dict.update(extra_fields)
