@@ -23,7 +23,7 @@ class CONFIG:
     POSITION_SIZE_USDT = 10.0
     LEVERAGE = 20
     MAX_CONCURRENT_POSITIONS = 10
-    MAX_TRADES_PER_SCAN = 3 # ИЗМЕНЕНО: Увеличен лимит для гибкости
+    MAX_TRADES_PER_SCAN = 6 # ИЗМЕНЕНО: Увеличен поток сигналов
     MIN_DAILY_VOLATILITY_PCT = 3.0
     MAX_DAILY_VOLATILITY_PCT = 10.0
     MIN_PRICE = 0.001
@@ -36,6 +36,7 @@ class CONFIG:
     STOCH_RSI_D = 3
     STOCH_RSI_MID = 50
     STOCH_EXIT_ZONE = 60
+    STOCH_LONG_EXIT_LEVEL = 70 # ИЗМЕНЕНО: Уровень выхода для LONG
     ATR_PERIOD = 14
     ATR_SPIKE_MULT = 2.5
     ATR_COOLDOWN_BARS = 2
@@ -94,23 +95,30 @@ async def filter_volatile_pairs(exchange: ccxt.Exchange) -> List[str]:
         return []
 
 def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
-    # ... без изменений ...
+    """ИЗМЕНЕНО: Ослаблен вход в шорт."""
     if len(df) < 2: return None
+    
     last = df.iloc[-1]
     ema_fast = last[f"EMA_{CONFIG.EMA_FAST_PERIOD}"]
     ema_slow = last[f"EMA_{CONFIG.EMA_SLOW_PERIOD}"]
     ema_trend = last[f"EMA_{CONFIG.EMA_TREND_PERIOD}"]
+    
     stoch_k_col = next((c for c in df.columns if c.startswith("STOCHRSIk_")), None)
     if not stoch_k_col: return None
+    
     k_now = last[stoch_k_col]
     k_prev = df[stoch_k_col].iloc[-2]
+
     buffer = 1 + CONFIG.EMA_TREND_BUFFER_PCT / 100
     is_uptrend = last['close'] > ema_trend * buffer
-    is_downtrend = last['close'] < ema_trend / buffer
+    is_downtrend = last['close'] < ema_trend # ИЗМЕНЕНО: Убран буфер для шорта
+    
     if is_uptrend and ema_fast > ema_slow and k_prev < CONFIG.STOCH_RSI_MID and k_now >= CONFIG.STOCH_RSI_MID:
         return "LONG"
+            
     if is_downtrend and ema_fast < ema_slow and k_prev > CONFIG.STOCH_RSI_MID and k_now <= CONFIG.STOCH_RSI_MID:
         return "SHORT"
+            
     return None
 
 async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
@@ -192,7 +200,7 @@ async def open_new_trade(symbol: str, side: str, entry_price: float, atr_last: f
 # TRADE MANAGER
 # ===========================================================================
 async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
-    """ИЗМЕНЕНО: Убрано лишнее логирование."""
+    """ИЗМЕНЕНО: Ослаблен порог soft-стопа, скорректирован выход из LONG."""
     bot_data = app.bot_data
     active_trades = bot_data.get("active_trades", [])
     if not active_trades: return
@@ -213,7 +221,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
     for i, trade in enumerate(active_trades):
         try:
             ohlcv = ohlcv_results[i]
-            # ИЗМЕНЕНО: Убрано лишнее предупреждение
             if isinstance(ohlcv, Exception) or not ohlcv:
                 continue
 
@@ -248,7 +255,8 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                 else:
                     progress_to_tp = (trade['Entry_Price'] - current_price) / (trade['Entry_Price'] - trade['TP_Price'])
 
-                if progress_to_tp < 0.5:
+                # ИЗМЕНЕНО: Ослаблен порог для soft-стопа
+                if progress_to_tp < 0.25:
                     continue
 
                 ema_fast = last[f"EMA_{CONFIG.EMA_FAST_PERIOD}"]; ema_slow = last[f"EMA_{CONFIG.EMA_SLOW_PERIOD}"]
@@ -257,7 +265,8 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                 
                 if trade['Side'] == 'LONG':
                     if ema_fast < ema_slow: exit_reason = "INVALIDATION_EMA_CROSS"
-                    elif k_prev > d_prev and k_now <= d_now and k_now < CONFIG.STOCH_EXIT_ZONE:
+                    # ИЗМЕНЕНО: Выход из LONG при развороте ниже 70
+                    elif k_prev > d_prev and k_now <= d_now and k_now < CONFIG.STOCH_LONG_EXIT_LEVEL:
                         exit_reason = "INVALIDATION_STOCH_RSI"
                 else: # SHORT
                     if ema_fast > ema_slow: exit_reason = "INVALIDATION_EMA_CROSS"
@@ -271,7 +280,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
             log.error(f"Error monitoring trade for {trade['Pair']}: {e}", exc_info=True)
 
     if trades_to_close:
-        # ... без изменений ...
         broadcast = app.bot_data.get('broadcast_func')
         for trade, reason, exit_price in trades_to_close:
             pnl_pct_raw = ((exit_price - trade['Entry_Price']) / trade['Entry_Price']) * (1 if trade['Side'] == "LONG" else -1)
@@ -293,7 +301,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
 # MAIN LOOP
 # ===========================================================================
 async def scanner_main_loop(app: Application, broadcast):
-    # ... без изменений ...
     log.info("Scanner Engine loop starting…")
     app.bot_data.setdefault("active_trades", [])
     app.bot_data.setdefault("trade_cooldown", {})
