@@ -13,7 +13,7 @@ import pandas as pd
 import pandas_ta as ta
 import ccxt.async_support as ccxt
 from telegram.ext import Application
-import gspread # Добавлен импорт для gspread.WorksheetNotFound
+import gspread
 
 import trade_executor
 
@@ -22,7 +22,6 @@ log = logging.getLogger("swing_bot_engine")
 # ===========================================================================
 # CONFIGURATION
 # ===========================================================================
-# ... без изменений ...
 class CONFIG:
     MARKET_REGIME_FILTER = True
     MARKET_REGIME_CACHE_TTL_SECONDS = 1800
@@ -31,7 +30,7 @@ class CONFIG:
     LEVERAGE = 20
     MAX_CONCURRENT_POSITIONS = 10
     MAX_TRADES_PER_SCAN = 4
-    MIN_VOL_USD = 200_000
+    MIN_VOL_USD = 1_000_000
     RISK_SCALE = POSITION_SIZE_USDT / 2
     MIN_PRICE = 0.001
     EMA_FAST_PERIOD = 9
@@ -48,41 +47,50 @@ class CONFIG:
     ATR_SPIKE_MULT = 2.5
     ATR_COOLDOWN_BARS = 3
     ATR_SL_MULT = 1.8
-    RISK_REWARD = 2
+    RISK_REWARD = 1.5
     SL_MIN_PCT = 1.0
     SL_MAX_PCT = 5.0
     SCANNER_INTERVAL_SECONDS = 300
     TICK_MONITOR_INTERVAL_SECONDS = 15
     OHLCV_LIMIT = 250
     CONCURRENCY_SEMAPHORE = 8
+    MAX_FUNDING_RATE_PCT = 0.075
 
 # ===========================================================================
-# HELPERS & MARKET REGIME
+# HELPERS
 # ===========================================================================
+
+# ИЗМЕНЕНО: Добавлена обертка try/except для повышения надежности
 async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
-    """ИЗМЕНЕНО: Создаёт лист 'Trading_Log_v2' с полной шапкой, если его ещё нет."""
+    """Создаёт лист 'Trading_Log_v2', обеспечивая безопасное завершение при ошибках."""
+    loop = asyncio.get_running_loop()
     title = "Trading_Log_v2"
+    ws = None
     try:
-        ws = gfile.worksheet(title)
+        ws = await loop.run_in_executor(None, lambda: gfile.worksheet(title))
         log.info(f"Worksheet '{title}' already exists.")
     except gspread.WorksheetNotFound:
         log.warning(f"Worksheet '{title}' not found. Creating...")
-        ws = gfile.add_worksheet(title=title, rows=1000, cols=20)
-        headers = [
-            "Signal_ID", "Timestamp_UTC", "Pair", "Side", "Status",
-            "Entry_Price", "Exit_Price", "Exit_Time_UTC",
-            "Exit_Reason", "PNL_USD", "PNL_Percent",
-            "MFE_Price", "MFE_ATR", "MFE_TP_Pct"
-        ]
-        ws.append_row(headers, value_input_option="USER_ENTERED")
-        log.info(f"Worksheet '{title}' created with all required headers.")
-    
-    # Перенаправляем executor на новый/проверенный лист
+        try:
+            ws = await loop.run_in_executor(None, lambda: gfile.add_worksheet(title=title, rows=1000, cols=20))
+            headers = [
+                "Signal_ID", "Timestamp_UTC", "Pair", "Side", "Status",
+                "Entry_Price", "Exit_Price", "Exit_Time_UTC",
+                "Exit_Reason", "PNL_USD", "PNL_Percent",
+                "MFE_Price", "MFE_ATR", "MFE_TP_Pct", "Time_in_Trade"
+            ]
+            await loop.run_in_executor(None, lambda: ws.append_row(headers, value_input_option="USER_ENTERED"))
+            log.info(f"Worksheet '{title}' created with all required headers.")
+        except Exception as e:
+            log.critical(f"Failed to create new worksheet '{title}': {e}")
+            raise # Прерываем выполнение, чтобы бот не работал без логгера
+    except Exception as e:
+        log.critical(f"An unexpected error occurred with Google Sheets: {e}")
+        raise
+
     trade_executor.TRADE_LOG_WS = ws
-    # Сбрасываем кэш, чтобы executor перечитал заголовки из правильного листа
     trade_executor.TRADING_HEADERS_CACHE = None
 
-# ... остальные helpers без изменений ...
 def format_price(price: float) -> str:
     if price < 0.01: return f"{price:.6f}"
     elif price < 1.0: return f"{price:.5f}"
@@ -92,7 +100,6 @@ async def get_market_regime(exchange: ccxt.Exchange, app: Application) -> Option
     now = time.time()
     cache = bot_data.get("market_regime_cache")
     if cache and (now - cache.get('timestamp', 0) < CONFIG.MARKET_REGIME_CACHE_TTL_SECONDS):
-        log.info("Using cached Market Regime.")
         return cache.get('regime')
     log.info("Fetching new Market Regime from exchange...")
     regime = await _is_bull_market_uncached(exchange)
@@ -151,7 +158,6 @@ def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
 # ===========================================================================
 # MARKET SCANNER & TRADE MANAGER
 # ===========================================================================
-# ... функции find_trade_signals, open_new_trade, monitor_active_trades без изменений ...
 async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     bot_data = app.bot_data
     if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
@@ -194,6 +200,18 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             if not atr_col or (df['high'] - df['low']).tail(CONFIG.ATR_COOLDOWN_BARS).max() > df[atr_col].tail(10).mean() * CONFIG.ATR_SPIKE_MULT: continue
             side = check_entry_conditions(df.copy())
             if side:
+                # УЛУЧШЕНО: Обработка фандинга с проверкой типа
+                if side == "LONG":
+                    try:
+                        # Фильтр liquid_pairs уже гарантирует, что это SWAP, доп. проверка не нужна.
+                        funding_rate_data = await exchange.fetch_funding_rate(symbol)
+                        funding_rate = float(funding_rate_data.get('fundingRate', 0)) # Преобразуем в float
+                        if funding_rate * 100 > CONFIG.MAX_FUNDING_RATE_PCT:
+                            log.info(f"Skipping LONG for {symbol} due to high funding rate: {funding_rate*100:.4f}%")
+                            continue
+                    except (KeyError, TypeError, ValueError) as e:
+                        log.warning(f"Could not fetch or parse funding rate for {symbol}: {e}")
+
                 if side == "SHORT" and market_is_bull is True: continue
                 if side == "LONG" and market_is_bull is False: continue
                 entry_price = df.iloc[-1]['close']
@@ -229,11 +247,25 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
         msg = (f"🔍 <b>SCAN ({CONFIG.TIMEFRAME})</b>\n\n"f"Найдено сигналов: LONG-<b>{len(long_candidates)}</b> | SHORT-<b>{len(short_candidates)}</b>\n"f"Открыто (лучшие по score): LONG-<b>{opened_long}</b> | SHORT-<b>{opened_short}</b>")
         if broadcast := app.bot_data.get('broadcast_func'):
             await broadcast(app, msg)
+
 async def open_new_trade(symbol: str, side: str, entry_price: float, atr_last: float, app: Application):
     bot_data = app.bot_data
     sl_price, tp_price, sl_pct = atr_based_levels(entry_price, atr_last, side)
+    if side == "LONG":
+        tp_1r_price = entry_price * (1 + sl_pct / 100)
+    else: # SHORT
+        tp_1r_price = entry_price * (1 - sl_pct / 100)
     tp_pct = sl_pct * CONFIG.RISK_REWARD
-    trade = {"Signal_ID": f"{symbol}_{int(time.time())}", "Pair": symbol, "Side": side, "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": tp_price, "Status": "ACTIVE", "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "sl_pct": sl_pct, "tp_pct": tp_pct, "ATR_Entry": atr_last, "MFE_Price": entry_price}
+    trade = {
+        "Signal_ID": f"{symbol}_{int(time.time())}", "Pair": symbol, "Side": side,
+        "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": tp_price,
+        "Status": "ACTIVE", "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "sl_pct": sl_pct, "tp_pct": tp_pct, "ATR_Entry": atr_last, "MFE_Price": entry_price,
+        "trailing_activated": False,
+        "TP_1R_Price": tp_1r_price,
+        "partially_closed": False,
+        "size_factor": 1.0 # ДОБАВЛЕНО: Множитель размера позиции
+    }
     bot_data.setdefault("active_trades", []).append(trade)
     log.info(f"New trade signal: {trade}")
     if broadcast := app.bot_data.get('broadcast_func'):
@@ -241,6 +273,7 @@ async def open_new_trade(symbol: str, side: str, entry_price: float, atr_last: f
         msg = (f"🔥 <b>НОВЫЙ СИГНАЛ ({side})</b>\n\n"f"<b>Пара:</b> {symbol}\n<b>Вход:</b> <code>{format_price(entry_price)}</code>\n"f"<b>SL:</b> <code>{format_price(sl_price)}</code> (-{sl_disp}%)\n"f"<b>TP:</b> <code>{format_price(tp_price)}</code> (+{tp_disp}%)")
         await broadcast(app, msg)
     await trade_executor.log_open_trade(trade)
+
 async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
     bot_data = app.bot_data
     active_trades = bot_data.get("active_trades", [])
@@ -254,6 +287,7 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
             except Exception: return None
     tasks = [safe_fetch_ohlcv(s) for s in symbols]
     ohlcv_results = await asyncio.gather(*tasks)
+    broadcast = app.bot_data.get('broadcast_func')
     for i, trade in enumerate(active_trades):
         try:
             ohlcv = ohlcv_results[i]
@@ -264,6 +298,36 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                 trade['MFE_Price'] = max(trade.get('MFE_Price', current_price), current_price)
             else:
                 trade['MFE_Price'] = min(trade.get('MFE_Price', current_price), current_price)
+            if not trade.get('partially_closed'):
+                is_1r_hit = False
+                if trade['Side'] == 'LONG' and current_price >= trade['TP_1R_Price']: is_1r_hit = True
+                elif trade['Side'] == 'SHORT' and current_price <= trade['TP_1R_Price']: is_1r_hit = True
+                if is_1r_hit:
+                    trade['partially_closed'] = True
+                    trade['SL_Price'] = trade['Entry_Price']
+                    trade['size_factor'] = 0.5 # ИЗМЕНЕНО: Уменьшаем размер для расчета PnL
+                    log.info(f"Partial Take Profit @ 1R for {trade['Pair']}. SL moved to Breakeven. Size factor is now 0.5.")
+                    if broadcast:
+                        msg = (f"💰 <b>ЧАСТИЧНАЯ ФИКСАЦИЯ @ 1R</b>\n\n"
+                               f"<b>Пара:</b> {trade['Pair']}\n"
+                               f"Закрыто 50% позиции. SL перенесен в безубыток.")
+                        await broadcast(app, msg)
+            if not trade.get('trailing_activated'):
+                progress_to_tp = 0
+                tp_diff = trade['TP_Price'] - trade['Entry_Price']
+                if abs(tp_diff) > 0:
+                    if trade['Side'] == 'LONG': progress_to_tp = (current_price - trade['Entry_Price']) / tp_diff
+                    else: progress_to_tp = (trade['Entry_Price'] - current_price) / abs(tp_diff)
+                if progress_to_tp >= 0.6:
+                    # УЛУЧШЕНО: Trailing stop ставится на +0.1R от входа
+                    risk_pct = trade['sl_pct']
+                    if trade['Side'] == 'LONG':
+                        new_sl = trade['Entry_Price'] * (1 + 0.1 * risk_pct / 100)
+                    else: # SHORT
+                        new_sl = trade['Entry_Price'] * (1 - 0.1 * risk_pct / 100)
+                    trade['SL_Price'] = new_sl
+                    trade['trailing_activated'] = True
+                    log.info(f"Trailing stop activated for {trade['Pair']}. New SL (+0.1R): {new_sl}")
             df_indicators = df.copy()
             if len(df_indicators) < CONFIG.EMA_TREND_PERIOD: continue
             df_indicators.ta.ema(length=CONFIG.EMA_FAST_PERIOD, append=True); df_indicators.ta.ema(length=CONFIG.EMA_SLOW_PERIOD, append=True)
@@ -276,51 +340,73 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
             stoch_d_col = next((c for c in df_indicators.columns if c.startswith("STOCHRSId_")), None)
             if not stoch_k_col or not stoch_d_col: continue
             if trade['Side'] == 'LONG':
-                if current_price <= trade['SL_Price']: exit_reason = "STOP_LOSS"
+                if current_price <= trade['SL_Price']: exit_reason = "STOP_LOSS" if not trade.get('trailing_activated') else "TRAIL_STOP"
                 elif current_price >= trade['TP_Price']: exit_reason = "TAKE_PROFIT"
             else:
-                if current_price >= trade['SL_Price']: exit_reason = "STOP_LOSS"
+                if current_price >= trade['SL_Price']: exit_reason = "STOP_LOSS" if not trade.get('trailing_activated') else "TRAIL_STOP"
                 elif current_price <= trade['TP_Price']: exit_reason = "TAKE_PROFIT"
             if not exit_reason:
-                if trade['Side'] == 'LONG': progress_to_tp = (current_price - trade['Entry_Price']) / (trade['TP_Price'] - trade['Entry_Price'])
-                else: progress_to_tp = (trade['Entry_Price'] - current_price) / (trade['Entry_Price'] - trade['TP_Price'])
-                if progress_to_tp < 0.25: continue
+                if trade['Side'] == 'LONG': progress_to_tp_soft = (current_price - trade['Entry_Price']) / (trade['TP_Price'] - trade['Entry_Price'])
+                else: progress_to_tp_soft = (trade['Entry_Price'] - current_price) / (trade['Entry_Price'] - trade['TP_Price'])
+                if progress_to_tp_soft < 0.25: continue
                 ema_fast = last[f"EMA_{CONFIG.EMA_FAST_PERIOD}"]; ema_slow = last[f"EMA_{CONFIG.EMA_SLOW_PERIOD}"]
                 k_now = last[stoch_k_col]; k_prev = prev[stoch_k_col]
                 d_now = last[stoch_d_col]; d_prev = prev[stoch_d_col]
                 if trade['Side'] == 'LONG':
                     if ema_fast < ema_slow: exit_reason = "INVALIDATION_EMA_CROSS"
-                    elif k_prev > d_prev and k_now <= d_now and k_now < CONFIG.STOCH_OVERBOUGHT_LEVEL:
-                        exit_reason = "INVALIDATION_STOCH_RSI"
-                else: # SHORT
+                    elif k_prev > d_prev and k_now <= d_now and k_now < CONFIG.STOCH_OVERBOUGHT_LEVEL: exit_reason = "INVALIDATION_STOCH_RSI"
+                else:
                     if ema_fast > ema_slow: exit_reason = "INVALIDATION_EMA_CROSS"
-                    elif k_prev < d_prev and k_now >= d_now and k_now > CONFIG.STOCH_OVERSOLD_LEVEL:
-                        exit_reason = "INVALIDATION_STOCH_RSI"
+                    elif k_prev < d_prev and k_now >= d_now and k_now > CONFIG.STOCH_OVERSOLD_LEVEL: exit_reason = "INVALIDATION_STOCH_RSI"
             if exit_reason: trades_to_close.append((trade, exit_reason, df_indicators))
         except Exception as e:
             log.error(f"Error monitoring trade for {trade['Pair']}: {e}", exc_info=True)
     if trades_to_close:
-        broadcast = app.bot_data.get('broadcast_func')
         for trade, reason, df_final in trades_to_close:
             exit_price = df_final.iloc[-1]['close']
-            pnl_pct_raw = ((exit_price - trade['Entry_Price']) / trade['Entry_Price']) * (1 if trade['Side'] == "LONG" else -1)
-            pnl_display = pnl_pct_raw * 100 * CONFIG.LEVERAGE
-            if reason == "STOP_LOSS": pnl_display = -trade['sl_pct'] * CONFIG.LEVERAGE
-            if reason == "TAKE_PROFIT": pnl_display = trade['tp_pct'] * CONFIG.LEVERAGE
-            pnl_usd = CONFIG.POSITION_SIZE_USDT * pnl_display / 100
+            if reason == "TRAIL_STOP":
+                pnl_pct_raw = ((exit_price - trade['Entry_Price']) / trade['Entry_Price']) * (1 if trade['Side'] == "LONG" else -1)
+                pnl_display = pnl_pct_raw * 100 * CONFIG.LEVERAGE
+            elif reason == "STOP_LOSS": pnl_display = -trade['sl_pct'] * CONFIG.LEVERAGE
+            elif reason == "TAKE_PROFIT": pnl_display = trade['tp_pct'] * CONFIG.LEVERAGE
+            else:
+                pnl_pct_raw = ((exit_price - trade['Entry_Price']) / trade['Entry_Price']) * (1 if trade['Side'] == "LONG" else -1)
+                pnl_display = pnl_pct_raw * 100 * CONFIG.LEVERAGE
+            
+            # ИЗМЕНЕНО: PnL рассчитывается с учетом множителя размера позиции
+            size_factor = trade.get('size_factor', 1.0)
+            pnl_usd = CONFIG.POSITION_SIZE_USDT * size_factor * pnl_display / 100
+            
             app.bot_data.setdefault("trade_cooldown", {})[trade['Pair']] = time.time()
             mfe_atr, mfe_tp_pct = 0, 0
             atr_col = next((c for c in df_final.columns if c.startswith("ATR")), None)
             current_atr = df_final[atr_col].iloc[-1] if atr_col else trade.get("ATR_Entry")
-            if current_atr and current_atr > 0:
-                mfe_atr = abs(trade['MFE_Price'] - trade['Entry_Price']) / current_atr
+            if current_atr and current_atr > 0: mfe_atr = abs(trade['MFE_Price'] - trade['Entry_Price']) / current_atr
             tp_diff = abs(trade['TP_Price'] - trade['Entry_Price'])
-            if tp_diff > 0:
-                mfe_tp_pct = abs(trade['MFE_Price'] - trade['Entry_Price']) / tp_diff
+            if tp_diff > 0: mfe_tp_pct = abs(trade['MFE_Price'] - trade['Entry_Price']) / tp_diff
             else: mfe_tp_pct = 0
-            extra_fields = {"MFE_Price": trade['MFE_Price'], "MFE_ATR": round(mfe_atr, 2), "MFE_TP_Pct": round(mfe_tp_pct, 3)}
+
+            # ИЗМЕНЕНО: Исправлен баг с timezone
+            time_in_trade_str = "N/A"
+            try:
+                FMT = '%Y-%m-%d %H:%M:%S'
+                t_entry = datetime.strptime(trade['Timestamp_UTC'], FMT).replace(tzinfo=timezone.utc)
+                t_exit = datetime.now(timezone.utc)
+                time_in_trade = t_exit - t_entry
+                days = time_in_trade.days
+                hours, remainder = divmod(time_in_trade.seconds, 3600)
+                minutes, _ = divmod(remainder, 60)
+                if days > 0: time_in_trade_str = f"{days}d {hours}h {minutes}m"
+                else: time_in_trade_str = f"{hours}h {minutes}m"
+            except (ValueError, KeyError) as e:
+                log.warning(f"Could not calculate Time-in-Trade: {e}")
+            
+            extra_fields = {
+                "MFE_Price": trade['MFE_Price'], "MFE_ATR": round(mfe_atr, 2),
+                "MFE_TP_Pct": round(mfe_tp_pct, 3), "Time_in_Trade": time_in_trade_str
+            }
             if broadcast:
-                emoji = {"STOP_LOSS":"❌", "TAKE_PROFIT":"✅"}.get(reason, "⚠️")
+                emoji = {"STOP_LOSS":"❌", "TAKE_PROFIT":"✅", "TRAIL_STOP": "🛡️"}.get(reason, "⚠️")
                 mfe_info = f"MFE: {mfe_tp_pct:.1%} of TP ({mfe_atr:.1f} ATR)"
                 msg = (f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({reason})</b>\n\n"f"<b>Пара:</b> {trade['Pair']}\n"f"<b>Выход:</b> <code>{format_price(exit_price)}</code>\n"f"<b>Результат: ${pnl_usd:+.2f} ({pnl_display:+.2f}%)</b>\n"f"<i>{mfe_info}</i>")
                 await broadcast(app, msg)
@@ -338,26 +424,20 @@ async def scanner_main_loop(app: Application, broadcast):
     app.bot_data.setdefault("market_regime_cache", {})
     app.bot_data['broadcast_func'] = broadcast
     try:
-        import gspread
         creds_json = os.environ.get("GOOGLE_CREDENTIALS")
         sheet_key = os.environ.get("SHEET_ID")
         if not creds_json or not sheet_key:
             log.critical("GOOGLE_CREDENTIALS or SHEET_ID environment variables not set. Cannot start.")
             return
-        creds = json.loads(creds_json)
-        gc = gspread.service_account_from_dict(creds)
+        creds_dict = json.loads(creds_json)
+        gc = gspread.service_account_from_dict(creds_dict)
         sheet = gc.open_by_key(sheet_key)
-        
-        # ИЗМЕНЕНО: Вызываем новую функцию для создания/проверки листа
         await ensure_new_log_sheet(sheet)
-        
-        # Загружаем заголовки уже из нового, правильного листа
         trade_executor.get_headers(trade_executor.TRADE_LOG_WS)
         log.info("Google Sheets initialized successfully.")
     except Exception as e:
         log.critical(f"Could not initialize Google Sheets: {e}", exc_info=True)
-        raise
-    
+        return # Останавливаем бота, если Google Sheets не инициализирован
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 200})
     last_scan_time = 0; last_flush_time = 0; FLUSH_INTERVAL = 15
     while app.bot_data.get("bot_on", False):
