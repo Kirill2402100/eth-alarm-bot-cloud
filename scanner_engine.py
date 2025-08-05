@@ -68,10 +68,9 @@ async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
     try:
         ws = await loop.run_in_executor(None, lambda: gfile.worksheet(title))
         log.info(f"Worksheet '{title}' already exists.")
-    except gspread.WorksheetNotFound:
+    except gspread.exceptions.WorksheetNotFound:
         log.warning(f"Worksheet '{title}' not found. Creating...")
         try:
-            # ИЗМЕНЕНО: Увеличен лимит колонок до 30
             ws = await loop.run_in_executor(None, lambda: gfile.add_worksheet(title=title, rows=1000, cols=30))
             headers = [
                 "Signal_ID", "Timestamp_UTC", "Pair", "Side", "Status",
@@ -102,7 +101,6 @@ async def is_daily_bearish(symbol: str, exchange: ccxt.Exchange) -> bool:
         last = df.iloc[-1]
         return last["c"] < last["ema200"] and last["c"] < last["o"]
     except Exception:
-        # Не логируем ошибку, чтобы не спамить, просто считаем тренд неопределенным
         return False
 
 def format_price(price: float) -> str:
@@ -172,7 +170,6 @@ def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
 # ===========================================================================
 # MARKET SCANNER & TRADE MANAGER
 # ===========================================================================
-# ИЗМЕНЕНО: Функция переработана для параллельной проверки дневного тренда
 async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     bot_data = app.bot_data
     if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
@@ -200,7 +197,6 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     tasks = [safe_fetch_ohlcv(symbol) for symbol in liquid_pairs]
     ohlcv_results = await asyncio.gather(*tasks)
     
-    # --- Шаг 1: Первичный отбор кандидатов ---
     pre_long_candidates, pre_short_candidates = [], []
     for i, ohlcv in enumerate(ohlcv_results):
         symbol = liquid_pairs[i]
@@ -223,13 +219,11 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
                 candidate_data = {'symbol': symbol, 'side': side, 'df': df}
                 if side == "LONG":
                     if market_is_bull is not False: pre_long_candidates.append(candidate_data)
-                else: # SHORT
+                else:
                     if market_is_bull is not True: pre_short_candidates.append(candidate_data)
         except Exception as e:
             log.error(f"Error pre-processing symbol {symbol}: {e}")
 
-    # --- Шаг 2: Параллельная проверка доп. фильтров ---
-    # Для LONG: проверка funding rate
     final_long_candidates = []
     for cand in pre_long_candidates:
         try:
@@ -242,7 +236,6 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
         except (KeyError, TypeError, ValueError) as e:
             log.warning(f"Could not fetch or parse funding rate for {cand['symbol']}, skipping: {e}")
 
-    # Для SHORT: проверка дневного тренда
     daily_check_tasks = [is_daily_bearish(c['symbol'], exchange) for c in pre_short_candidates]
     daily_results = await asyncio.gather(*daily_check_tasks)
     final_short_candidates = []
@@ -252,7 +245,6 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
         else:
             log.info(f"Skip SHORT {cand['symbol']}: daily trend is not decisively bearish.")
 
-    # --- Шаг 3: Финальный скоринг и отбор ---
     all_candidates = []
     for cand in final_long_candidates + final_short_candidates:
         try:
@@ -266,7 +258,6 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             risk_usd_raw = (sl_pct / 100) * CONFIG.POSITION_SIZE_USDT * CONFIG.LEVERAGE
             risk_norm = np.tanh(risk_usd_raw / CONFIG.RISK_SCALE)
             quote_volume = tickers.get(cand['symbol'], {}).get('quoteVolume') or CONFIG.MIN_VOL_USD
-            # ИЗМЕНЕНО: Вес объема в скоринге снижен
             score = (0.35 * np.log10(quote_volume) - 0.25 * risk_norm + 0.30 * edge)
             all_candidates.append({'symbol': cand['symbol'], 'side': cand['side'], 'entry_price': entry_price, 'atr': atr, 'score': score})
         except Exception as e:
@@ -391,10 +382,9 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
         for trade, reason, df_final in trades_to_close:
             exit_price = df_final.iloc[-1]['close']
             
-            # ИЗМЕНЕНО: Исправлен баг с расчетом PnL для STOP_LOSS
             if reason == "TAKE_PROFIT":
                 pnl_display = trade['tp_pct'] * CONFIG.LEVERAGE
-            else: # STOP_LOSS или INVALIDATION
+            else:
                 pnl_pct_raw = ((exit_price - trade['Entry_Price']) / trade['Entry_Price']) * (1 if trade['Side'] == "LONG" else -1)
                 pnl_display = pnl_pct_raw * 100 * CONFIG.LEVERAGE
             
@@ -461,8 +451,13 @@ async def scanner_main_loop(app: Application, broadcast):
     except Exception as e:
         log.critical(f"Could not initialize Google Sheets during startup: {e}", exc_info=True)
         return
+        
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 200})
-    last_scan_time = 0; last_flush_time = 0; FLUSH_INTERVAL = 15
+    
+    # ИЗМЕНЕНО: Восстановлена переменная last_scan_time
+    last_scan_time = 0
+    last_flush_time = 0
+    
     while app.bot_data.get("bot_on", False):
         try:
             current_time = time.time()
@@ -471,16 +466,22 @@ async def scanner_main_loop(app: Application, broadcast):
                 await find_trade_signals(exchange, app)
                 last_scan_time = current_time
                 log.info("--- Scan Finished ---")
+            
             await monitor_active_trades(exchange, app)
-            if current_time - last_flush_time >= FLUSH_INTERVAL:
+            
+            # Динамический сброс буфера
+            if len(trade_executor.PENDING_TRADES) >= 20 or \
+               (current_time - last_flush_time >= 15 and trade_executor.PENDING_TRADES):
                 await trade_executor.flush_log_buffers()
                 last_flush_time = current_time
+
             await asyncio.sleep(CONFIG.TICK_MONITOR_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             log.info("Main loop cancelled."); break
         except Exception as e:
             log.error(f"Error in main loop: {e}", exc_info=True)
             await asyncio.sleep(30)
+            
     await trade_executor.flush_log_buffers()
     await exchange.close()
     log.info("Scanner Engine loop stopped.")
