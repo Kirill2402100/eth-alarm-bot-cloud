@@ -46,10 +46,12 @@ class CONFIG:
     ATR_PERIOD = 14
     ATR_SPIKE_MULT = 2.5
     ATR_COOLDOWN_BARS = 3
-    ATR_SL_MULT = 1.8
-    RISK_REWARD = 1.0
-    SL_MIN_PCT = 1.0
-    SL_MAX_PCT = 5.0
+    
+    SL_FIXED_PCT = 1.0
+    TP_FIXED_PCT = 2.0
+    TRAIL_TRIGGER_PCT = 1.2
+    TRAIL_PROFIT_LOCK_PCT = 1.0
+
     SCANNER_INTERVAL_SECONDS = 300
     TICK_MONITOR_INTERVAL_SECONDS = 15
     OHLCV_LIMIT = 250
@@ -60,6 +62,7 @@ class CONFIG:
 # HELPERS
 # ===========================================================================
 
+# ... (ensure_new_log_sheet, is_daily_bearish, format_price и другие хелперы до fixed_percentage_levels) ...
 async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
     """Создаёт лист 'Trading_Log_v2', обеспечивая безопасное завершение при ошибках."""
     loop = asyncio.get_running_loop()
@@ -138,16 +141,23 @@ def tf_seconds(tf: str) -> int:
     if unit == "h": return n * 3600
     if unit == "d": return n * 86400
     return 0
-def atr_based_levels(entry: float, atr: float, side: str) -> tuple[float, float, float]:
-    sl_pct = CONFIG.ATR_SL_MULT * atr / entry * 100
-    sl_pct = min(max(sl_pct, CONFIG.SL_MIN_PCT), CONFIG.SL_MAX_PCT)
+
+# ИЗМЕНЕНО: Функция теперь принимает symbol и exchange для округления цен
+def fixed_percentage_levels(symbol: str, entry: float, side: str, exchange: ccxt.Exchange) -> tuple[float, float]:
+    """Calculates SL/TP and rounds them to the exchange's price precision."""
     if side == "LONG":
-        sl_price = entry * (1 - sl_pct / 100)
-        tp_price = entry * (1 + sl_pct * CONFIG.RISK_REWARD / 100)
-    else:
-        sl_price = entry * (1 + sl_pct / 100)
-        tp_price = entry * (1 - sl_pct * CONFIG.RISK_REWARD / 100)
-    return sl_price, tp_price, sl_pct
+        sl_price_raw = entry * (1 - CONFIG.SL_FIXED_PCT / 100)
+        tp_price_raw = entry * (1 + CONFIG.TP_FIXED_PCT / 100)
+    else: # SHORT
+        sl_price_raw = entry * (1 + CONFIG.SL_FIXED_PCT / 100)
+        tp_price_raw = entry * (1 - CONFIG.TP_FIXED_PCT / 100)
+    
+    # Округляем до шага цены, поддерживаемого биржей
+    sl_price = float(exchange.price_to_precision(symbol, sl_price_raw))
+    tp_price = float(exchange.price_to_precision(symbol, tp_price_raw))
+    
+    return sl_price, tp_price
+
 def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
     if len(df) < 2: return None
     last = df.iloc[-1]
@@ -171,6 +181,7 @@ def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
 # MARKET SCANNER & TRADE MANAGER
 # ===========================================================================
 async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
+    # ... (код до Шага 3 остается прежним) ...
     bot_data = app.bot_data
     if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
         log.info("Position limit reached. Skipping scan."); return
@@ -244,20 +255,25 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             final_short_candidates.append(cand)
         else:
             log.info(f"Skip SHORT {cand['symbol']}: daily trend is not decisively bearish.")
-
+            
+    # --- Шаг 3: Финальный скоринг и отбор ---
     all_candidates = []
     for cand in final_long_candidates + final_short_candidates:
         try:
             df = cand['df']
-            atr_col = next((c for c in df.columns if c.startswith("ATR")), None)
             entry_price = df.iloc[-1]['close']
-            atr = df[atr_col].iloc[-1]
-            if atr == 0: continue
-            _, tp_price, sl_pct = atr_based_levels(entry_price, atr, cand['side'])
-            edge = max(abs(tp_price - entry_price) / atr, 1.0)
-            risk_usd_raw = (sl_pct / 100) * CONFIG.POSITION_SIZE_USDT * CONFIG.LEVERAGE
+            atr_col = next((c for c in df.columns if c.startswith("ATR")), None)
+            atr = df[atr_col].iloc[-1] if atr_col and not pd.isna(df[atr_col].iloc[-1]) else 0
+            
+            # ИЗМЕНЕНО: Восстановлена логика скоринга с учетом волатильности (edge)
+            risk_usd_raw = (CONFIG.SL_FIXED_PCT / 100) * CONFIG.POSITION_SIZE_USDT * CONFIG.LEVERAGE
             risk_norm = np.tanh(risk_usd_raw / CONFIG.RISK_SCALE)
             quote_volume = tickers.get(cand['symbol'], {}).get('quoteVolume') or CONFIG.MIN_VOL_USD
+            
+            # `edge` показывает, насколько ожидаемый профит больше текущей волатильности
+            tp_move = entry_price * CONFIG.TP_FIXED_PCT / 100
+            edge = max(tp_move / atr, 1.0) if atr > 0 else 1.0
+            
             score = (0.35 * np.log10(quote_volume) - 0.25 * risk_norm + 0.30 * edge)
             all_candidates.append({'symbol': cand['symbol'], 'side': cand['side'], 'entry_price': entry_price, 'atr': atr, 'score': score})
         except Exception as e:
@@ -277,7 +293,7 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     opened_long, opened_short = 0, 0
     trades_left_to_open = CONFIG.MAX_CONCURRENT_POSITIONS - len(bot_data.get("active_trades", []))
     for candidate in selected_candidates[:trades_left_to_open]:
-        await open_new_trade(candidate['symbol'], candidate['side'], candidate['entry_price'], candidate['atr'], app)
+        await open_new_trade(candidate['symbol'], candidate['side'], candidate['entry_price'], exchange, app, atr_entry=candidate['atr'])
         if candidate['side'] == "LONG": opened_long += 1
         else: opened_short += 1
     if pre_long_candidates or pre_short_candidates:
@@ -285,77 +301,95 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
         if broadcast := app.bot_data.get('broadcast_func'):
             await broadcast(app, msg)
 
-async def open_new_trade(symbol: str, side: str, entry_price: float, atr_last: float, app: Application):
+# ИЗМЕНЕНО: Функция теперь принимает exchange для округления цен
+async def open_new_trade(symbol: str, side: str, entry_price: float, exchange: ccxt.Exchange, app: Application, atr_entry: float):
     bot_data = app.bot_data
-    sl_price, tp_price, sl_pct = atr_based_levels(entry_price, atr_last, side)
-    sl_shift_pct = sl_pct * 0.5 / 100
-    tp_pct = sl_pct * CONFIG.RISK_REWARD
+    sl_price, tp_price = fixed_percentage_levels(symbol, entry_price, side, exchange)
+
     trade = {
         "Signal_ID": f"{symbol}_{int(time.time())}", "Pair": symbol, "Side": side,
         "Entry_Price": entry_price, "SL_Price": sl_price, "TP_Price": tp_price,
         "Status": "ACTIVE", "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        "sl_pct": sl_pct, "tp_pct": tp_pct, "ATR_Entry": atr_last, "MFE_Price": entry_price,
-        "SL_shift_pct": sl_shift_pct,
+        "sl_pct": CONFIG.SL_FIXED_PCT, 
+        "tp_pct": CONFIG.TP_FIXED_PCT,
+        "ATR_Entry": atr_entry,
+        "MFE_Price": entry_price,
         "sl_shifted": False
     }
     bot_data.setdefault("active_trades", []).append(trade)
     log.info(f"New trade signal: {trade}")
+    
     if broadcast := app.bot_data.get('broadcast_func'):
-        sl_disp = round(sl_pct * CONFIG.LEVERAGE); tp_disp = round(tp_pct * CONFIG.LEVERAGE)
-        msg = (f"🔥 <b>НОВЫЙ СИГНАЛ ({side})</b>\n\n"f"<b>Пара:</b> {symbol}\n<b>Вход:</b> <code>{format_price(entry_price)}</code>\n"f"<b>SL:</b> <code>{format_price(sl_price)}</code> (-{sl_disp}%)\n"f"<b>TP:</b> <code>{format_price(tp_price)}</code> (+{tp_disp}%)")
+        sl_disp = round(CONFIG.SL_FIXED_PCT * CONFIG.LEVERAGE)
+        tp_disp = round(CONFIG.TP_FIXED_PCT * CONFIG.LEVERAGE)
+        msg = (f"🔥 <b>НОВЫЙ СИГНАЛ ({side})</b>\n\n"
+               f"<b>Пара:</b> {symbol}\n<b>Вход:</b> <code>{format_price(entry_price)}</code>\n"
+               f"<b>SL:</b> <code>{format_price(sl_price)}</code> (-{sl_disp}%)\n"
+               f"<b>TP:</b> <code>{format_price(tp_price)}</code> (+{tp_disp}%)")
         await broadcast(app, msg)
+        
     await trade_executor.log_open_trade(trade)
 
 async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
     bot_data = app.bot_data
     active_trades = bot_data.get("active_trades", [])
     if not active_trades: return
+    
     trades_to_close = []
     symbols = [t['Pair'] for t in active_trades]
     sem = asyncio.Semaphore(CONFIG.CONCURRENCY_SEMAPHORE)
+    
     async def safe_fetch_ohlcv(symbol):
         async with sem:
             try: return await exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=CONFIG.OHLCV_LIMIT)
             except Exception: return None
+            
     tasks = [safe_fetch_ohlcv(s) for s in symbols]
     ohlcv_results = await asyncio.gather(*tasks)
     broadcast = app.bot_data.get('broadcast_func')
+    
     for i, trade in enumerate(active_trades):
         try:
             ohlcv = ohlcv_results[i]
             if not ohlcv: continue
+            
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             current_price = df.iloc[-1]['close']
+            
             if trade['Side'] == 'LONG':
                 trade['MFE_Price'] = max(trade.get('MFE_Price', current_price), current_price)
             else:
                 trade['MFE_Price'] = min(trade.get('MFE_Price', current_price), current_price)
 
             if not trade.get("sl_shifted"):
-                progress = 0
-                tp_diff = trade['TP_Price'] - trade['Entry_Price']
-                if abs(tp_diff) > 0:
-                    progress = (current_price - trade['Entry_Price']) / tp_diff if trade['Side'] == 'LONG' else \
-                               (trade['Entry_Price'] - current_price) / abs(tp_diff)
-                if progress >= 0.50:
+                profit_pct = ((current_price - trade['Entry_Price']) / trade['Entry_Price'] * 100) if trade['Side'] == 'LONG' else ((trade['Entry_Price'] - current_price) / trade['Entry_Price'] * 100)
+
+                if profit_pct >= CONFIG.TRAIL_TRIGGER_PCT:
                     if trade['Side'] == 'LONG':
-                        trade['SL_Price'] = trade['Entry_Price'] * (1 + trade['SL_shift_pct'])
+                        new_sl_raw = trade['Entry_Price'] * (1 + CONFIG.TRAIL_PROFIT_LOCK_PCT / 100)
                     else:
-                        trade['SL_Price'] = trade['Entry_Price'] * (1 - trade['SL_shift_pct'])
+                        new_sl_raw = trade['Entry_Price'] * (1 - CONFIG.TRAIL_PROFIT_LOCK_PCT / 100)
+                    
+                    new_sl = float(exchange.price_to_precision(trade['Pair'], new_sl_raw))
+                    trade['SL_Price'] = new_sl
                     trade['sl_shifted'] = True
-                    log.info(f"SL moved to +0.5R for {trade['Pair']}. New SL: {trade['SL_Price']}")
+                    log.info(f"SL moved to profit lock for {trade['Pair']}. New SL: {new_sl}")
+                    
+                    if broadcast:
+                        # ИЗМЕНЕНО: Корректный знак для LONG/SHORT
+                        sign = "+" if trade['Side'] == "LONG" else "-"
+                        msg = (f"🛡️ <b>СТОП ПЕРЕНЕСЕН В ПРИБЫЛЬ</b>\n\n"
+                               f"<b>Пара:</b> {trade['Pair']}\n"
+                               f"<b>Новый SL:</b> <code>{format_price(new_sl)}</code> ({sign}{CONFIG.TRAIL_PROFIT_LOCK_PCT:.2f}%)")
+                        await broadcast(app, msg)
 
             df_indicators = df.copy()
             if len(df_indicators) < CONFIG.EMA_TREND_PERIOD: continue
             df_indicators.ta.ema(length=CONFIG.EMA_FAST_PERIOD, append=True); df_indicators.ta.ema(length=CONFIG.EMA_SLOW_PERIOD, append=True)
-            df_indicators.ta.ema(length=CONFIG.EMA_TREND_PERIOD, append=True)
-            df_indicators.ta.stochrsi(length=CONFIG.STOCH_RSI_PERIOD, k=CONFIG.STOCH_RSI_K, d=CONFIG.STOCH_RSI_D, append=True)
-            last = df_indicators.iloc[-1]; prev = df_indicators.iloc[-2]
+            
+            last = df_indicators.iloc[-1]
             exit_reason = None
-            stoch_k_col = next((c for c in df_indicators.columns if c.startswith("STOCHRSIk_")), None)
-            stoch_d_col = next((c for c in df_indicators.columns if c.startswith("STOCHRSId_")), None)
-            if not stoch_k_col or not stoch_d_col: continue
-
+            
             if trade['Side'] == 'LONG':
                 if current_price <= trade['SL_Price']: exit_reason = "STOP_LOSS"
                 elif current_price >= trade['TP_Price']: exit_reason = "TAKE_PROFIT"
@@ -364,20 +398,18 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                 elif current_price <= trade['TP_Price']: exit_reason = "TAKE_PROFIT"
             
             if not exit_reason:
-                ema_fast = last[f"EMA_{CONFIG.EMA_FAST_PERIOD}"]; ema_slow = last[f"EMA_{CONFIG.EMA_SLOW_PERIOD}"]
-                k_now = last[stoch_k_col]; k_prev = prev[stoch_k_col]
-                d_now = last[stoch_d_col]; d_prev = prev[stoch_d_col]
-                if trade['Side'] == 'LONG':
-                    if ema_fast < ema_slow: exit_reason = "INVALIDATION_EMA_CROSS"
-                    elif k_prev > d_prev and k_now <= d_now and k_now < CONFIG.STOCH_OVERBOUGHT_LEVEL: exit_reason = "INVALIDATION_STOCH_RSI"
-                else:
-                    if ema_fast > ema_slow: exit_reason = "INVALIDATION_EMA_CROSS"
-                    elif k_prev < d_prev and k_now >= d_now and k_now > CONFIG.STOCH_OVERSOLD_LEVEL: exit_reason = "INVALIDATION_STOCH_RSI"
+                ema_fast = last[f"EMA_{CONFIG.EMA_FAST_PERIOD}"]
+                ema_slow = last[f"EMA_{CONFIG.EMA_SLOW_PERIOD}"]
+                if trade['Side'] == 'LONG' and ema_fast < ema_slow:
+                    exit_reason = "INVALIDATION_EMA_CROSS"
+                elif trade['Side'] == 'SHORT' and ema_fast > ema_slow:
+                    exit_reason = "INVALIDATION_EMA_CROSS"
             
             if exit_reason: trades_to_close.append((trade, exit_reason, df_indicators))
         except Exception as e:
             log.error(f"Error monitoring trade for {trade['Pair']}: {e}", exc_info=True)
             
+    # ... (код закрытия сделок, PnL и main_loop остается без изменений) ...
     if trades_to_close:
         for trade, reason, df_final in trades_to_close:
             exit_price = df_final.iloc[-1]['close']
@@ -454,7 +486,6 @@ async def scanner_main_loop(app: Application, broadcast):
         
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 200})
     
-    # ИЗМЕНЕНО: Восстановлена переменная last_scan_time
     last_scan_time = 0
     last_flush_time = 0
     
@@ -469,7 +500,6 @@ async def scanner_main_loop(app: Application, broadcast):
             
             await monitor_active_trades(exchange, app)
             
-            # Динамический сброс буфера
             if len(trade_executor.PENDING_TRADES) >= 20 or \
                (current_time - last_flush_time >= 15 and trade_executor.PENDING_TRADES):
                 await trade_executor.flush_log_buffers()
