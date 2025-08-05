@@ -58,11 +58,18 @@ class CONFIG:
     CONCURRENCY_SEMAPHORE = 8
     MAX_FUNDING_RATE_PCT = 0.075
 
+    NOTIFY_EMPTY_SCAN = False
+
+    # Заглушки для обратной совместимости с внешними модулями (например, /status)
+    ATR_SL_MULT = 0
+    SL_MIN_PCT = SL_FIXED_PCT
+    SL_MAX_PCT = SL_FIXED_PCT
+    RISK_REWARD = TP_FIXED_PCT / SL_FIXED_PCT if SL_FIXED_PCT > 0 else 0
+
 # ===========================================================================
 # HELPERS
 # ===========================================================================
 
-# ... (ensure_new_log_sheet, is_daily_bearish, format_price и другие хелперы до fixed_percentage_levels) ...
 async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
     """Создаёт лист 'Trading_Log_v2', обеспечивая безопасное завершение при ошибках."""
     loop = asyncio.get_running_loop()
@@ -141,8 +148,6 @@ def tf_seconds(tf: str) -> int:
     if unit == "h": return n * 3600
     if unit == "d": return n * 86400
     return 0
-
-# ИЗМЕНЕНО: Функция теперь принимает symbol и exchange для округления цен
 def fixed_percentage_levels(symbol: str, entry: float, side: str, exchange: ccxt.Exchange) -> tuple[float, float]:
     """Calculates SL/TP and rounds them to the exchange's price precision."""
     if side == "LONG":
@@ -152,12 +157,10 @@ def fixed_percentage_levels(symbol: str, entry: float, side: str, exchange: ccxt
         sl_price_raw = entry * (1 + CONFIG.SL_FIXED_PCT / 100)
         tp_price_raw = entry * (1 - CONFIG.TP_FIXED_PCT / 100)
     
-    # Округляем до шага цены, поддерживаемого биржей
     sl_price = float(exchange.price_to_precision(symbol, sl_price_raw))
     tp_price = float(exchange.price_to_precision(symbol, tp_price_raw))
     
     return sl_price, tp_price
-
 def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
     if len(df) < 2: return None
     last = df.iloc[-1]
@@ -181,7 +184,6 @@ def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
 # MARKET SCANNER & TRADE MANAGER
 # ===========================================================================
 async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
-    # ... (код до Шага 3 остается прежним) ...
     bot_data = app.bot_data
     if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
         log.info("Position limit reached. Skipping scan."); return
@@ -255,8 +257,7 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             final_short_candidates.append(cand)
         else:
             log.info(f"Skip SHORT {cand['symbol']}: daily trend is not decisively bearish.")
-            
-    # --- Шаг 3: Финальный скоринг и отбор ---
+
     all_candidates = []
     for cand in final_long_candidates + final_short_candidates:
         try:
@@ -265,12 +266,10 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             atr_col = next((c for c in df.columns if c.startswith("ATR")), None)
             atr = df[atr_col].iloc[-1] if atr_col and not pd.isna(df[atr_col].iloc[-1]) else 0
             
-            # ИЗМЕНЕНО: Восстановлена логика скоринга с учетом волатильности (edge)
             risk_usd_raw = (CONFIG.SL_FIXED_PCT / 100) * CONFIG.POSITION_SIZE_USDT * CONFIG.LEVERAGE
             risk_norm = np.tanh(risk_usd_raw / CONFIG.RISK_SCALE)
             quote_volume = tickers.get(cand['symbol'], {}).get('quoteVolume') or CONFIG.MIN_VOL_USD
             
-            # `edge` показывает, насколько ожидаемый профит больше текущей волатильности
             tp_move = entry_price * CONFIG.TP_FIXED_PCT / 100
             edge = max(tp_move / atr, 1.0) if atr > 0 else 1.0
             
@@ -296,12 +295,17 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
         await open_new_trade(candidate['symbol'], candidate['side'], candidate['entry_price'], exchange, app, atr_entry=candidate['atr'])
         if candidate['side'] == "LONG": opened_long += 1
         else: opened_short += 1
-    if pre_long_candidates or pre_short_candidates:
-        msg = (f"🔍 <b>SCAN ({CONFIG.TIMEFRAME})</b>\n\n"f"Найдено сигналов: LONG-<b>{len(long_cand_sorted)}</b> | SHORT-<b>{len(short_cand_sorted)}</b>\n"f"Открыто (лучшие по score): LONG-<b>{opened_long}</b> | SHORT-<b>{opened_short}</b>")
+
+    total_found = len(long_cand_sorted) + len(short_cand_sorted)
+    should_notify = CONFIG.NOTIFY_EMPTY_SCAN or total_found > 0
+
+    if should_notify:
+        msg = (f"🔍 <b>SCAN ({CONFIG.TIMEFRAME})</b>\n\n"
+               f"Найдено сигналов: LONG-<b>{len(long_cand_sorted)}</b> | SHORT-<b>{len(short_cand_sorted)}</b>\n"
+               f"Открыто (лучшие по score): LONG-<b>{opened_long}</b> | SHORT-<b>{opened_short}</b>")
         if broadcast := app.bot_data.get('broadcast_func'):
             await broadcast(app, msg)
 
-# ИЗМЕНЕНО: Функция теперь принимает exchange для округления цен
 async def open_new_trade(symbol: str, side: str, entry_price: float, exchange: ccxt.Exchange, app: Application, atr_entry: float):
     bot_data = app.bot_data
     sl_price, tp_price = fixed_percentage_levels(symbol, entry_price, side, exchange)
@@ -376,7 +380,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                     log.info(f"SL moved to profit lock for {trade['Pair']}. New SL: {new_sl}")
                     
                     if broadcast:
-                        # ИЗМЕНЕНО: Корректный знак для LONG/SHORT
                         sign = "+" if trade['Side'] == "LONG" else "-"
                         msg = (f"🛡️ <b>СТОП ПЕРЕНЕСЕН В ПРИБЫЛЬ</b>\n\n"
                                f"<b>Пара:</b> {trade['Pair']}\n"
@@ -409,7 +412,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
         except Exception as e:
             log.error(f"Error monitoring trade for {trade['Pair']}: {e}", exc_info=True)
             
-    # ... (код закрытия сделок, PnL и main_loop остается без изменений) ...
     if trades_to_close:
         for trade, reason, df_final in trades_to_close:
             exit_price = df_final.iloc[-1]['close']
