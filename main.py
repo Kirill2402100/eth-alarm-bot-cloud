@@ -120,10 +120,11 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if is_running:
         scanner_status = "⏸️ НА ПАУЗЕ" if is_paused else "⚡️ РАБОТАЕТ"
 
-    # ИЗМЕНЕНО: Блок параметров теперь не содержит трейлинг и использует актуальные атрибуты
+    # ИЗМЕНЕНО: Блок параметров теперь отображает данные для стратегии "Wick-Spike"
     params_msg = (
-        f"• <b>SL:</b> {cfg.ATR_SL_MULT:.2f} × ATR\n"
-        f"• <b>TP:</b> {cfg.RISK_REWARD:.1f} × SL (RR 1:{cfg.RISK_REWARD:.1f})\n"
+        f"• <b>Стратегия:</b> Wick-Spike\n"
+        f"• <b>SL:</b> {cfg.SL_PCT:.2f}%\n"
+        f"• <b>TP:</b> {cfg.TP_PCT:.2f}%\n"
     )
 
     msg = (
