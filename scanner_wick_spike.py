@@ -27,6 +27,7 @@ class CONFIG:
     MAX_CONCURRENT_POSITIONS = 10
     CONCURRENCY_SEMAPHORE   = 10
 
+    # ИЗМЕНЕНО: Снижен порог ликвидности
     MIN_QUOTE_VOLUME_USD = 300_000
     MIN_PRICE = 0.001
 
@@ -46,9 +47,9 @@ class CONFIG:
     SCAN_INTERVAL_SECONDS  = 30
     TICK_MONITOR_SECONDS   = 5
 
-    # ДОБАВЛЕНО: Заглушки для обратной совместимости с main.py
-    ATR_SL_MULT = 1.0  # Не используется в логике, но нужно для /status
-    RISK_REWARD = 2.0  # Не используется в логике, но нужно для /status
+    # Заглушки для обратной совместимости с командой /status в main.py
+    ATR_SL_MULT = 0 # Не используется в логике, но нужно для /status
+    RISK_REWARD = TP_PCT / SL_PCT if SL_PCT > 0 else 0 # Не используется, но нужно для /status
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -102,8 +103,13 @@ async def scanner_main_loop(app: Application, broadcast):
 
     while app.bot_data.get("bot_on", False):
         try:
-            await _run_scan(exchange, app)
+            # ИЗМЕНЕНО: Проверяем флаг паузы перед сканированием
+            if not app.bot_data.get("scan_paused", False):
+                await _run_scan(exchange, app)
+            
+            # Мониторинг работает всегда
             await _monitor_trades(exchange, app)
+            
             await asyncio.sleep(CONFIG.SCAN_INTERVAL_SECONDS)
         except Exception as e:
             log.error(f"main loop error: {e}", exc_info=True)
@@ -123,6 +129,10 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                   if (t.get("quoteVolume") or 0) > CONFIG.MIN_QUOTE_VOLUME_USD
                   and exchange.market(s).get("type") == "swap"
                   and s.endswith("USDT:USDT")]
+        
+        # ДОБАВЛЕНО: Логирование количества пар
+        log.info(f"Wick-Scan: получено {len(tickers)} пар; после фильтра ликвидности – {len(liquid)}")
+
     except Exception as e:
         log.warning(f"ticker fetch failed: {e}")
         return
@@ -138,6 +148,10 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
     bars = await asyncio.gather(*[fetch_tf(s) for s in liquid])
 
+    # ДОБАВЛЕНО: Счетчики для итогового лога
+    found_count = 0
+    opened_count = 0
+
     for symbol, ohlcv in bars:
         if not ohlcv:
             continue
@@ -152,14 +166,28 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         vol_sigma = df["volume"].rolling(CONFIG.VOL_WINDOW).std()
         df["vol_z"] = (df["volume"] - vol_mu) / vol_sigma
         last = df.iloc[-1]
+        
+        # Проверяем, что в данных нет NaN, чтобы избежать ошибок
+        if pd.isna(last["vol_z"]) or pd.isna(last["atr"]):
+            continue
+
         if last["vol_z"] < CONFIG.VOL_Z_THRESHOLD:
             continue
 
         ok, side = is_spike(last, last["atr"])
         if not ok:
             continue
+        
+        found_count += 1
 
-        await _open_trade(symbol, side, last, exchange, app)
+        # Проверяем лимит позиций перед открытием
+        if len(bt.get("active_trades", [])) + opened_count < CONFIG.MAX_CONCURRENT_POSITIONS:
+            await _open_trade(symbol, side, last, exchange, app)
+            opened_count += 1
+    
+    # ДОБАВЛЕНО: Итоговое сообщение в лог
+    if found_count > 0 or opened_count > 0:
+        log.info(f"Wick-Scan завершён: найдено {found_count} шпилей, открыто {opened_count} сделок.")
 
 # ---------------------------------------------------------------------------
 async def _open_trade(symbol: str, side: str, candle: pd.Series,
