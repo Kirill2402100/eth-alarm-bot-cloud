@@ -6,7 +6,7 @@ import logging
 from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, PicklePersistence
 
-import scanner_wick_spike
+import scanner_wick_spike as scanner_engine
 import trade_executor
 
 # --- Конфигурация ---
