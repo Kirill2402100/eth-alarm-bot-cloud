@@ -23,16 +23,21 @@ log = logging.getLogger("swing_bot_engine")
 # CONFIGURATION
 # ===========================================================================
 class CONFIG:
+    # --- Основные параметры ---
     MARKET_REGIME_FILTER = True
     MARKET_REGIME_CACHE_TTL_SECONDS = 1800
     TIMEFRAME = "15m"
     POSITION_SIZE_USDT = 10.0
     LEVERAGE = 20
-    MAX_CONCURRENT_POSITIONS = 10
-    MAX_TRADES_PER_SCAN = 4
+    
+    # --- Лимиты и риски ---
+    MAX_CONCURRENT_POSITIONS = 5
+    MAX_TRADES_PER_SCAN = 2
     MIN_VOL_USD = 700_000
     RISK_SCALE = POSITION_SIZE_USDT / 2
     MIN_PRICE = 0.001
+    
+    # --- Параметры индикаторов ---
     EMA_FAST_PERIOD = 9
     EMA_SLOW_PERIOD = 21
     EMA_TREND_PERIOD = 200
@@ -40,19 +45,30 @@ class CONFIG:
     STOCH_RSI_PERIOD = 14
     STOCH_RSI_K = 3
     STOCH_RSI_D = 3
-    STOCH_RSI_MID = 50
     
+    # --- Параметры свечей и волатильности ---
     ATR_PERIOD = 14
     ATR_SPIKE_MULT = 2.5
     ATR_COOLDOWN_BARS = 3
     
-    SL_FIXED_PCT = 1.0
-    TP_FIXED_PCT = 2.0
-    TRAIL_TRIGGER_PCT = 1.2
-    TRAIL_PROFIT_LOCK_PCT = 1.0
-    SECOND_TRAIL_TRIGGER_PCT = 0.7
-    SECOND_TRAIL_LOCK_PCT = 0.3
+    # --- Параметры стратегии и риска ---
+    SL_FIXED_PCT = 1.0              # Фиксированный стоп-лосс в процентах
+    TP_FIXED_PCT = 2.0              # Фиксированный тейк-профит в процентах
+    
+    # --- Параметры двухэтапного переноса стопа ---
+    TRAIL_TRIGGER_PCT = 1.2         # % прибыли для активации 2-го переноса стопа
+    TRAIL_PROFIT_LOCK_PCT = 1.0     # % прибыли для фиксации на 2-м этапе
+    SECOND_TRAIL_TRIGGER_PCT = 0.7  # % прибыли для активации 1-го переноса стопа
+    SECOND_TRAIL_LOCK_PCT = 0.3     # % прибыли для фиксации на 1-м этапе
 
+    # --- Дополнительные фильтры и выходы ---
+    STOCH_ENTRY_OVERSOLD = 25       # Stoch RSI должен быть НИЖЕ этого уровня для входа в LONG
+    STOCH_ENTRY_OVERBOUGHT = 75     # Stoch RSI должен быть ВЫШЕ этого уровня для входа в SHORT
+    IMPULSE_CANDLE_ATR_MULT = 1.5   # Макс. размер свечи входа (в ATR) для отсечения аномалий
+    TIME_STOP_MINUTES = 30          # Макс. время в сделке (в минутах) до проверки MFE
+    TIME_STOP_MFE_THRESHOLD = 0.3   # Порог MFE. Если цена не прошла 30% пути к TP, сделка закроется по тайм-стопу
+
+    # --- Системные параметры ---
     SCANNER_INTERVAL_SECONDS = 300
     TICK_MONITOR_INTERVAL_SECONDS = 15
     OHLCV_LIMIT = 250
@@ -62,9 +78,10 @@ class CONFIG:
 
 # ===========================================================================
 # HELPERS
-# ... (Этот раздел без изменений)
 # ===========================================================================
+
 async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
+    """Создаёт лист 'Trading_Log_v2', обеспечивая безопасное завершение при ошибках."""
     loop = asyncio.get_running_loop()
     title = "Trading_Log_v2"
     ws = None
@@ -89,8 +106,10 @@ async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
     except Exception as e:
         log.critical(f"An unexpected error occurred with Google Sheets: {e}")
         raise
+
     trade_executor.TRADE_LOG_WS = ws
     trade_executor.TRADING_HEADERS_CACHE = None
+
 async def is_daily_bearish(symbol: str, exchange: ccxt.Exchange) -> bool:
     try:
         ohlcv = await exchange.fetch_ohlcv(symbol, "1d", limit=201)
@@ -103,6 +122,7 @@ async def is_daily_bearish(symbol: str, exchange: ccxt.Exchange) -> bool:
         return last["c"] < last["ema200"] and last["c"] < last["o"]
     except Exception:
         return False
+
 def format_price(price: float) -> str:
     if price < 0.01: return f"{price:.6f}"
     elif price < 1.0: return f"{price:.5f}"
@@ -139,37 +159,49 @@ def tf_seconds(tf: str) -> int:
     if unit == "d": return n * 86400
     return 0
 def fixed_percentage_levels(symbol: str, entry: float, side: str, exchange: ccxt.Exchange) -> tuple[float, float]:
+    """Calculates SL/TP and rounds them to the exchange's price precision."""
     if side == "LONG":
         sl_price_raw = entry * (1 - CONFIG.SL_FIXED_PCT / 100)
         tp_price_raw = entry * (1 + CONFIG.TP_FIXED_PCT / 100)
-    else:
+    else: # SHORT
         sl_price_raw = entry * (1 + CONFIG.SL_FIXED_PCT / 100)
         tp_price_raw = entry * (1 - CONFIG.TP_FIXED_PCT / 100)
+    
     sl_price = float(exchange.price_to_precision(symbol, sl_price_raw))
     tp_price = float(exchange.price_to_precision(symbol, tp_price_raw))
+    
     return sl_price, tp_price
+
 def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
+    """Checks for entry signals, requiring Stoch RSI to exit extreme zones."""
     if len(df) < 2: return None
     last = df.iloc[-1]
+    prev = df.iloc[-2]
     ema_fast = last[f"EMA_{CONFIG.EMA_FAST_PERIOD}"]
     ema_slow = last[f"EMA_{CONFIG.EMA_SLOW_PERIOD}"]
     ema_trend = last[f"EMA_{CONFIG.EMA_TREND_PERIOD}"]
     stoch_k_col = next((c for c in df.columns if c.startswith("STOCHRSIk_")), None)
     if not stoch_k_col: return None
+    
     k_now = last[stoch_k_col]
-    k_prev = df[stoch_k_col].iloc[-2]
+    k_prev = prev[stoch_k_col]
+    
     buffer = 1 + CONFIG.EMA_TREND_BUFFER_PCT / 100
     is_uptrend = last['close'] > ema_trend * buffer
     is_downtrend = last['close'] < ema_trend / buffer
-    if is_uptrend and ema_fast > ema_slow and k_prev < CONFIG.STOCH_RSI_MID and k_now >= CONFIG.STOCH_RSI_MID:
+
+    # ИЗМЕНЕНО: Stoch RSI должен не просто развернуться, а выйти из зоны перепроданности
+    if is_uptrend and ema_fast > ema_slow and k_prev < CONFIG.STOCH_ENTRY_OVERSOLD and k_now > CONFIG.STOCH_ENTRY_OVERSOLD:
         return "LONG"
-    if is_downtrend and ema_fast < ema_slow and k_prev > CONFIG.STOCH_RSI_MID and k_now <= CONFIG.STOCH_RSI_MID:
+    
+    # ИЗМЕНЕНО: Аналогично для шорта - выход из зоны перекупленности
+    if is_downtrend and ema_fast < ema_slow and k_prev > CONFIG.STOCH_ENTRY_OVERBOUGHT and k_now < CONFIG.STOCH_ENTRY_OVERBOUGHT:
         return "SHORT"
+        
     return None
 
 # ===========================================================================
 # MARKET SCANNER & TRADE MANAGER
-# ... (Этот раздел без изменений)
 # ===========================================================================
 async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     bot_data = app.bot_data
@@ -178,7 +210,7 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     market_is_bull = None
     if CONFIG.MARKET_REGIME_FILTER:
         market_is_bull = await get_market_regime(exchange, app)
-        if market_is_bull is True: log.info("Market Regime: BULL. Penalizing SHORT signals.")
+        if market_is_bull is True: log.info("Market Regime: BULL. Longs only.")
         elif market_is_bull is False: log.info("Market Regime: BEAR. Penalizing LONG signals.")
         else: log.info("Market Regime: NEUTRAL/FLAT. All signals allowed.")
     try:
@@ -213,15 +245,23 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             df.ta.stochrsi(length=CONFIG.STOCH_RSI_PERIOD, k=CONFIG.STOCH_RSI_K, d=CONFIG.STOCH_RSI_D, append=True)
             df.ta.atr(length=CONFIG.ATR_PERIOD, append=True)
             atr_col = next((c for c in df.columns if c.startswith("ATR")), None)
-            if not atr_col or (df['high'] - df['low']).tail(CONFIG.ATR_COOLDOWN_BARS).max() > df[atr_col].tail(10).mean() * CONFIG.ATR_SPIKE_MULT: continue
-            
+            if not atr_col: continue
+
+            last_candle = df.iloc[-1]
+            atr = last_candle[atr_col]
+            if atr > 0 and abs(last_candle['close'] - last_candle['open']) / atr > CONFIG.IMPULSE_CANDLE_ATR_MULT:
+                log.debug(f"Skipping {symbol}: Impulse candle detected.")
+                continue
+
             side = check_entry_conditions(df.copy())
             if side:
                 candidate_data = {'symbol': symbol, 'side': side, 'df': df}
                 if side == "LONG":
-                    if market_is_bull is not False: pre_long_candidates.append(candidate_data)
-                else:
-                    if market_is_bull is not True: pre_short_candidates.append(candidate_data)
+                    if market_is_bull is True:
+                        pre_long_candidates.append(candidate_data)
+                else: # SHORT
+                    if market_is_bull is not True: 
+                        pre_short_candidates.append(candidate_data)
         except Exception as e:
             log.error(f"Error pre-processing symbol {symbol}: {e}")
 
@@ -244,7 +284,7 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
         if daily_results[i]:
             final_short_candidates.append(cand)
         else:
-            log.info(f"Skip SHORT {cand['symbol']}: daily trend is not decisively bearish.")
+            log.debug(f"Skip SHORT {cand['symbol']}: daily trend is not decisively bearish.")
 
     all_candidates = []
     for cand in final_long_candidates + final_short_candidates:
@@ -269,7 +309,7 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     long_cand_sorted = sorted([c for c in all_candidates if c['side'] == 'LONG'], key=lambda x: x['score'], reverse=True)
     short_cand_sorted = sorted([c for c in all_candidates if c['side'] == 'SHORT'], key=lambda x: x['score'], reverse=True)
     
-    n_long = min(len(long_cand_sorted), CONFIG.MAX_TRADES_PER_SCAN // 2)
+    n_long = min(len(long_cand_sorted), CONFIG.MAX_TRADES_PER_SCAN // 2 if CONFIG.MAX_TRADES_PER_SCAN > 1 else 1)
     n_short = min(len(short_cand_sorted), CONFIG.MAX_TRADES_PER_SCAN - n_long)
     selected_candidates = long_cand_sorted[:n_long] + short_cand_sorted[:n_short]
     remaining_slots = CONFIG.MAX_TRADES_PER_SCAN - len(selected_candidates)
@@ -293,6 +333,7 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
                f"Открыто (лучшие по score): LONG-<b>{opened_long}</b> | SHORT-<b>{opened_short}</b>")
         if broadcast := app.bot_data.get('broadcast_func'):
             await broadcast(app, msg)
+
 async def open_new_trade(symbol: str, side: str, entry_price: float, exchange: ccxt.Exchange, app: Application, atr_entry: float):
     bot_data = app.bot_data
     sl_price, tp_price = fixed_percentage_levels(symbol, entry_price, side, exchange)
@@ -320,6 +361,7 @@ async def open_new_trade(symbol: str, side: str, entry_price: float, exchange: c
         await broadcast(app, msg)
         
     await trade_executor.log_open_trade(trade)
+
 async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
     bot_data = app.bot_data
     active_trades = bot_data.get("active_trades", [])
@@ -353,6 +395,7 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
 
             profit_pct = ((current_price - trade['Entry_Price']) / trade['Entry_Price'] * 100) if trade['Side'] == 'LONG' else ((trade['Entry_Price'] - current_price) / trade['Entry_Price'] * 100)
 
+            # Этап 1: Перенос в +0.3% при достижении +0.7%
             if not trade.get('trail_1_done') and profit_pct >= CONFIG.SECOND_TRAIL_TRIGGER_PCT:
                 if trade['Side'] == 'LONG':
                     new_sl_raw = trade['Entry_Price'] * (1 + CONFIG.SECOND_TRAIL_LOCK_PCT / 100)
@@ -364,12 +407,12 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                 log.info(f"Trail #1 activated for {trade['Pair']}. SL moved to +{CONFIG.SECOND_TRAIL_LOCK_PCT}%. New SL: {new_sl}")
                 if broadcast:
                     sign = "+" if trade['Side'] == "LONG" else "-"
-                    # ИЗМЕНЕНО: Убран лишний знак "+" перед скобками
                     msg = (f"🛡️ <b>СТОП ПЕРЕНЕСЁН ({sign}{CONFIG.SECOND_TRAIL_LOCK_PCT:.2f}%)</b>\n\n"
                            f"<b>Пара:</b> {trade['Pair']}\n"
                            f"<b>Новый SL:</b> <code>{format_price(new_sl)}</code>")
                     await broadcast(app, msg)
 
+            # Этап 2: Перенос в +1.0% при достижении +1.2%
             if not trade.get('trail_2_done') and profit_pct >= CONFIG.TRAIL_TRIGGER_PCT:
                 if trade['Side'] == 'LONG':
                     new_sl_raw = trade['Entry_Price'] * (1 + CONFIG.TRAIL_PROFIT_LOCK_PCT / 100)
@@ -377,7 +420,6 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                     new_sl_raw = trade['Entry_Price'] * (1 - CONFIG.TRAIL_PROFIT_LOCK_PCT / 100)
                 new_sl = float(exchange.price_to_precision(trade['Pair'], new_sl_raw))
                 
-                # ИЗМЕНЕНО: Защита от "отката" стоп-лосса
                 is_improvement = (trade['Side'] == 'LONG' and new_sl > trade['SL_Price']) or \
                                  (trade['Side'] == 'SHORT' and new_sl < trade['SL_Price'])
 
@@ -397,12 +439,17 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
             df_indicators.ta.ema(length=CONFIG.EMA_FAST_PERIOD, append=True); df_indicators.ta.ema(length=CONFIG.EMA_SLOW_PERIOD, append=True)
             last = df_indicators.iloc[-1]
             exit_reason = None
+            
+            # ИЗМЕНЕН ПОРЯДОК: Сначала жесткие выходы, потом мягкие
+            # 1. Проверка SL/TP
             if trade['Side'] == 'LONG':
                 if current_price <= trade['SL_Price']: exit_reason = "STOP_LOSS"
                 elif current_price >= trade['TP_Price']: exit_reason = "TAKE_PROFIT"
             else:
                 if current_price >= trade['SL_Price']: exit_reason = "STOP_LOSS"
                 elif current_price <= trade['TP_Price']: exit_reason = "TAKE_PROFIT"
+            
+            # 2. Проверка на инвалидацию по EMA
             if not exit_reason:
                 ema_fast = last[f"EMA_{CONFIG.EMA_FAST_PERIOD}"]
                 ema_slow = last[f"EMA_{CONFIG.EMA_SLOW_PERIOD}"]
@@ -410,12 +457,27 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                     exit_reason = "INVALIDATION_EMA_CROSS"
                 elif trade['Side'] == 'SHORT' and ema_fast > ema_slow:
                     exit_reason = "INVALIDATION_EMA_CROSS"
-            
+
+            # 3. Проверка по тайм-стопу (последней)
+            if not exit_reason:
+                try:
+                    FMT = '%Y-%m-%d %H:%M:%S'
+                    t_entry = datetime.strptime(trade['Timestamp_UTC'], FMT).replace(tzinfo=timezone.utc)
+                    time_in_trade = datetime.now(timezone.utc) - t_entry
+                    
+                    tp_diff = abs(trade['TP_Price'] - trade['Entry_Price'])
+                    mfe_tp_pct = abs(trade['MFE_Price'] - trade['Entry_Price']) / tp_diff if tp_diff > 0 else 0
+                    
+                    if time_in_trade.total_seconds() >= CONFIG.TIME_STOP_MINUTES * 60 and mfe_tp_pct < CONFIG.TIME_STOP_MFE_THRESHOLD:
+                        exit_reason = "TIME_STOP"
+                        log.info(f"Closing {trade['Pair']} due to Time Stop (stuck in trade).")
+                except (ValueError, KeyError) as e:
+                    log.warning(f"Could not calculate time_in_trade for {trade['Pair']}: {e}")
+
             if exit_reason: trades_to_close.append((trade, exit_reason, df_indicators))
         except Exception as e:
             log.error(f"Error monitoring trade for {trade['Pair']}: {e}", exc_info=True)
     
-    # ... (Конец файла без изменений)
     if trades_to_close:
         for trade, reason, df_final in trades_to_close:
             exit_price = df_final.iloc[-1]['close']
@@ -459,6 +521,7 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
             await trade_executor.update_closed_trade(trade['Signal_ID'], "CLOSED", exit_price, pnl_usd, pnl_display, reason, extra_fields=extra_fields)
         closed_ids = {t['Signal_ID'] for t, _, _ in trades_to_close}
         bot_data["active_trades"] = [t for t in active_trades if t['Signal_ID'] not in closed_ids]
+
 async def scanner_main_loop(app: Application, broadcast):
     log.info("Scanner Engine loop starting…")
     app.bot_data.setdefault("active_trades", [])
