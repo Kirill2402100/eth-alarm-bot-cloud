@@ -23,45 +23,32 @@ class CONFIG:
     TIMEFRAME = "1m"
     POSITION_SIZE_USDT = 10.0
     LEVERAGE = 20
-
     MAX_CONCURRENT_POSITIONS = 10
     CONCURRENCY_SEMAPHORE   = 10
-
-    # ИЗМЕНЕНО: Снижен порог ликвидности
     MIN_QUOTE_VOLUME_USD = 300_000
     MIN_PRICE = 0.001
-
     ATR_PERIOD = 14
     ATR_SPIKE_MULT = 1.8
-
     WICK_RATIO = 2.0
-
     VOL_WINDOW = 50
     VOL_Z_THRESHOLD = 2.0
-
     ENTRY_TAIL_FRACTION = 0.25
-
     SL_PCT = 0.2
     TP_PCT = 0.4
-
     SCAN_INTERVAL_SECONDS  = 30
     TICK_MONITOR_SECONDS   = 5
-
     # Заглушки для обратной совместимости с командой /status в main.py
-    ATR_SL_MULT = 0 # Не используется в логике, но нужно для /status
-    RISK_REWARD = TP_PCT / SL_PCT if SL_PCT > 0 else 0 # Не используется, но нужно для /status
+    ATR_SL_MULT = 0
+    RISK_REWARD = TP_PCT / SL_PCT if SL_PCT > 0 else 0
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def format_price(p: float) -> str:
-    if p < 0.01:
-        return f"{p:.6f}"
-    if p < 1.0:
-        return f"{p:.5f}"
+    if p < 0.01: return f"{p:.6f}"
+    if p < 1.0: return f"{p:.5f}"
     return f"{p:.4f}"
-
 
 def tf_seconds(tf: str) -> int:
     n, unit = int(tf[:-1]), tf[-1].lower()
@@ -76,18 +63,14 @@ def is_spike(candle: pd.Series, atr: float) -> Tuple[bool, Optional[str]]:
     o, h, l, c = candle["open"], candle["high"], candle["low"], candle["close"]
     body = abs(c - o)
     range_ = h - l
-    if atr <= 0:
-        return (False, None)
-    if range_ < CONFIG.ATR_SPIKE_MULT * atr:
-        return (False, None)
+    if atr <= 0: return (False, None)
+    if range_ < CONFIG.ATR_SPIKE_MULT * atr: return (False, None)
 
     upper_tail = h - max(o, c)
     lower_tail = min(o, c) - l
 
-    if lower_tail >= CONFIG.WICK_RATIO * body and lower_tail > 0:
-        return (True, "LONG")
-    if upper_tail >= CONFIG.WICK_RATIO * body and upper_tail > 0:
-        return (True, "SHORT")
+    if lower_tail >= CONFIG.WICK_RATIO * body and lower_tail > 0: return (True, "LONG")
+    if upper_tail >= CONFIG.WICK_RATIO * body and upper_tail > 0: return (True, "SHORT")
     return (False, None)
 
 # ---------------------------------------------------------------------------
@@ -98,21 +81,18 @@ async def scanner_main_loop(app: Application, broadcast):
     app.bot_data.setdefault("active_trades", [])
     app.bot_data['broadcast_func'] = broadcast
 
-    exchange = ccxt.mexc({'options': {'defaultType': 'swap'},
-                          'enableRateLimit': True, 'rateLimit': 150})
+    exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 150})
 
     while app.bot_data.get("bot_on", False):
+        log.info("Wick-Spike loop heartbeat…") # ДОБАВЛЕНО: Heartbeat для контроля
         try:
-            # ИЗМЕНЕНО: Проверяем флаг паузы перед сканированием
             if not app.bot_data.get("scan_paused", False):
                 await _run_scan(exchange, app)
-            
-            # Мониторинг работает всегда
             await _monitor_trades(exchange, app)
-            
             await asyncio.sleep(CONFIG.SCAN_INTERVAL_SECONDS)
         except Exception as e:
-            log.error(f"main loop error: {e}", exc_info=True)
+            # ИЗМЕНЕНО: log.exception для вывода полного трейсбэка
+            log.exception("FATAL in main loop")
             await asyncio.sleep(5)
 
     await exchange.close()
@@ -129,10 +109,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                   if (t.get("quoteVolume") or 0) > CONFIG.MIN_QUOTE_VOLUME_USD
                   and exchange.market(s).get("type") == "swap"
                   and s.endswith("USDT:USDT")]
-        
-        # ДОБАВЛЕНО: Логирование количества пар
         log.info(f"Wick-Scan: получено {len(tickers)} пар; после фильтра ликвидности – {len(liquid)}")
-
     except Exception as e:
         log.warning(f"ticker fetch failed: {e}")
         return
@@ -142,24 +119,31 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     async def fetch_tf(symbol):
         async with sem:
             try:
-                return symbol, await exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=CONFIG.VOL_WINDOW + CONFIG.ATR_PERIOD + 1)
-            except Exception:
+                # ДОБАВЛЕНО: Таймаут для каждого запроса
+                return symbol, await asyncio.wait_for(
+                    exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=CONFIG.VOL_WINDOW + CONFIG.ATR_PERIOD + 1),
+                    timeout=12
+                )
+            except Exception as e:
+                log.debug(f"ohlcv {symbol} failed: {e.__class__.__name__}")
                 return symbol, None
 
     bars = await asyncio.gather(*[fetch_tf(s) for s in liquid])
 
-    # ДОБАВЛЕНО: Счетчики для итогового лога
     found_count = 0
     opened_count = 0
+    scan_started = time.time() # ДОБАВЛЕНО: Контроль общего времени скана
 
     for symbol, ohlcv in bars:
-        if not ohlcv:
-            continue
+        # ДОБАВЛЕНО: Проверка на превышение бюджета времени
+        if time.time() - scan_started > CONFIG.SCAN_INTERVAL_SECONDS - 3:
+            log.warning("Scan aborted – time budget exceeded")
+            break
+
+        if not ohlcv: continue
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
-        if df.iloc[-1]['ts'] < (time.time()-tf_seconds(CONFIG.TIMEFRAME))*1000:
-            continue
-        if df.iloc[-1]['close'] < CONFIG.MIN_PRICE:
-            continue
+        if df.iloc[-1]['ts'] < (time.time()-tf_seconds(CONFIG.TIMEFRAME))*1000: continue
+        if df.iloc[-1]['close'] < CONFIG.MIN_PRICE: continue
 
         df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=CONFIG.ATR_PERIOD)
         vol_mu = df["volume"].rolling(CONFIG.VOL_WINDOW).mean()
@@ -167,34 +151,25 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         df["vol_z"] = (df["volume"] - vol_mu) / vol_sigma
         last = df.iloc[-1]
         
-        # Проверяем, что в данных нет NaN, чтобы избежать ошибок
-        if pd.isna(last["vol_z"]) or pd.isna(last["atr"]):
-            continue
-
-        if last["vol_z"] < CONFIG.VOL_Z_THRESHOLD:
-            continue
+        if pd.isna(last["vol_z"]) or pd.isna(last["atr"]): continue
+        if last["vol_z"] < CONFIG.VOL_Z_THRESHOLD: continue
 
         ok, side = is_spike(last, last["atr"])
-        if not ok:
-            continue
+        if not ok: continue
         
         found_count += 1
-
-        # Проверяем лимит позиций перед открытием
         if len(bt.get("active_trades", [])) + opened_count < CONFIG.MAX_CONCURRENT_POSITIONS:
             await _open_trade(symbol, side, last, exchange, app)
             opened_count += 1
     
-    # ДОБАВЛЕНО: Итоговое сообщение в лог
-    if found_count > 0 or opened_count > 0:
-        log.info(f"Wick-Scan завершён: найдено {found_count} шпилей, открыто {opened_count} сделок.")
+    # ИЗМЕНЕНО: Логируем итог всегда
+    log.info(f"Wick-Scan завершён: найдено {found_count} шпилей, открыто {opened_count} сделок.")
 
 # ---------------------------------------------------------------------------
 async def _open_trade(symbol: str, side: str, candle: pd.Series,
                       exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
     entry_price = candle["close"]
-
     tail_frac = CONFIG.ENTRY_TAIL_FRACTION
     if tail_frac > 0:
         if side == "LONG":
@@ -237,16 +212,17 @@ async def _open_trade(symbol: str, side: str, candle: pd.Series,
 async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
     act = bt.get("active_trades", [])
-    if not act:
-        return
+    if not act: return
 
     sem = asyncio.Semaphore(CONFIG.CONCURRENCY_SEMAPHORE)
     async def fetch(symbol):
         async with sem:
             try:
-                ohlc = await exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=2)
+                # ДОБАВЛЕНО: Таймаут для мониторинга
+                ohlc = await asyncio.wait_for(exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=2), timeout=12)
                 return symbol, ohlc[-1][4] if ohlc else None
-            except Exception:
+            except Exception as e:
+                log.debug(f"monitor fetch {symbol} failed: {e.__class__.__name__}")
                 return symbol, None
 
     latest = dict(await asyncio.gather(*[fetch(t['Pair']) for t in act]))
@@ -254,8 +230,7 @@ async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
 
     for tr in act:
         price = latest.get(tr['Pair'])
-        if price is None:
-            continue
+        if price is None: continue
         tr['MFE_Price'] = max(tr['MFE_Price'], price) if tr['Side']=="LONG" else min(tr['MFE_Price'], price)
         if (tr['Side']=="LONG" and price <= tr['SL_Price']) or \
            (tr['Side']=="SHORT" and price >= tr['SL_Price']):
@@ -264,8 +239,7 @@ async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
              (tr['Side']=="SHORT" and price <= tr['TP_Price']):
             close_list.append((tr, "TAKE_PROFIT", price))
 
-    if not close_list:
-        return
+    if not close_list: return
 
     for tr, reason, exit_p in close_list:
         pnl_pct = CONFIG.TP_PCT if reason=="TAKE_PROFIT" else -CONFIG.SL_PCT
