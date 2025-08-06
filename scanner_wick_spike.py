@@ -1,29 +1,5 @@
-"""
-Wick-Spike strategy scanner & trade manager
-==========================================
-A self-contained drop-in replacement for the previous scanner.
-Keeps the external contract (functions `scanner_main_loop`,
-`find_trade_signals`, `monitor_active_trades`, etc.) so the rest of
-bot infrastructure does not need to be touched.
+# scanner_wick_spike.py
 
-Logic overview
---------------
-1. Fetch 1-minute OHLCV bars (OHLC + volume) for all liquid swaps.
-2.   A candle qualifies as a *wick-spike* when **all** hold:
-     • tail_len >= 2 × body_len (upper-tail for shorts, lower-tail for longs)
-     • candle_range >= 1.8 × ATR(14) (computed on the same 1-m stream)
-     • volume >= µ + 2·σ (rolling 50-period vol mean / std)
-3. Entry **counter** to the direction of the spike *at market* right after
-   the candle closes.  Optionally place a limit a bit deeper into the tail –
-   param `ENTRY_TAIL_FRACTION` controls that.
-4. Fixed exits only:
-     TP 0.4 %  (≈ 2R)  •  SL 0.2 %  (hard, market order)
-5. No trailing, no time-stop — we want a fast mean-reversion scalp.
-
-All risk is expressed in price %, then multiplied by `LEVERAGE` for display.
-
-Dependencies: pandas, pandas_ta, ccxt.async_support, numpy.
-"""
 from __future__ import annotations
 import asyncio, time, logging, json, os
 from datetime import datetime, timezone
@@ -44,32 +20,35 @@ log = logging.getLogger("wick_spike_engine")
 # CONFIG
 # ---------------------------------------------------------------------------
 class CONFIG:
-    TIMEFRAME = "1m"                 # 1-minute bars
+    TIMEFRAME = "1m"
     POSITION_SIZE_USDT = 10.0
     LEVERAGE = 20
 
     MAX_CONCURRENT_POSITIONS = 10
     CONCURRENCY_SEMAPHORE   = 10
 
-    MIN_QUOTE_VOLUME_USD = 300_000    # liquidity filter
+    MIN_QUOTE_VOLUME_USD = 300_000
     MIN_PRICE = 0.001
 
     ATR_PERIOD = 14
-    ATR_SPIKE_MULT = 1.8              # candle range >= 1.8 ATR
+    ATR_SPIKE_MULT = 1.8
 
-    WICK_RATIO = 2.0                  # wick >= 2 × body
+    WICK_RATIO = 2.0
 
-    VOL_WINDOW = 50                   # for µ, σ of volume
-    VOL_Z_THRESHOLD = 2.0             # vol >= µ + 2σ
+    VOL_WINDOW = 50
+    VOL_Z_THRESHOLD = 2.0
 
-    ENTRY_TAIL_FRACTION = 0.25        # 0 => market close price,
-                                      # 0.25 => 25 % deeper into tail
+    ENTRY_TAIL_FRACTION = 0.25
 
-    SL_PCT = 0.2                      # price % (not leveraged)
+    SL_PCT = 0.2
     TP_PCT = 0.4
 
-    SCAN_INTERVAL_SECONDS  = 30       # high-freq scanner
+    SCAN_INTERVAL_SECONDS  = 30
     TICK_MONITOR_SECONDS   = 5
+
+    # ДОБАВЛЕНО: Заглушки для обратной совместимости с main.py
+    ATR_SL_MULT = 1.0  # Не используется в логике, но нужно для /status
+    RISK_REWARD = 2.0  # Не используется в логике, но нужно для /status
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -96,7 +75,7 @@ def is_spike(candle: pd.Series, atr: float) -> Tuple[bool, Optional[str]]:
     o, h, l, c = candle["open"], candle["high"], candle["low"], candle["close"]
     body = abs(c - o)
     range_ = h - l
-    if atr <= 0:                      # safeguard
+    if atr <= 0:
         return (False, None)
     if range_ < CONFIG.ATR_SPIKE_MULT * atr:
         return (False, None)
@@ -104,10 +83,8 @@ def is_spike(candle: pd.Series, atr: float) -> Tuple[bool, Optional[str]]:
     upper_tail = h - max(o, c)
     lower_tail = min(o, c) - l
 
-    # LONG => bullish reversal after a down-spike (long lower tail)
     if lower_tail >= CONFIG.WICK_RATIO * body and lower_tail > 0:
         return (True, "LONG")
-    # SHORT => bearish reversal after up-spike
     if upper_tail >= CONFIG.WICK_RATIO * body and upper_tail > 0:
         return (True, "SHORT")
     return (False, None)
@@ -120,7 +97,6 @@ async def scanner_main_loop(app: Application, broadcast):
     app.bot_data.setdefault("active_trades", [])
     app.bot_data['broadcast_func'] = broadcast
 
-    # --- ccxt client
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'},
                           'enableRateLimit': True, 'rateLimit': 150})
 
@@ -167,11 +143,10 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             continue
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
         if df.iloc[-1]['ts'] < (time.time()-tf_seconds(CONFIG.TIMEFRAME))*1000:
-            continue  # last bar incomplete
+            continue
         if df.iloc[-1]['close'] < CONFIG.MIN_PRICE:
             continue
 
-        # indicators
         df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=CONFIG.ATR_PERIOD)
         vol_mu = df["volume"].rolling(CONFIG.VOL_WINDOW).mean()
         vol_sigma = df["volume"].rolling(CONFIG.VOL_WINDOW).std()
@@ -192,7 +167,6 @@ async def _open_trade(symbol: str, side: str, candle: pd.Series,
     bt = app.bot_data
     entry_price = candle["close"]
 
-    # optional deeper entry
     tail_frac = CONFIG.ENTRY_TAIL_FRACTION
     if tail_frac > 0:
         if side == "LONG":
@@ -243,7 +217,7 @@ async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
         async with sem:
             try:
                 ohlc = await exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=2)
-                return symbol, ohlc[-1][4] if ohlc else None  # close price
+                return symbol, ohlc[-1][4] if ohlc else None
             except Exception:
                 return symbol, None
 
@@ -274,6 +248,5 @@ async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
             await bc(app, f"{emoji} <b>{reason}</b> {tr['Pair']} {pnl_lever:+.2f}% (price {format_price(exit_p)})")
         await trade_executor.update_closed_trade(tr['Signal_ID'], "CLOSED", exit_p, pnl_usd, pnl_lever, reason)
 
-    # drop closed
     closed_ids = {t['Signal_ID'] for t,_,_ in close_list}
     bt['active_trades'] = [t for t in act if t['Signal_ID'] not in closed_ids]
