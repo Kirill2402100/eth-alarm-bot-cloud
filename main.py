@@ -6,11 +6,12 @@ import logging
 from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, PicklePersistence
 
-import scanner_wick_spike as scanner_engine
+# ИЗМЕНЕНО: Импортируем правильный файл сканера под привычным псевдонимом
+import scanner_wick_spike as scanner_engine 
 import trade_executor
 
 # --- Конфигурация ---
-BOT_VERSION = "SwingBot-1.7" # Версия обновлена
+BOT_VERSION = "SwingBot-WickSpike-1.0" # Версия обновлена для ясности
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 log = logging.getLogger("bot")
@@ -22,7 +23,6 @@ async def post_init(app: Application):
     log.info("Бот запущен. Проверяем, нужно ли запускать основной цикл...")
     if app.bot_data.get('run_loop_on_startup', False):
         log.info("Обнаружен флаг 'run_loop_on_startup'. Запускаю основной цикл.")
-        # ИЗМЕНЕНО: Сохраняем ссылку на задачу для корректного управления состоянием
         task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
         app.bot_data['main_loop_task'] = task
     
@@ -116,23 +116,22 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     cfg = scanner_engine.CONFIG
     
-    rr_ratio = cfg.TP_FIXED_PCT / cfg.SL_FIXED_PCT if cfg.SL_FIXED_PCT > 0 else 0
-    
     scanner_status = "🔌 ОСТАНОВЛЕН"
     if is_running:
         scanner_status = "⏸️ НА ПАУЗЕ" if is_paused else "⚡️ РАБОТАЕТ"
+
+    # ИЗМЕНЕНО: Блок параметров теперь не содержит трейлинг и использует актуальные атрибуты
+    params_msg = (
+        f"• <b>SL:</b> {cfg.ATR_SL_MULT:.2f} × ATR\n"
+        f"• <b>TP:</b> {cfg.RISK_REWARD:.1f} × SL (RR 1:{cfg.RISK_REWARD:.1f})\n"
+    )
 
     msg = (
         f"<b>Состояние бота v{BOT_VERSION}</b>\n\n"
         f"<b>Статус сканера:</b> {scanner_status}\n"
         f"<b>Активных сделок:</b> {len(active_trades)} / {cfg.MAX_CONCURRENT_POSITIONS}\n\n"
         f"<b><u>Параметры стратегии:</u></b>\n"
-        f"• <b>SL:</b> {cfg.SL_FIXED_PCT:.2f}%\n"
-        f"• <b>TP:</b> {cfg.TP_FIXED_PCT:.2f}% (RR 1:{rr_ratio:.1f})\n"
-        "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
-        # ИЗМЕНЕНО: Исправлены подписи для трейлов
-        f"• <b>Трейл №1:</b> при +{cfg.SECOND_TRAIL_TRIGGER_PCT:.2f}% ➜ SL в +{cfg.SECOND_TRAIL_LOCK_PCT:.2f}%\n"
-        f"• <b>Трейл №2:</b> при +{cfg.TRAIL_TRIGGER_PCT:.2f}% ➜ SL в +{cfg.TRAIL_PROFIT_LOCK_PCT:.2f}%\n"
+        f"{params_msg}"
     )
     
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
@@ -150,5 +149,4 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("resume", cmd_resume))
     
     log.info(f"Bot v{BOT_VERSION} starting...")
-    # ИЗМЕНЕНО: Убрана лишняя точка
     app.run_polling()
