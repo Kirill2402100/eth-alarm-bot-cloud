@@ -23,20 +23,29 @@ class CONFIG:
     TIMEFRAME = "1m"
     POSITION_SIZE_USDT = 10.0
     LEVERAGE = 20
+
     MAX_CONCURRENT_POSITIONS = 10
     CONCURRENCY_SEMAPHORE   = 10
+
     MIN_QUOTE_VOLUME_USD = 300_000
     MIN_PRICE = 0.001
+
     ATR_PERIOD = 14
     ATR_SPIKE_MULT = 1.8
+
     WICK_RATIO = 2.0
+
     VOL_WINDOW = 50
     VOL_Z_THRESHOLD = 2.0
+
     ENTRY_TAIL_FRACTION = 0.25
+
     SL_PCT = 0.2
     TP_PCT = 0.4
-    SCAN_INTERVAL_SECONDS  = 30
-    TICK_MONITOR_SECONDS   = 5
+
+    # ИЗМЕНЕНО: Уменьшен интервал для более быстрого мониторинга
+    SCAN_INTERVAL_SECONDS  = 5
+
     # Заглушки для обратной совместимости с командой /status в main.py
     ATR_SL_MULT = 0
     RISK_REWARD = TP_PCT / SL_PCT if SL_PCT > 0 else 0
@@ -44,6 +53,37 @@ class CONFIG:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# ДОБАВЛЕНО: Функция для инициализации Google Sheets
+async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
+    """Создаёт лист 'Trading_Log_v2', если он не существует."""
+    loop = asyncio.get_running_loop()
+    title = "Trading_Log_v2"
+    ws = None
+    try:
+        ws = await loop.run_in_executor(None, lambda: gfile.worksheet(title))
+        log.info(f"Worksheet '{title}' already exists.")
+    except gspread.exceptions.WorksheetNotFound:
+        log.warning(f"Worksheet '{title}' not found. Creating...")
+        try:
+            ws = await loop.run_in_executor(None, lambda: gfile.add_worksheet(title=title, rows=1000, cols=30))
+            headers = [
+                "Signal_ID", "Timestamp_UTC", "Pair", "Side", "Status",
+                "Entry_Price", "Exit_Price", "Exit_Time_UTC",
+                "Exit_Reason", "PNL_USD", "PNL_Percent",
+                "MFE_Price", "MFE_ATR", "MFE_TP_Pct", "Time_in_Trade"
+            ]
+            await loop.run_in_executor(None, lambda: ws.append_row(headers, value_input_option="USER_ENTERED"))
+            log.info(f"Worksheet '{title}' created with all required headers.")
+        except Exception as e:
+            log.critical(f"Failed to create new worksheet '{title}': {e}")
+            raise
+    except Exception as e:
+        log.critical(f"An unexpected error occurred with Google Sheets: {e}")
+        raise
+
+    trade_executor.TRADE_LOG_WS = ws
+    trade_executor.TRADING_HEADERS_CACHE = None
 
 def format_price(p: float) -> str:
     if p < 0.01: return f"{p:.6f}"
@@ -81,17 +121,45 @@ async def scanner_main_loop(app: Application, broadcast):
     app.bot_data.setdefault("active_trades", [])
     app.bot_data['broadcast_func'] = broadcast
 
+    # ДОБАВЛЕНО: Инициализация Google Sheets
+    try:
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+        sheet_key  = os.environ.get("SHEET_ID")
+        if not creds_json or not sheet_key:
+            log.critical("GOOGLE_CREDENTIALS / SHEET_ID не заданы, логирование в таблицу отключено.")
+        else:
+            gc = gspread.service_account_from_dict(json.loads(creds_json))
+            sheet = gc.open_by_key(sheet_key)
+            await ensure_new_log_sheet(sheet)
+            trade_executor.get_headers(trade_executor.TRADE_LOG_WS)
+            log.info("Google Sheets инициализированы")
+    except Exception as e:
+        log.error(f"Sheets init error: {e}", exc_info=True)
+
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 150})
+    
+    last_flush = 0
+    last_scan_time = 0
 
     while app.bot_data.get("bot_on", False):
-        log.info("Wick-Spike loop heartbeat…") # ДОБАВЛЕНО: Heartbeat для контроля
+        log.info("Wick-Spike loop heartbeat…")
         try:
+            current_time = time.time()
             if not app.bot_data.get("scan_paused", False):
-                await _run_scan(exchange, app)
+                # Сканируем не чаще, чем раз в 30 секунд, чтобы не спамить
+                if current_time - last_scan_time >= 30:
+                    await _run_scan(exchange, app)
+                    last_scan_time = current_time
+            
             await _monitor_trades(exchange, app)
+
+            # ДОБАВЛЕНО: Периодический сброс буфера логов
+            if trade_executor.PENDING_TRADES and current_time - last_flush >= 15:
+                await trade_executor.flush_log_buffers()
+                last_flush = current_time
+
             await asyncio.sleep(CONFIG.SCAN_INTERVAL_SECONDS)
         except Exception as e:
-            # ИЗМЕНЕНО: log.exception для вывода полного трейсбэка
             log.exception("FATAL in main loop")
             await asyncio.sleep(5)
 
@@ -119,7 +187,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     async def fetch_tf(symbol):
         async with sem:
             try:
-                # ДОБАВЛЕНО: Таймаут для каждого запроса
                 return symbol, await asyncio.wait_for(
                     exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=CONFIG.VOL_WINDOW + CONFIG.ATR_PERIOD + 1),
                     timeout=12
@@ -132,11 +199,10 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
     found_count = 0
     opened_count = 0
-    scan_started = time.time() # ДОБАВЛЕНО: Контроль общего времени скана
+    scan_started = time.time()
 
     for symbol, ohlcv in bars:
-        # ДОБАВЛЕНО: Проверка на превышение бюджета времени
-        if time.time() - scan_started > CONFIG.SCAN_INTERVAL_SECONDS - 3:
+        if time.time() - scan_started > 27: # 30 - 3
             log.warning("Scan aborted – time budget exceeded")
             break
 
@@ -162,7 +228,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             await _open_trade(symbol, side, last, exchange, app)
             opened_count += 1
     
-    # ИЗМЕНЕНО: Логируем итог всегда
     log.info(f"Wick-Scan завершён: найдено {found_count} шпилей, открыто {opened_count} сделок.")
 
 # ---------------------------------------------------------------------------
@@ -218,26 +283,37 @@ async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
     async def fetch(symbol):
         async with sem:
             try:
-                # ДОБАВЛЕНО: Таймаут для мониторинга
+                # ИЗМЕНЕНО: Запрашиваем последнюю свечу, чтобы получить high/low
                 ohlc = await asyncio.wait_for(exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=2), timeout=12)
-                return symbol, ohlc[-1][4] if ohlc else None
+                return symbol, ohlc[-1] if ohlc else None # [ts, o, h, l, c, v]
             except Exception as e:
                 log.debug(f"monitor fetch {symbol} failed: {e.__class__.__name__}")
                 return symbol, None
 
-    latest = dict(await asyncio.gather(*[fetch(t['Pair']) for t in act]))
+    latest_bars = dict(await asyncio.gather(*[fetch(t['Pair']) for t in act]))
     close_list: List[Tuple[dict,str,float]] = []
 
     for tr in act:
-        price = latest.get(tr['Pair'])
-        if price is None: continue
-        tr['MFE_Price'] = max(tr['MFE_Price'], price) if tr['Side']=="LONG" else min(tr['MFE_Price'], price)
-        if (tr['Side']=="LONG" and price <= tr['SL_Price']) or \
-           (tr['Side']=="SHORT" and price >= tr['SL_Price']):
-            close_list.append((tr, "STOP_LOSS", price))
-        elif (tr['Side']=="LONG" and price >= tr['TP_Price']) or \
-             (tr['Side']=="SHORT" and price <= tr['TP_Price']):
-            close_list.append((tr, "TAKE_PROFIT", price))
+        bar = latest_bars.get(tr['Pair'])
+        if bar is None: continue
+        
+        last_high = bar[2]
+        last_low = bar[3]
+        
+        # MFE обновляем по high/low для точности
+        tr['MFE_Price'] = max(tr['MFE_Price'], last_high) if tr['Side']=="LONG" else min(tr['MFE_Price'], last_low)
+        
+        # ИЗМЕНЕНО: Проверяем касание SL/TP по high и low
+        if tr['Side']=="LONG":
+            if last_low <= tr['SL_Price']:
+                close_list.append((tr, "STOP_LOSS", tr['SL_Price'])) # Выход по цене SL
+            elif last_high >= tr['TP_Price']:
+                close_list.append((tr, "TAKE_PROFIT", tr['TP_Price'])) # Выход по цене TP
+        else: # SHORT
+            if last_high >= tr['SL_Price']:
+                close_list.append((tr, "STOP_LOSS", tr['SL_Price']))
+            elif last_low <= tr['TP_Price']:
+                close_list.append((tr, "TAKE_PROFIT", tr['TP_Price']))
 
     if not close_list: return
 
@@ -248,7 +324,12 @@ async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
         if bc := bt.get('broadcast_func'):
             emoji = "✅" if reason=="TAKE_PROFIT" else "❌"
             await bc(app, f"{emoji} <b>{reason}</b> {tr['Pair']} {pnl_lever:+.2f}% (price {format_price(exit_p)})")
-        await trade_executor.update_closed_trade(tr['Signal_ID'], "CLOSED", exit_p, pnl_usd, pnl_lever, reason)
+        
+        # Добавляем доп. поля для лога
+        extra_fields = {
+            "MFE_Price": tr['MFE_Price'],
+        }
+        await trade_executor.update_closed_trade(tr['Signal_ID'], "CLOSED", exit_p, pnl_usd, pnl_lever, reason, extra_fields=extra_fields)
 
     closed_ids = {t['Signal_ID'] for t,_,_ in close_list}
     bt['active_trades'] = [t for t in act if t['Signal_ID'] not in closed_ids]
