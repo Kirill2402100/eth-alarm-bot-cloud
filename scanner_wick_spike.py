@@ -28,14 +28,14 @@ class CONFIG:
     MIN_QUOTE_VOLUME_USD = 150_000
     MIN_PRICE = 0.001
     ATR_PERIOD = 14
-    ATR_SPIKE_MULT = 1.8
-    WICK_RATIO = 2.0
+    ATR_SPIKE_MULT = 1.5
+    WICK_RATIO = 1.5
     VOL_WINDOW = 50
-    VOL_Z_THRESHOLD = 2.0
-    ENTRY_TAIL_FRACTION = 0.25
-    SL_PCT = 0.2
-    TP_PCT = 0.4
-    SCAN_INTERVAL_SECONDS  = 5
+    VOL_Z_THRESHOLD = 1.5
+    ENTRY_TAIL_FRACTION = 0.35
+    SL_PCT = 0.25
+    TP_PCT = 0.5
+    SCAN_INTERVAL_SECONDS  = 3
     # Заглушки для обратной совместимости с командой /status в main.py
     ATR_SL_MULT = 0
     RISK_REWARD = TP_PCT / SL_PCT if SL_PCT > 0 else 0
