@@ -23,29 +23,19 @@ class CONFIG:
     TIMEFRAME = "1m"
     POSITION_SIZE_USDT = 10.0
     LEVERAGE = 20
-
     MAX_CONCURRENT_POSITIONS = 10
     CONCURRENCY_SEMAPHORE   = 10
-
     MIN_QUOTE_VOLUME_USD = 300_000
     MIN_PRICE = 0.001
-
     ATR_PERIOD = 14
     ATR_SPIKE_MULT = 1.8
-
     WICK_RATIO = 2.0
-
     VOL_WINDOW = 50
     VOL_Z_THRESHOLD = 2.0
-
     ENTRY_TAIL_FRACTION = 0.25
-
     SL_PCT = 0.2
     TP_PCT = 0.4
-
-    # ИЗМЕНЕНО: Уменьшен интервал для более быстрого мониторинга
     SCAN_INTERVAL_SECONDS  = 5
-
     # Заглушки для обратной совместимости с командой /status в main.py
     ATR_SL_MULT = 0
     RISK_REWARD = TP_PCT / SL_PCT if SL_PCT > 0 else 0
@@ -54,7 +44,6 @@ class CONFIG:
 # Helpers
 # ---------------------------------------------------------------------------
 
-# ДОБАВЛЕНО: Функция для инициализации Google Sheets
 async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
     """Создаёт лист 'Trading_Log_v2', если он не существует."""
     loop = asyncio.get_running_loop()
@@ -98,19 +87,30 @@ def tf_seconds(tf: str) -> int:
 # Wick detection
 # ---------------------------------------------------------------------------
 
-def is_spike(candle: pd.Series, atr: float) -> Tuple[bool, Optional[str]]:
-    """Return (True, side) where side is LONG/SHORT to take *counter* spike."""
-    o, h, l, c = candle["open"], candle["high"], candle["low"], candle["close"]
-    body = abs(c - o)
-    range_ = h - l
-    if atr <= 0: return (False, None)
-    if range_ < CONFIG.ATR_SPIKE_MULT * atr: return (False, None)
+def is_spike(candle: pd.Series, atr: float) -> tuple[bool, str|None]:
+    """Определяет шпильку и возвращает сторону для контр-трейда."""
+    o,h,l,c = candle["open"], candle["high"], candle["low"], candle["close"]
+    body = abs(c-o)
+    rng = h-l
 
-    upper_tail = h - max(o, c)
-    lower_tail = min(o, c) - l
+    # ИЗМЕНЕНО: Защита от деления на ноль и ложных срабатываний на доджи
+    if body == 0:
+        body = (h + l) * 1e-6  # Присваиваем минимальную ненулевую ширину
 
-    if lower_tail >= CONFIG.WICK_RATIO * body and lower_tail > 0: return (True, "LONG")
-    if upper_tail >= CONFIG.WICK_RATIO * body and upper_tail > 0: return (True, "SHORT")
+    if atr <= 0 or rng < CONFIG.ATR_SPIKE_MULT * atr:
+        return (False, None)
+
+    upper = h - max(o,c)
+    lower = min(o,c) - l
+    
+    cond_lo = lower >= CONFIG.WICK_RATIO * body and lower > 0
+    cond_up = upper >= CONFIG.WICK_RATIO * body and upper > 0
+
+    if cond_lo and cond_up:
+        return (True, "LONG"  if lower > upper else "SHORT")
+
+    if cond_lo: return (True, "LONG")
+    if cond_up: return (True, "SHORT")
     return (False, None)
 
 # ---------------------------------------------------------------------------
@@ -121,7 +121,6 @@ async def scanner_main_loop(app: Application, broadcast):
     app.bot_data.setdefault("active_trades", [])
     app.bot_data['broadcast_func'] = broadcast
 
-    # ДОБАВЛЕНО: Инициализация Google Sheets
     try:
         creds_json = os.environ.get("GOOGLE_CREDENTIALS")
         sheet_key  = os.environ.get("SHEET_ID")
@@ -146,14 +145,12 @@ async def scanner_main_loop(app: Application, broadcast):
         try:
             current_time = time.time()
             if not app.bot_data.get("scan_paused", False):
-                # Сканируем не чаще, чем раз в 30 секунд, чтобы не спамить
                 if current_time - last_scan_time >= 30:
                     await _run_scan(exchange, app)
                     last_scan_time = current_time
             
             await _monitor_trades(exchange, app)
 
-            # ДОБАВЛЕНО: Периодический сброс буфера логов
             if trade_executor.PENDING_TRADES and current_time - last_flush >= 15:
                 await trade_executor.flush_log_buffers()
                 last_flush = current_time
@@ -202,7 +199,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     scan_started = time.time()
 
     for symbol, ohlcv in bars:
-        if time.time() - scan_started > 27: # 30 - 3
+        if time.time() - scan_started > 27:
             log.warning("Scan aborted – time budget exceeded")
             break
 
@@ -283,9 +280,8 @@ async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
     async def fetch(symbol):
         async with sem:
             try:
-                # ИЗМЕНЕНО: Запрашиваем последнюю свечу, чтобы получить high/low
                 ohlc = await asyncio.wait_for(exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=2), timeout=12)
-                return symbol, ohlc[-1] if ohlc else None # [ts, o, h, l, c, v]
+                return symbol, ohlc[-1] if ohlc else None
             except Exception as e:
                 log.debug(f"monitor fetch {symbol} failed: {e.__class__.__name__}")
                 return symbol, None
@@ -300,15 +296,13 @@ async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
         last_high = bar[2]
         last_low = bar[3]
         
-        # MFE обновляем по high/low для точности
         tr['MFE_Price'] = max(tr['MFE_Price'], last_high) if tr['Side']=="LONG" else min(tr['MFE_Price'], last_low)
         
-        # ИЗМЕНЕНО: Проверяем касание SL/TP по high и low
         if tr['Side']=="LONG":
             if last_low <= tr['SL_Price']:
-                close_list.append((tr, "STOP_LOSS", tr['SL_Price'])) # Выход по цене SL
+                close_list.append((tr, "STOP_LOSS", tr['SL_Price']))
             elif last_high >= tr['TP_Price']:
-                close_list.append((tr, "TAKE_PROFIT", tr['TP_Price'])) # Выход по цене TP
+                close_list.append((tr, "TAKE_PROFIT", tr['TP_Price']))
         else: # SHORT
             if last_high >= tr['SL_Price']:
                 close_list.append((tr, "STOP_LOSS", tr['SL_Price']))
@@ -325,10 +319,7 @@ async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
             emoji = "✅" if reason=="TAKE_PROFIT" else "❌"
             await bc(app, f"{emoji} <b>{reason}</b> {tr['Pair']} {pnl_lever:+.2f}% (price {format_price(exit_p)})")
         
-        # Добавляем доп. поля для лога
-        extra_fields = {
-            "MFE_Price": tr['MFE_Price'],
-        }
+        extra_fields = {"MFE_Price": tr['MFE_Price']}
         await trade_executor.update_closed_trade(tr['Signal_ID'], "CLOSED", exit_p, pnl_usd, pnl_lever, reason, extra_fields=extra_fields)
 
     closed_ids = {t['Signal_ID'] for t,_,_ in close_list}
