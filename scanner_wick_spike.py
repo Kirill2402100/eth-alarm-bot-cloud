@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, time, logging, json, os
+import asyncio, time, logging, json, os, contextlib
 from datetime import datetime, timezone
 from typing import Optional, Tuple, List, Dict
 
@@ -26,7 +26,7 @@ class CONFIG:
     CONCURRENCY_SEMAPHORE = 12
     FETCH_TIMEOUT = 8
     CHUNK_SIZE = 60
-    TIME_BUDGET_SEC = 180
+    TIME_BUDGET_SEC = 90
     SCAN_TOP_N_SYMBOLS = 300
 
     MIN_QUOTE_VOLUME_USD = 150_000
@@ -58,10 +58,6 @@ class CONFIG:
 # Helpers
 # ---------------------------------------------------------------------------
 async def fetch_ohlcv_tf(exchange: ccxt.Exchange, symbol: str, tf: str, limit: int, supported_timeframes: dict | None = None):
-    """
-    Загружает OHLCV. Если ТФ не поддерживается, ресемплит из 1m.
-    Использует переданный кэш поддерживаемых таймфреймов.
-    """
     supported = supported_timeframes or (exchange.timeframes or {})
     
     if tf == "3m" and "3m" not in supported and "1m" in supported:
@@ -78,7 +74,14 @@ async def fetch_ohlcv_tf(exchange: ccxt.Exchange, symbol: str, tf: str, limit: i
               .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
               .dropna()
               .reset_index())
-        df["ts"] = (df["dt"].astype("int64") // 1_000_000).astype(np.int64)
+        
+        # ПАТЧ: Безопасная конвертация времени для разных версий pandas
+        try:
+            ts_ns = df["dt"].view("int64")
+        except Exception:
+            ts_ns = df["dt"].astype("int64")
+        df["ts"] = (ts_ns // 1_000_000).astype(np.int64)
+        
         return df[["ts", "open", "high", "low", "close", "volume"]].tail(limit).values.tolist()
     
     return await asyncio.wait_for(exchange.fetch_ohlcv(symbol, tf, limit=limit), timeout=CONFIG.FETCH_TIMEOUT)
@@ -118,11 +121,17 @@ def tf_seconds(tf: str) -> int:
     n, unit = int(tf[:-1]), tf[-1].lower()
     return n * (60 if unit == "m" else 3600 if unit == "h" else 86400)
 
+# ---------------------------------------------------------------------------
+# Core loops
+# ---------------------------------------------------------------------------
 async def scanner_main_loop(app: Application, broadcast):
     log.info("Wick-Spike loop starting…")
     app.bot_data.setdefault("active_trades", [])
     app.bot_data.setdefault("symbol_cooldown", {})
+    app.bot_data.setdefault("scan_task", None)
+    app.bot_data.setdefault("scan_offset", 0)
     app.bot_data['broadcast_func'] = broadcast
+
     if 'score_threshold' not in app.bot_data:
         app.bot_data['score_threshold'] = CONFIG.SCORE_BASE
     
@@ -137,36 +146,52 @@ async def scanner_main_loop(app: Application, broadcast):
         log.error(f"Sheets init error: {e}", exc_info=True)
 
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 150})
-    
     await exchange.load_markets(True)
     app.bot_data['supported_timeframes'] = (exchange.timeframes or {}).copy()
     log.info("Рынки и поддерживаемые таймфреймы загружены и закэшированы.")
 
     last_flush = 0
-    scan_triggered_for_ts = 0
+    last_candle_ts = 0
+    last_cleanup = 0 # ПАТЧ: Таймер для очистки кулдаунов
     TF_SECONDS = tf_seconds(CONFIG.TIMEFRAME)
 
     while app.bot_data.get("bot_on", False):
-        log.info("Wick-Spike loop heartbeat…")
         try:
-            current_time = time.time()
+            now = time.time()
+            candle_ts = int(now // TF_SECONDS) * TF_SECONDS
+
             if not app.bot_data.get("scan_paused", False):
-                current_candle_start_ts = int(current_time // TF_SECONDS) * TF_SECONDS
-                if current_candle_start_ts > scan_triggered_for_ts:
-                    log.info(f"New {CONFIG.TIMEFRAME} candle detected. Wick-Scan start: thr={app.bot_data.get('score_threshold', CONFIG.SCORE_BASE):.2f}")
-                    await _run_scan(exchange, app)
-                    scan_triggered_for_ts = current_candle_start_ts
-            
+                task = app.bot_data.get("scan_task")
+                if candle_ts > last_candle_ts and (task is None or task.done()):
+                    log.info(f"New {CONFIG.TIMEFRAME} candle. Kick scan task… thr={app.bot_data.get('score_threshold', CONFIG.SCORE_BASE):.2f}")
+                    app.bot_data["scan_task"] = asyncio.create_task(_run_scan(exchange, app))
+                    last_candle_ts = candle_ts
+
             await _monitor_trades(exchange, app)
-            if trade_executor.PENDING_TRADES and current_time - last_flush >= 15:
+
+            if trade_executor.PENDING_TRADES and now - last_flush >= 15:
                 await trade_executor.flush_log_buffers()
-                last_flush = current_time
+                last_flush = now
+            
+            # ПАТЧ: Регулярная очистка словаря кулдаунов
+            if now - last_cleanup >= 60:
+                cd = app.bot_data.get("symbol_cooldown", {})
+                app.bot_data["symbol_cooldown"] = {s: t for s, t in cd.items() if t > now}
+                last_cleanup = now
+
             await asyncio.sleep(CONFIG.SCAN_INTERVAL_SECONDS)
-        except Exception as e:
+        except Exception:
             log.exception("FATAL in main loop")
             await asyncio.sleep(5)
+
+    task = app.bot_data.get("scan_task")
+    if task and not task.done():
+        task.cancel()
+        with contextlib.suppress(Exception):
+            await task
     await exchange.close()
 
+# ---------------------------------------------------------------------------
 async def _run_scan(exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
     if len(bt.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
@@ -180,8 +205,18 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         liquid_tickers.sort(key=lambda x: x['quoteVolume'], reverse=True)
         top_n_symbols = {t['symbol'] for t in liquid_tickers[:CONFIG.SCAN_TOP_N_SYMBOLS]}
         top_n_symbols.add("BTC/USDT:USDT")
+        
         liquid = list(top_n_symbols)
-        log.info(f"Wick-Scan: получено {len(tickers)} пар; отобрано топ-{len(liquid)} по объему.")
+        if not liquid:
+            log.info("No liquid symbols to scan.")
+            return
+
+        symbols = liquid
+        N = len(symbols)
+        off = app.bot_data.get("scan_offset", 0) % N
+        symbols = symbols[off:] + symbols[:off]
+        log.info(f"Wick-Scan: получено {len(tickers)} пар; отобрано топ-{len(liquid)}, сканируем с {off}-й.")
+
     except Exception as e:
         log.warning(f"ticker fetch failed: {e}")
         return
@@ -208,25 +243,26 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
     scan_started = time.time()
     candidates, opened_count = [], 0
+    processed = 0
     now = time.time()
     TF_SECONDS = tf_seconds(CONFIG.TIMEFRAME)
     current_candle_start_ts = int(now // TF_SECONDS) * TF_SECONDS
-    cooldown = bt.get("symbol_cooldown", {})
-    if int(now) % 300 == 0:
-        bt["symbol_cooldown"] = {s:t for s,t in cooldown.items() if t > now}
-
-    for i in range(0, len(liquid), CONFIG.CHUNK_SIZE):
+    
+    for i in range(0, len(symbols), CONFIG.CHUNK_SIZE):
         if time.time() - scan_started > CONFIG.TIME_BUDGET_SEC:
             log.warning("Scan aborted – time budget exceeded")
             break
         
-        chunk = liquid[i:i+CONFIG.CHUNK_SIZE]
+        chunk = symbols[i:i+CONFIG.CHUNK_SIZE]
+        processed += len(chunk)
         all_data = await asyncio.gather(*[fetch_data(s) for s in chunk])
         
         gate_passed_symbols = []
         for symbol, data_dict in all_data:
             if not data_dict or not data_dict.get('tf'): continue
-            if cooldown.get(symbol, 0) > now: continue
+            # ПАТЧ: Корректная проверка кулдауна
+            if bt.get("symbol_cooldown", {}).get(symbol, 0) > now: continue
+            
             df_tf = pd.DataFrame(data_dict["tf"], columns=["ts","open","high","low","close","volume"])
             if df_tf.empty or len(df_tf) < 2: continue
             last_idx = -1
@@ -249,7 +285,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 gate_passed_symbols.append({'symbol': symbol, 'df_tf': df_tf, 'df_5m': pd.DataFrame(data_dict["5m"], columns=["ts","open","high","low","close","volume"]), 'last_idx': last_idx, 'gate_features': {'wick_ratio': wick_ratio, 'spike_atr_mult': spike_atr_mult, 'vol_z': vol_z}})
         
         if not gate_passed_symbols:
-            log.info(f"Scan progress: {min(i + CONFIG.CHUNK_SIZE, len(liquid))}/{len(liquid)} symbols, no gates passed.")
+            log.info(f"Scan progress: {min(i + CONFIG.CHUNK_SIZE, len(symbols))}/{len(symbols)} symbols, no gates passed.")
             continue
             
         log.info(f"Chunk progress: {len(gate_passed_symbols)} symbols passed gate checks. Now calculating score...")
@@ -278,15 +314,17 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             except Exception:
                 log.exception(f"Score calculation for {item.get('symbol')} failed")
 
-        log.info(f"Scan progress: {min(i + CONFIG.CHUNK_SIZE, len(liquid))}/{len(liquid)} symbols, found_so_far={len(candidates)}, thr={bt.get('score_threshold', 0):.2f}, elapsed={time.time()-scan_started:.1f}s")
-    
+        log.info(f"Scan progress: {min(i + CONFIG.CHUNK_SIZE, len(symbols))}/{len(symbols)} symbols, found_so_far={len(candidates)}, thr={bt.get('score_threshold', 0):.2f}, elapsed={time.time()-scan_started:.1f}s")
+        await asyncio.sleep(0)
+
     found_count = len(candidates)
     if found_count > 0:
         candidates.sort(key=lambda x: x['score'], reverse=True)
         for cand in candidates:
             if opened_count >= CONFIG.MAX_TRADES_PER_SCAN: break
             if len(bt.get("active_trades", [])) + opened_count >= CONFIG.MAX_CONCURRENT_POSITIONS: break
-            if cand['symbol'] in bt.get("symbol_cooldown", {}): continue
+            # ПАТЧ: Корректная проверка кулдауна при открытии
+            if bt.get("symbol_cooldown", {}).get(cand['symbol'], 0) > time.time(): continue
             await _open_trade(cand, exchange, app)
             opened_count += 1
     
@@ -295,6 +333,15 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         bt['score_threshold'] = max(CONFIG.SCORE_MIN, current_threshold - CONFIG.SCORE_ADAPT_STEP)
     elif found_count > CONFIG.TARGET_SIGNALS_PER_SCAN * 2:
         bt['score_threshold'] = min(CONFIG.SCORE_MAX, current_threshold + CONFIG.SCORE_ADAPT_STEP)
+
+    try:
+        N_all = len(liquid)
+        if N_all > 0:
+            app.bot_data["scan_offset"] = (off + processed) % N_all
+            # ПАТЧ: Дополнительный лог для контроля ротации
+            log.info(f"Rotation advanced: processed={processed}, next_offset={app.bot_data.get('scan_offset')}, pool={len(liquid)}")
+    except Exception:
+        log.debug("Failed to advance scan_offset", exc_info=True)
 
     if found_count == 0 and opened_count == 0:
         log.info(f"Scan finished, no suitable signals found. New threshold: {bt['score_threshold']:.2f}")
@@ -336,7 +383,6 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
     bt["symbol_cooldown"][symbol] = time.time() + CONFIG.SYMBOL_COOLDOWN_SEC
     log.info(f"Opened {side} {symbol} @ {entry_price} with score {trade['Score']:.2f}. Cooldown until {datetime.fromtimestamp(bt['symbol_cooldown'][symbol]).strftime('%H:%M:%S')}")
 
-    # ПАТЧ: Исправлена синтаксическая ошибка в f-string
     if bc := bt.get('broadcast_func'):
         msg = (
             f"⚡ <b>Wick-Spike {side} (Score: {trade['Score']:.2f})</b>\n\n"
