@@ -15,7 +15,7 @@ import trade_executor
 log = logging.getLogger("wick_spike_engine")
 
 # ---------------------------------------------------------------------------
-# CONFIG - ИЗМЕНЕНО
+# CONFIG
 # ---------------------------------------------------------------------------
 class CONFIG:
     TIMEFRAME = "1m"
@@ -23,12 +23,12 @@ class CONFIG:
     LEVERAGE = 20
     MAX_CONCURRENT_POSITIONS = 10
     
-    # ПАТЧ: Оптимизация производительности и таймаутов
-    CONCURRENCY_SEMAPHORE = 10      # Увеличиваем параллелизм
-    FETCH_TIMEOUT = 8               # Снижаем таймаут на один запрос OHLCV
-    SCAN_CADENCE_SEC = 30           # Целевая частота запусков _run_scan
-    CHUNK_SIZE = 60                 # Уменьшаем чанк для более быстрой итерации
-    TIME_BUDGET_SEC = 55            # Увеличиваем общий бюджет времени на скан
+    # Параметры производительности
+    CONCURRENCY_SEMAPHORE = 10
+    FETCH_TIMEOUT = 8
+    SCAN_CADENCE_SEC = 30
+    CHUNK_SIZE = 60
+    TIME_BUDGET_SEC = 55
 
     MIN_QUOTE_VOLUME_USD = 200_000
     MIN_PRICE = 0.001
@@ -101,8 +101,8 @@ def tf_seconds(tf: str) -> int:
 # Core loops
 # ---------------------------------------------------------------------------
 async def scanner_main_loop(app: Application, broadcast):
-    log.info("Wick-Spike loop starting…")
     # ... (код инициализации остается без изменений) ...
+    log.info("Wick-Spike loop starting…")
     app.bot_data.setdefault("active_trades", [])
     app.bot_data.setdefault("symbol_cooldown", {})
     app.bot_data['broadcast_func'] = broadcast
@@ -142,8 +142,6 @@ async def scanner_main_loop(app: Application, broadcast):
             await asyncio.sleep(5)
     await exchange.close()
 
-# ---------------------------------------------------------------------------
-# ПАТЧ: Полностью переписан _run_scan с двухпроходной оптимизацией
 # ---------------------------------------------------------------------------
 async def _run_scan(exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
@@ -204,7 +202,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             log.warning("Scan aborted – time budget exceeded")
             break
         
-        # --- Проход 1: Получаем 1m данные и применяем быстрые гейты ---
         chunk = liquid[i:i+CONFIG.CHUNK_SIZE]
         ohlcv_1m_data = await asyncio.gather(*[fetch_1m_data(s) for s in chunk])
         
@@ -234,57 +231,89 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             if (wick_ratio >= CONFIG.GATE_WICK_RATIO and 
                 spike_atr_mult >= CONFIG.GATE_ATR_SPIKE_MULT and 
                 vol_z >= CONFIG.GATE_VOL_Z):
-                gate_passed_symbols.append({'symbol': symbol, 'df_1m': df_1m})
+                gate_passed_symbols.append({
+                    'symbol': symbol, 
+                    'df_1m': df_1m,
+                    # ПАТЧ: Сохраняем уже посчитанные значения, чтобы не считать их заново
+                    'gate_features': {
+                        'wick_ratio': wick_ratio,
+                        'spike_atr_mult': spike_atr_mult,
+                        'vol_z': vol_z
+                    }
+                })
         
         if not gate_passed_symbols:
             log.info(f"Scan progress: {min(i + CONFIG.CHUNK_SIZE, len(liquid))}/{len(liquid)} symbols, no gates passed.")
             continue
             
-        # --- Проход 2: Для прошедших гейты, получаем 5m данные и считаем полный скор ---
         ohlcv_5m_data = dict(await asyncio.gather(*[fetch_5m_data(s['symbol']) for s in gate_passed_symbols]))
 
         for item in gate_passed_symbols:
-            symbol, df_1m = item['symbol'], item['df_1m']
-            ohlcv_5m = ohlcv_5m_data.get(symbol)
-            if not ohlcv_5m: continue
-            
-            df_5m = pd.DataFrame(ohlcv_5m, columns=["ts","open","high","low","close","volume"])
-            
-            # Считаем оставшиеся фичи и итоговый скор
-            last = df_1m.iloc[-1]
-            c = last['close']
-            df_1m['ema20'] = ta.ema(df_1m['close'], length=20) # считаем только когда нужно
-            dist_from_mean = abs(c - df_1m.iloc[-1]['ema20']) / max(last['atr'], 1e-9)
-            
-            ema50_m5 = ta.ema(df_5m['close'], length=50)
-            atr_m5 = ta.atr(df_5m['high'], df_5m['low'], df_5m['close'], length=14)
-            htf_m5_slope = (ema50_m5.iloc[-1] - ema50_m5.iloc[-6]) / max(atr_m5.iloc[-1], 1e-9) if len(ema50_m5) > 5 else 0
-            
-            btc_ret_5m = (btc_df['close'].iloc[-1] / btc_df['close'].iloc[-6]) - 1 if len(btc_df) > 5 else 0
-            
-            upper_wick = last['high'] - max(last['open'], c)
-            side = "SHORT" if upper_wick >= (min(last['open'], c) - last['low']) else "LONG"
-            
-            btc_context_bonus = 0.0
-            if side == "LONG" and btc_ret_5m < -0.005: btc_context_bonus = -0.15
-            elif side == "SHORT" and btc_ret_5m > 0.005: btc_context_bonus = -0.15
-            
-            score = (0.35 * min(max(last['wick_ratio_val'] - 1.5, 0), 2.5) + # Используем сохраненные значения
-                     0.25 * min(max(last['spike_atr_mult_val'] - 1.8, 0), 2.0) +
-                     0.20 * min(max(last['vol_z'] - 2.0, 0), 3.0) +
-                     0.15 * min(dist_from_mean, 3.0) - 
-                     0.15 * min(abs(htf_m5_slope), 2.0) + 
-                     0.10 * btc_context_bonus)
-            
-            score_threshold = bt.get('score_threshold', CONFIG.SCORE_BASE)
-            if score >= score_threshold:
-                # ... (Код добавления в `candidates` остается прежним)
-                pass # Заглушка, так как код не был предоставлен в запросе
+            try:
+                symbol, df_1m = item['symbol'], item['df_1m']
+                ohlcv_5m = ohlcv_5m_data.get(symbol)
+                if not ohlcv_5m: continue
+                
+                df_5m = pd.DataFrame(ohlcv_5m, columns=["ts","open","high","low","close","volume"])
+                
+                # --- Извлекаем значения из сохраненных данных ---
+                gate_features = item['gate_features']
+                wick_ratio = gate_features['wick_ratio']
+                spike_atr_mult = gate_features['spike_atr_mult']
+                vol_z = gate_features['vol_z']
+
+                # --- Считаем оставшиеся фичи ---
+                last = df_1m.iloc[-1]
+                c = last['close']
+                df_1m['ema20'] = ta.ema(df_1m['close'], length=20)
+                dist_from_mean = abs(c - df_1m.iloc[-1]['ema20']) / max(last['atr'], 1e-9) if pd.notna(df_1m.iloc[-1]['ema20']) else 0
+                
+                ema50_m5 = ta.ema(df_5m['close'], length=50)
+                atr_m5 = ta.atr(df_5m['high'], df_5m['low'], df_5m['close'], length=14)
+                htf_m5_slope = (ema50_m5.iloc[-1] - ema50_m5.iloc[-6]) / max(atr_m5.iloc[-1], 1e-9) if len(ema50_m5) > 5 else 0
+                
+                btc_ret_5m = (btc_df['close'].iloc[-1] / btc_df['close'].iloc[-6]) - 1 if len(btc_df) > 5 else 0
+                
+                upper_wick = last['high'] - max(last['open'], c)
+                side = "SHORT" if upper_wick >= (min(last['open'], c) - last['low']) else "LONG"
+                
+                btc_context_bonus = 0.0
+                if side == "LONG" and btc_ret_5m < -0.005: btc_context_bonus = -0.15
+                elif side == "SHORT" and btc_ret_5m > 0.005: btc_context_bonus = -0.15
+                
+                # ПАТЧ: Добавляем debug-лог и исправляем формулу скоринга
+                log.debug(f"{symbol} features: wick={wick_ratio:.2f}, atrSpike={spike_atr_mult:.2f}, "
+                          f"volZ={vol_z:.2f}, distMean={dist_from_mean:.2f}, htfSlope={htf_m5_slope:.2f}, "
+                          f"btcBonus={btc_context_bonus:.2f}")
+
+                score = (
+                    0.35 * min(max(wick_ratio - 1.5, 0), 2.5)
+                    + 0.25 * min(max(spike_atr_mult - 1.8, 0), 2.0)
+                    + 0.20 * min(max(vol_z - 2.0, 0), 3.0)
+                    + 0.15 * min(dist_from_mean, 3.0) 
+                    - 0.15 * min(abs(htf_m5_slope), 2.0) 
+                    + 0.10 * btc_context_bonus
+                )
+                
+                score_threshold = bt.get('score_threshold', CONFIG.SCORE_BASE)
+                if score >= score_threshold:
+                    candidates.append({
+                        'symbol': symbol, 'side': side, 'score': score,
+                        'last_ohlc': {'o': last['open'], 'h': last['high'], 'l': last['low'], 'c': c},
+                        'features': {
+                            'Score': round(score, 2), 'Wick_Ratio': round(wick_ratio, 2),
+                            'Spike_ATR': round(spike_atr_mult, 2), 'Vol_Z': round(vol_z, 2),
+                            'Dist_Mean': round(dist_from_mean, 2), 'HTF_Slope': round(htf_m5_slope, 2),
+                            'BTC_5m': round(btc_ret_5m * 100, 3)
+                        }
+                    })
+            except Exception:
+                log.exception(f"Score calculation for {item.get('symbol')} failed")
 
         log.info(f"Scan progress: {min(i + CONFIG.CHUNK_SIZE, len(liquid))}/{len(liquid)} symbols, "
-                 f"found={len(candidates)} opened={opened_count} elapsed={time.time()-scan_started:.1f}s")
+                 f"found_so_far={len(candidates)}, elapsed={time.time()-scan_started:.1f}s")
     
-    # --- Отбор и адаптация порога (после всех чанков) ---
+    # --- Отбор и адаптация порога ---
     found_count = len(candidates)
     if found_count > 0:
         candidates.sort(key=lambda x: x['score'], reverse=True)
