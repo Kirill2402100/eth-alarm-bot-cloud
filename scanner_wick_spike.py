@@ -74,7 +74,6 @@ async def fetch_ohlcv_tf(exchange: ccxt.Exchange, symbol: str, tf: str, limit: i
         df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
         df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
         df = (df.set_index("dt")
-              # ПАТЧ: Заменен устаревший алиас "3T" на "3min"
               .resample("3min", label="left", closed="left")
               .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
               .dropna()
@@ -84,7 +83,6 @@ async def fetch_ohlcv_tf(exchange: ccxt.Exchange, symbol: str, tf: str, limit: i
     
     return await asyncio.wait_for(exchange.fetch_ohlcv(symbol, tf, limit=limit), timeout=CONFIG.FETCH_TIMEOUT)
 
-# ... (Остальная часть файла остается без изменений, так как они были корректны) ...
 async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
     loop = asyncio.get_running_loop()
     title = "Trading_Log_v2"
@@ -338,8 +336,70 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
     bt["symbol_cooldown"][symbol] = time.time() + CONFIG.SYMBOL_COOLDOWN_SEC
     log.info(f"Opened {side} {symbol} @ {entry_price} with score {trade['Score']:.2f}. Cooldown until {datetime.fromtimestamp(bt['symbol_cooldown'][symbol]).strftime('%H:%M:%S')}")
 
+    # ПАТЧ: Исправлена синтаксическая ошибка в f-string
     if bc := bt.get('broadcast_func'):
-        msg = (f"⚡ <b>Wick-Spike {side} (Score: {trade['Score']:.2f})</b>\n\n"
-               f"<b>Пара:</b> {symbol}\n<b>Вход:</b> <code>{format_price(entry_price)}</code>\n"
-               f"<b>SL:</b> <code>{format_price(sl)}</code> (-{CONFIG.SL_PCT:.2f}%)\n"
-               f"<b>TP:</b> <code>{format_price(tp)}</code> (+
+        msg = (
+            f"⚡ <b>Wick-Spike {side} (Score: {trade['Score']:.2f})</b>\n\n"
+            f"<b>Пара:</b> {symbol}\n"
+            f"<b>Вход:</b> <code>{format_price(entry_price)}</code>\n"
+            f"<b>SL:</b> <code>{format_price(sl)}</code> (-{CONFIG.SL_PCT:.2f}%)\n"
+            f"<b>TP:</b> <code>{format_price(tp)}</code> (+{take_profit_pct:.2f}%)"
+        )
+        await bc(app, msg)
+    await trade_executor.log_open_trade(trade)
+
+async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
+    bt = app.bot_data
+    act = bt.get("active_trades", [])
+    if not act: return
+    
+    supported_tfs = bt.get('supported_timeframes', {})
+    sem = asyncio.Semaphore(CONFIG.CONCURRENCY_SEMAPHORE)
+    async def fetch(symbol):
+        async with sem:
+            try:
+                ohlc_list = await fetch_ohlcv_tf(exchange, symbol, CONFIG.TIMEFRAME, 2, supported_tfs)
+                return symbol, ohlc_list[-1] if ohlc_list else None
+            except Exception: return symbol, None
+
+    latest_bars = dict(await asyncio.gather(*[fetch(t['Pair']) for t in act]))
+    close_list: List[Tuple[dict,str,float]] = []
+
+    for tr in act:
+        bar = latest_bars.get(tr['Pair'])
+        if bar is None: continue
+        last_high, last_low = bar[2], bar[3]
+        
+        entry, mfe_price, mae_price = tr['Entry_Price'], tr.get('MFE_Price', tr['Entry_Price']), tr.get('MAE_Price', tr['Entry_Price'])
+        if tr['Side'] == "LONG":
+            tr['MFE_Price'], tr['MAE_Price'] = max(mfe_price, last_high), min(mae_price, last_low)
+            if last_low <= tr['SL_Price']: close_list.append((tr, "STOP_LOSS", tr['SL_Price']))
+            elif last_high >= tr['TP_Price']: close_list.append((tr, "TAKE_PROFIT", tr['TP_Price']))
+        else: # SHORT
+            tr['MFE_Price'], tr['MAE_Price'] = min(mfe_price, last_low), max(mae_price, last_high)
+            if last_high >= tr['SL_Price']: close_list.append((tr, "STOP_LOSS", tr['SL_Price']))
+            elif last_low <= tr['TP_Price']: close_list.append((tr, "TAKE_PROFIT", tr['TP_Price']))
+
+    if not close_list: return
+
+    for tr, reason, exit_p in close_list:
+        tp_pct_actual = abs(tr['TP_Price'] / tr['Entry_Price'] - 1) * 100
+        sl_pct_actual = abs(tr['SL_Price'] / tr['Entry_Price'] - 1) * 100
+        pnl_pct = tp_pct_actual if reason == "TAKE_PROFIT" else -sl_pct_actual
+
+        pnl_lever, pnl_usd = pnl_pct * CONFIG.LEVERAGE, CONFIG.POSITION_SIZE_USDT * pnl_pct * CONFIG.LEVERAGE / 100
+        if bc := bt.get('broadcast_func'):
+            emoji = "✅" if reason=="TAKE_PROFIT" else "❌"
+            await bc(app, f"{emoji} <b>{reason}</b> {tr['Pair']} {pnl_lever:+.2f}% (price {format_price(exit_p)})")
+        
+        entry_time = datetime.strptime(tr['Timestamp_UTC'], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        now_utc = datetime.now(timezone.utc)
+        time_to_close = (now_utc - entry_time).total_seconds() / 60
+        
+        mfe_pct = abs(tr['MFE_Price'] / tr['Entry_Price'] - 1) * 100
+        mae_pct = abs(tr['MAE_Price'] / tr['Entry_Price'] - 1) * 100
+        extra_fields = {"MFE_pct": round(mfe_pct, 2), "MAE_pct": round(mae_pct, 2), "Time_to_TP_SL": round(time_to_close, 2)}
+        await trade_executor.update_closed_trade(tr['Signal_ID'], "CLOSED", exit_p, pnl_usd, pnl_lever, reason, extra_fields=extra_fields)
+
+    closed_ids = {t['Signal_ID'] for t,_,_ in close_list}
+    bt['active_trades'] = [t for t in act if t['Signal_ID'] not in closed_ids]
