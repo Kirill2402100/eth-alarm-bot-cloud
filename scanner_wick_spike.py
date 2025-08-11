@@ -51,6 +51,18 @@ class CONFIG:
     MAX_TRADES_PER_SCAN = 2
     SYMBOL_COOLDOWN_SEC = 180
 
+    # Фильтры "анти-иглы" / ликвидность
+    LOCAL_QUOTE_ROLL = 20
+    LOCAL_QUOTE_MIN_USD = 250_000
+    MAX_TAIL_PCT = 1.8
+    MIN_BODY_PCT = 0.05
+    MAX_SPIKE_ATR = 6.0
+    MAX_HTF_SLOPE = 0.8
+    
+    CHECK_ORDERBOOK = True
+    ORDERBOOK_MIN_NOTIONAL = 20_000
+    ORDERBOOK_TIMEOUT = 2
+
     ATR_SL_MULT = 0
     RISK_REWARD = TP_PCT / SL_PCT if SL_PCT > 0 else 0
 
@@ -75,11 +87,10 @@ async def fetch_ohlcv_tf(exchange: ccxt.Exchange, symbol: str, tf: str, limit: i
               .dropna()
               .reset_index())
         
-        # ПАТЧ: Безопасная конвертация времени для разных версий pandas
         try:
-            ts_ns = df["dt"].astype("int64") # pandas 2.x, tz-aware ok
+            ts_ns = df["dt"].astype("int64")
         except Exception:
-            ts_ns = df["dt"].view("int64")   # fallback для старых версий
+            ts_ns = df["dt"].view("int64")
         df["ts"] = (ts_ns // 1_000_000).astype(np.int64)
         
         return df[["ts", "open", "high", "low", "close", "volume"]].tail(limit).values.tolist()
@@ -243,11 +254,14 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     scan_started = time.time()
     candidates, opened_count = [], 0
     processed = 0
-    now = time.time()
+    
     TF_SECONDS = tf_seconds(CONFIG.TIMEFRAME)
-    current_candle_start_ts = int(now // TF_SECONDS) * TF_SECONDS
     
     for i in range(0, len(symbols), CONFIG.CHUNK_SIZE):
+        # ПАТЧ: Обновляем 'now' для каждого чанка
+        now = time.time()
+        current_candle_start_ts = int(now // TF_SECONDS) * TF_SECONDS
+
         if time.time() - scan_started > CONFIG.TIME_BUDGET_SEC:
             log.warning("Scan aborted – time budget exceeded")
             break
@@ -262,25 +276,60 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             if bt.get("symbol_cooldown", {}).get(symbol, 0) > now: continue
             
             df_tf = pd.DataFrame(data_dict["tf"], columns=["ts","open","high","low","close","volume"])
-            if df_tf.empty or len(df_tf) < 2: continue
+            df_5m = pd.DataFrame(data_dict["5m"], columns=["ts","open","high","low","close","volume"])
+            if df_tf.empty or len(df_tf) < 2 or df_5m.empty or len(df_5m) < 7: continue
+
             last_idx = -1
             if df_tf.iloc[-1]["ts"] == current_candle_start_ts * 1000: last_idx = -2
             last = df_tf.iloc[last_idx]
+
             if last["ts"] < (current_candle_start_ts - TF_SECONDS) * 1000: continue
             if last["close"] < CONFIG.MIN_PRICE: continue
+            
             df_tf["atr"] = ta.atr(df_tf["high"], df_tf["low"], df_tf["close"], length=CONFIG.ATR_PERIOD)
             vol_mu = df_tf["volume"].rolling(CONFIG.VOL_WINDOW).mean()
             vol_sigma = df_tf["volume"].rolling(CONFIG.VOL_WINDOW).std().replace(0, 1e-9)
             df_tf["vol_z"] = (df_tf["volume"] - vol_mu) / vol_sigma
+
             if pd.isna(df_tf.iloc[last_idx]["atr"]) or pd.isna(df_tf.iloc[last_idx]["vol_z"]): continue
+            
             h, l, o, c = last['high'], last['low'], last['open'], last['close']
+            
+            # ПАТЧ: Ранний выход, если тело свечи слишком маленькое
             body = max(abs(c-o), 1e-9)
+            body_pct = 100.0 * body / max(c, 1e-9)
+            if body_pct < CONFIG.MIN_BODY_PCT:
+                continue
+
             wick_ratio = max(h - max(o, c), min(o, c) - l) / body
             spike_atr_mult = (h - l) / max(df_tf.iloc[last_idx]["atr"], 1e-9)
             vol_z = df_tf.iloc[last_idx]["vol_z"]
 
+            df_tf["quote"] = df_tf["close"] * df_tf["volume"]
+            roll_quote_med = df_tf["quote"].rolling(CONFIG.LOCAL_QUOTE_ROLL).median().iloc[last_idx]
+            
+            # ПАТЧ: Защита от NaN в медиане
+            if pd.isna(roll_quote_med):
+                continue
+            
+            tail = max(h - max(o, c), min(o, c) - l)
+            tail_pct = 100.0 * tail / max(c, 1e-9)
+
+            ema50_m5 = ta.ema(df_5m["close"], length=50)
+            atr_m5 = ta.atr(df_5m["high"], df_5m["low"], df_5m["close"], length=14)
+            htf_m5_slope_gate = (ema50_m5.iloc[-1] - ema50_m5.iloc[-6]) / max(atr_m5.iloc[-1], 1e-9) if len(ema50_m5) > 6 else np.nan
+            
+            # ПАТЧ: Защита от NaN в HTF slope
+            if pd.isna(htf_m5_slope_gate) or abs(htf_m5_slope_gate) > CONFIG.MAX_HTF_SLOPE:
+                continue
+
+            if (roll_quote_med < CONFIG.LOCAL_QUOTE_MIN_USD or
+                tail_pct > CONFIG.MAX_TAIL_PCT or
+                spike_atr_mult > CONFIG.MAX_SPIKE_ATR):
+                continue
+
             if (wick_ratio >= CONFIG.GATE_WICK_RATIO and spike_atr_mult >= CONFIG.GATE_ATR_SPIKE_MULT and vol_z >= CONFIG.GATE_VOL_Z):
-                gate_passed_symbols.append({'symbol': symbol, 'df_tf': df_tf, 'df_5m': pd.DataFrame(data_dict["5m"], columns=["ts","open","high","low","close","volume"]), 'last_idx': last_idx, 'gate_features': {'wick_ratio': wick_ratio, 'spike_atr_mult': spike_atr_mult, 'vol_z': vol_z}})
+                gate_passed_symbols.append({'symbol': symbol, 'df_tf': df_tf, 'df_5m': df_5m, 'last_idx': last_idx, 'gate_features': {'wick_ratio': wick_ratio, 'spike_atr_mult': spike_atr_mult, 'vol_z': vol_z}})
         
         if not gate_passed_symbols:
             log.info(f"Scan progress: {min(i + CONFIG.CHUNK_SIZE, len(symbols))}/{len(symbols)} symbols, no gates passed.")
@@ -291,6 +340,19 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         for item in gate_passed_symbols:
             try:
                 symbol, df_tf, df_5m, li, gf = item["symbol"], item["df_tf"], item["df_5m"], item["last_idx"], item["gate_features"]
+                
+                if CONFIG.CHECK_ORDERBOOK:
+                    try:
+                        ob = await asyncio.wait_for(exchange.fetch_order_book(symbol, limit=10), timeout=CONFIG.ORDERBOOK_TIMEOUT)
+                        # ПАТЧ: Явное приведение к float
+                        def notional(levels): return sum(float(p) * float(q) for p, q in levels[:10])
+                        if min(notional(ob.get("bids", [])), notional(ob.get("asks", []))) < CONFIG.ORDERBOOK_MIN_NOTIONAL:
+                            log.debug(f"{symbol} failed orderbook check.")
+                            continue
+                    except Exception:
+                        log.debug(f"Failed to fetch orderbook for {symbol}, skipping.")
+                        continue
+
                 last, c = df_tf.iloc[li], df_tf.iloc[li]["close"]
                 df_tf["ema20"] = ta.ema(df_tf["close"], length=20)
                 dist_from_mean = abs(c - df_tf.iloc[li]["ema20"]) / max(df_tf.iloc[li]["atr"], 1e-9) if pd.notna(df_tf.iloc[li]["ema20"]) else 0
