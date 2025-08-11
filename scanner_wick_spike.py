@@ -27,7 +27,7 @@ class CONFIG:
     CONCURRENCY_SEMAPHORE = 12
     FETCH_TIMEOUT = 8
     CHUNK_SIZE = 60
-    TIME_BUDGET_SEC = 55
+    TIME_BUDGET_SEC = 58 # ПАТЧ: Увеличен бюджет времени
     SCAN_TOP_N_SYMBOLS = 300
 
     MIN_QUOTE_VOLUME_USD = 150_000
@@ -55,12 +55,41 @@ class CONFIG:
     MAX_TRADES_PER_SCAN = 2
     SYMBOL_COOLDOWN_SEC = 180
 
-    # Заглушки
     ATR_SL_MULT = 0
     RISK_REWARD = TP_PCT / SL_PCT if SL_PCT > 0 else 0
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+# ПАТЧ: Хелпер больше не вызывает load_markets() и использует безопасную конвертацию времени
+async def fetch_ohlcv_tf(exchange: ccxt.Exchange, symbol: str, tf: str, limit: int, supported_timeframes: dict | None = None):
+    """
+    Загружает OHLCV. Если ТФ не поддерживается, ресемплит из 1m.
+    Использует переданный кэш поддерживаемых таймфреймов.
+    """
+    supported = supported_timeframes or (exchange.timeframes or {})
+    
+    if tf == "3m" and "3m" not in supported and "1m" in supported:
+        raw = await asyncio.wait_for(
+            exchange.fetch_ohlcv(symbol, "1m", limit=limit * 3 + 5),
+            timeout=CONFIG.FETCH_TIMEOUT
+        )
+        if not raw: return []
+        
+        df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
+        df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        df = (df.set_index("dt")
+              .resample("3T", label="left", closed="left")
+              .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+              .dropna()
+              .reset_index())
+        # Безопасная конвертация времени
+        df["ts"] = (df["dt"].astype("int64") // 1_000_000).astype(np.int64)
+        return df[["ts", "open", "high", "low", "close", "volume"]].tail(limit).values.tolist()
+    
+    return await asyncio.wait_for(exchange.fetch_ohlcv(symbol, tf, limit=limit), timeout=CONFIG.FETCH_TIMEOUT)
 
-# ... (Функции ensure_new_log_sheet, format_price, tf_seconds остаются без изменений) ...
+# ... (ensure_new_log_sheet, format_price, tf_seconds остаются без изменений) ...
 async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
     loop = asyncio.get_running_loop()
     title = "Trading_Log_v2"
@@ -69,7 +98,7 @@ async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
         "Entry_Price", "Exit_Price", "Exit_Time_UTC",
         "Exit_Reason", "PNL_USD", "PNL_Percent",
         "Score", "Score_Threshold", "Wick_Ratio", "Spike_ATR", "Vol_Z",
-        "Dist_Mean", "HTF_Slope", "BTC_5m",
+        "Dist_Mean", "HTF_Slope", "BTC_ctx",
         "MFE_Price", "MAE_Price", "MFE_pct", "MAE_pct", "Time_to_TP_SL"
     ]
     ws = None
@@ -96,6 +125,7 @@ def tf_seconds(tf: str) -> int:
     n, unit = int(tf[:-1]), tf[-1].lower()
     return n * (60 if unit == "m" else 3600 if unit == "h" else 86400)
 
+
 # ---------------------------------------------------------------------------
 # Core loops
 # ---------------------------------------------------------------------------
@@ -118,9 +148,11 @@ async def scanner_main_loop(app: Application, broadcast):
         log.error(f"Sheets init error: {e}", exc_info=True)
 
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 150})
-    # ПАТЧ: Принудительная загрузка рынков для получения правил точности
+    
+    # ПАТЧ: Загружаем рынки и кэшируем таймфреймы один раз при старте
     await exchange.load_markets(True)
-    log.info("Рынки загружены.")
+    app.bot_data['supported_timeframes'] = (exchange.timeframes or {}).copy()
+    log.info("Рынки и поддерживаемые таймфреймы загружены и закэшированы.")
 
     last_flush = 0
     scan_triggered_for_ts = 0
@@ -153,54 +185,50 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     if len(bt.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
         return
 
+    # Получаем кэш таймфреймов
+    supported_tfs = bt.get('supported_timeframes', {})
+
     try:
         tickers = await exchange.fetch_tickers()
-        liquid_tickers = [t for t in tickers.values()
-                         if (t.get('quoteVolume') or 0) > CONFIG.MIN_QUOTE_VOLUME_USD
-                         and exchange.market(t['symbol']).get("type") == "swap"
-                         and t['symbol'].endswith("USDT:USDT")
-                         and "UP" not in t['symbol'] and "DOWN" not in t['symbol']]
+        liquid_tickers = [t for t in tickers.values() if (t.get('quoteVolume') or 0) > CONFIG.MIN_QUOTE_VOLUME_USD and exchange.market(t['symbol']).get("type") == "swap" and t['symbol'].endswith("USDT:USDT") and "UP" not in t['symbol'] and "DOWN" not in t['symbol']]
         liquid_tickers.sort(key=lambda x: x['quoteVolume'], reverse=True)
         top_n_symbols = {t['symbol'] for t in liquid_tickers[:CONFIG.SCAN_TOP_N_SYMBOLS]}
         top_n_symbols.add("BTC/USDT:USDT")
         liquid = list(top_n_symbols)
         log.info(f"Wick-Scan: получено {len(tickers)} пар; отобрано топ-{len(liquid)} по объему.")
-
     except Exception as e:
         log.warning(f"ticker fetch failed: {e}")
         return
 
     try:
-        btc_ohlcv = await exchange.fetch_ohlcv("BTC/USDT:USDT", CONFIG.TIMEFRAME, limit=10)
+        # ПАТЧ: Используем хелпер с переданным кэшем
+        btc_ohlcv = await fetch_ohlcv_tf(exchange, "BTC/USDT:USDT", CONFIG.TIMEFRAME, 10, supported_tfs)
         btc_df = pd.DataFrame(btc_ohlcv, columns=["ts","open","high","low","close","volume"])
+        if btc_df.empty: btc_df = None
     except Exception as e:
-        log.warning(f"BTC fetch failed, skipping scan: {e}")
-        return
+        log.warning(f"BTC fetch failed ({e}). Continuing without BTC context.")
+        btc_df = None
 
     sem = asyncio.Semaphore(CONFIG.CONCURRENCY_SEMAPHORE)
+    limit_tf, limit_5m = CONFIG.VOL_WINDOW + CONFIG.ATR_PERIOD + 2, 50 + 6
     
-    limit_tf = CONFIG.VOL_WINDOW + CONFIG.ATR_PERIOD + 2
-    limit_5m = 50 + 6
-    
+    # ПАТЧ: fetch_data теперь тоже использует кэш таймфреймов
     async def fetch_data(symbol):
         async with sem:
             try:
-                ohlc_tf = await asyncio.wait_for(exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=limit_tf), timeout=CONFIG.FETCH_TIMEOUT)
+                ohlc_tf = await fetch_ohlcv_tf(exchange, symbol, CONFIG.TIMEFRAME, limit_tf, supported_tfs)
                 ohlc_5m = await asyncio.wait_for(exchange.fetch_ohlcv(symbol, '5m', limit=limit_5m), timeout=CONFIG.FETCH_TIMEOUT)
                 return symbol, {"tf": ohlc_tf, "5m": ohlc_5m}
             except Exception:
                 return symbol, None
 
     scan_started = time.time()
-    candidates = []
-    opened_count = 0
+    candidates, opened_count = [], 0
     now = time.time()
     TF_SECONDS = tf_seconds(CONFIG.TIMEFRAME)
     current_candle_start_ts = int(now // TF_SECONDS) * TF_SECONDS
-    
-    # ПАТЧ: Более явная очистка словаря кулдаунов
     cooldown = bt.get("symbol_cooldown", {})
-    if int(now) % 300 == 0: # Чистим раз в 5 минут
+    if int(now) % 300 == 0:
         bt["symbol_cooldown"] = {s:t for s,t in cooldown.items() if t > now}
 
     for i in range(0, len(liquid), CONFIG.CHUNK_SIZE):
@@ -213,48 +241,33 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         
         gate_passed_symbols = []
         for symbol, data_dict in all_data:
-            if not data_dict: continue
+            if not data_dict or not data_dict.get('tf'): continue
             if cooldown.get(symbol, 0) > now: continue
-
             df_tf = pd.DataFrame(data_dict["tf"], columns=["ts","open","high","low","close","volume"])
             if df_tf.empty or len(df_tf) < 2: continue
-
-            # ПАТЧ: Выбор свечи через строгое равенство
             last_idx = -1
-            if df_tf.iloc[-1]["ts"] == current_candle_start_ts * 1000:
-                last_idx = -2
-            
+            if df_tf.iloc[-1]["ts"] == current_candle_start_ts * 1000: last_idx = -2
             last = df_tf.iloc[last_idx]
-
             if last["ts"] < (current_candle_start_ts - TF_SECONDS) * 1000: continue
             if last["close"] < CONFIG.MIN_PRICE: continue
-            
             df_tf["atr"] = ta.atr(df_tf["high"], df_tf["low"], df_tf["close"], length=CONFIG.ATR_PERIOD)
             vol_mu = df_tf["volume"].rolling(CONFIG.VOL_WINDOW).mean()
             vol_sigma = df_tf["volume"].rolling(CONFIG.VOL_WINDOW).std().replace(0, 1e-9)
             df_tf["vol_z"] = (df_tf["volume"] - vol_mu) / vol_sigma
-
             if pd.isna(df_tf.iloc[last_idx]["atr"]) or pd.isna(df_tf.iloc[last_idx]["vol_z"]): continue
-            
             h, l, o, c = last['high'], last['low'], last['open'], last['close']
             body = max(abs(c-o), 1e-9)
             wick_ratio = max(h - max(o, c), min(o, c) - l) / body
             spike_atr_mult = (h - l) / max(df_tf.iloc[last_idx]["atr"], 1e-9)
             vol_z = df_tf.iloc[last_idx]["vol_z"]
 
-            if (wick_ratio >= CONFIG.GATE_WICK_RATIO and 
-                spike_atr_mult >= CONFIG.GATE_ATR_SPIKE_MULT and 
-                vol_z >= CONFIG.GATE_VOL_Z):
-                gate_passed_symbols.append({
-                    'symbol': symbol, 'df_tf': df_tf, 'df_5m': pd.DataFrame(data_dict["5m"], columns=["ts","open","high","low","close","volume"]),
-                    'last_idx': last_idx, 'gate_features': {'wick_ratio': wick_ratio, 'spike_atr_mult': spike_atr_mult, 'vol_z': vol_z}
-                })
+            if (wick_ratio >= CONFIG.GATE_WICK_RATIO and spike_atr_mult >= CONFIG.GATE_ATR_SPIKE_MULT and vol_z >= CONFIG.GATE_VOL_Z):
+                gate_passed_symbols.append({'symbol': symbol, 'df_tf': df_tf, 'df_5m': pd.DataFrame(data_dict["5m"], columns=["ts","open","high","low","close","volume"]), 'last_idx': last_idx, 'gate_features': {'wick_ratio': wick_ratio, 'spike_atr_mult': spike_atr_mult, 'vol_z': vol_z}})
         
         if not gate_passed_symbols:
             log.info(f"Scan progress: {min(i + CONFIG.CHUNK_SIZE, len(liquid))}/{len(liquid)} symbols, no gates passed.")
             continue
             
-        # ПАТЧ: Дополнительное логирование
         log.info(f"Chunk progress: {len(gate_passed_symbols)} symbols passed gate checks. Now calculating score...")
 
         for item in gate_passed_symbols:
@@ -266,7 +279,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 ema50_m5 = ta.ema(df_5m["close"], length=50)
                 atr_m5 = ta.atr(df_5m["high"], df_5m["low"], df_5m["close"], length=14)
                 htf_m5_slope = (ema50_m5.iloc[-1] - ema50_m5.iloc[-6]) / max(atr_m5.iloc[-1], 1e-9) if len(ema50_m5) > 6 else 0
-                btc_ret_context = (btc_df["close"].iloc[-1] / btc_df["close"].iloc[-6]) - 1 if len(btc_df) > 6 else 0
+                btc_ret_context = 0 if btc_df is None or btc_df.empty or len(btc_df) <= 6 else (btc_df["close"].iloc[-1] / btc_df["close"].iloc[-6]) - 1
                 upper_wick, lower_wick = last["high"] - max(last["open"], c), min(last["open"], c) - last["low"]
                 side = "SHORT" if upper_wick >= lower_wick else "LONG"
                 btc_context_bonus = 0.0
@@ -277,20 +290,11 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 
                 score_threshold = bt.get("score_threshold", CONFIG.SCORE_BASE)
                 if score >= score_threshold:
-                    candidates.append({
-                        'symbol': symbol, 'side': side, 'score': score,
-                        'last_ohlc': {'o': last["open"], 'h': last["high"], 'l': last["low"], 'c': c},
-                        'features': {
-                            'Score': round(score, 2), 'Wick_Ratio': round(gf["wick_ratio"], 2),
-                            'Spike_ATR': round(gf["spike_atr_mult"], 2), 'Vol_Z': round(gf["vol_z"], 2),
-                            'Dist_Mean': round(dist_from_mean, 2), 'HTF_Slope': round(htf_m5_slope, 2),
-                            'BTC_5m': round(btc_ret_context * 100, 3)
-                        }
-                    })
+                    candidates.append({'symbol': symbol, 'side': side, 'score': score, 'last_ohlc': {'o': last["open"], 'h': last["high"], 'l': last["low"], 'c': c}, 'features': {'Score': round(score, 2), 'Wick_Ratio': round(gf["wick_ratio"], 2), 'Spike_ATR': round(gf["spike_atr_mult"], 2), 'Vol_Z': round(gf["vol_z"], 2), 'Dist_Mean': round(dist_from_mean, 2), 'HTF_Slope': round(htf_m5_slope, 2), 'BTC_ctx': round(btc_ret_context * 100, 3)}})
             except Exception:
                 log.exception(f"Score calculation for {item.get('symbol')} failed")
 
-        log.info(f"Scan progress: {min(i + CONFIG.CHUNK_SIZE, len(liquid))}/{len(liquid)} symbols, found_so_far={len(candidates)}, elapsed={time.time()-scan_started:.1f}s")
+        log.info(f"Scan progress: {min(i + CONFIG.CHUNK_SIZE, len(liquid))}/{len(liquid)} symbols, found_so_far={len(candidates)}, thr={bt.get('score_threshold', 0):.2f}, elapsed={time.time()-scan_started:.1f}s")
     
     found_count = len(candidates)
     if found_count > 0:
@@ -313,10 +317,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     else:
         log.info(f"Scan finished: found {found_count} candidates, opened {opened_count}. New threshold: {bt['score_threshold']:.2f}")
 
-
-# ---------------------------------------------------------------------------
-# ПАТЧ: Исправлена критическая ошибка в расчете цены входа
-# ---------------------------------------------------------------------------
+# ... (Функция _open_trade остается без изменений) ...
 async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
     symbol, side, score = candidate['symbol'], candidate['side'], candidate['score']
@@ -331,11 +332,9 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
     o, h, l, c = last_ohlc['o'], last_ohlc['h'], last_ohlc['l'], last_ohlc['c']
     
     if side == "LONG":
-        # двигаемся внутрь нижней тени от минимума
         lower_tail = min(o, c) - l
         entry_price = l + entry_tail_fraction * lower_tail
     else: # SHORT
-        # двигаемся внутрь верхней тени от максимума
         upper_tail = h - max(o, c)
         entry_price = h - entry_tail_fraction * upper_tail
 
@@ -362,18 +361,18 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
         await bc(app, msg)
     await trade_executor.log_open_trade(trade)
 
-# ... (Функция _monitor_trades остается без изменений) ...
 async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
     act = bt.get("active_trades", [])
     if not act: return
-
+    
+    supported_tfs = bt.get('supported_timeframes', {})
     sem = asyncio.Semaphore(CONFIG.CONCURRENCY_SEMAPHORE)
     async def fetch(symbol):
         async with sem:
             try:
-                ohlc = await asyncio.wait_for(exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=2), timeout=12)
-                return symbol, ohlc[-1] if ohlc else None
+                ohlc_list = await fetch_ohlcv_tf(exchange, symbol, CONFIG.TIMEFRAME, 2, supported_tfs)
+                return symbol, ohlc_list[-1] if ohlc_list else None
             except Exception: return symbol, None
 
     latest_bars = dict(await asyncio.gather(*[fetch(t['Pair']) for t in act]))
