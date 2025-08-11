@@ -103,6 +103,8 @@ async def scanner_main_loop(app: Application, broadcast):
     app.bot_data.setdefault("scan_task", None)
     app.bot_data.setdefault("scan_offset", 0)
     app.bot_data.setdefault('last_thr_bump_at', 0)
+    # <<< ИЗМЕНЕНО: Ключ для троттлинга логов
+    app.bot_data.setdefault('last_heartbeat_log', 0)
     app.bot_data['broadcast_func'] = broadcast
     if 'score_threshold' not in app.bot_data:
         app.bot_data['score_threshold'] = CONFIG.SCORE_BASE
@@ -122,9 +124,15 @@ async def scanner_main_loop(app: Application, broadcast):
     last_scan_time = 0
 
     while app.bot_data.get("bot_on", False):
-        log.info("Wick-Spike loop heartbeat…")
+        # <<< ИЗМЕНЕНО: Логируем heartbeat не чаще раза в минуту
+        hb_key = "last_heartbeat_log"
+        last_hb = app.bot_data.get(hb_key, 0)
+        current_time = time.time()
+        if current_time - last_hb >= 60:
+            log.info("Wick-Spike loop heartbeat…")
+            app.bot_data[hb_key] = current_time
+
         try:
-            current_time = time.time()
             if not app.bot_data.get("scan_paused", False):
                 t = app.bot_data.get("scan_task")
                 if (not t or t.done()) and (current_time - last_scan_time >= CONFIG.SCAN_CADENCE_SEC):
@@ -399,8 +407,8 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
     if bc := bt.get('broadcast_func'):
         msg = (f"⚡ <b>Wick-Spike {side} (Score: {trade['Score']:.2f})</b>\n\n"
                f"<b>Пара:</b> {symbol}\n<b>Вход:</b> <code>{format_price(entry_price)}</code>\n"
-               f"<b>SL:</b> <code>{format_price(sl)}</code> (-{CONFIG.SL_PCT:.2f}%)\n"
-               f"<b>TP:</b> <code>{format_price(tp)}</code> (+{take_profit_pct:.2f}%)")
+               f"<b>SL:</b> <code>{format_price(sl)}</code> (-{abs(sl/entry_price-1)*100:.2f}%)\n"
+               f"<b>TP:</b> <code>{format_price(tp)}</code> (+{abs(tp/entry_price-1)*100:.2f}%)")
         await bc(app, msg)
 
     await trade_executor.log_open_trade(trade)
