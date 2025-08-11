@@ -28,7 +28,7 @@ class CONFIG:
     FETCH_TIMEOUT = 8
     SCAN_CADENCE_SEC = 30
     CHUNK_SIZE = 60
-    TIME_BUDGET_SEC = 55
+    TIME_BUDGET_SEC = 120
     SCAN_TOP_N_SYMBOLS = 300        # Сканируем топ-300 пар по объему
 
     MIN_QUOTE_VOLUME_USD = 150_000  # Снижаем порог, так как отбор идет по топ-N
