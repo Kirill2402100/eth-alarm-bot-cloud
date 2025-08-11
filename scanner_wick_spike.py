@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio, time, logging, json, os
+import contextlib
 from datetime import datetime, timezone
 from typing import Optional, Tuple, List, Dict
 
@@ -15,7 +16,7 @@ import trade_executor
 log = logging.getLogger("wick_spike_engine")
 
 # ---------------------------------------------------------------------------
-# CONFIG - ИЗМЕНЕНО
+# CONFIG
 # ---------------------------------------------------------------------------
 class CONFIG:
     TIMEFRAME = "1m"
@@ -23,31 +24,27 @@ class CONFIG:
     LEVERAGE = 20
     MAX_CONCURRENT_POSITIONS = 10
     
-    # ПАТЧ: Оптимизация производительности и отбора
-    CONCURRENCY_SEMAPHORE = 12      # Увеличиваем параллелизм
+    CONCURRENCY_SEMAPHORE = 12
     FETCH_TIMEOUT = 8
-    SCAN_CADENCE_SEC = 30
+    SCAN_CADENCE_SEC = 15
     CHUNK_SIZE = 60
     TIME_BUDGET_SEC = 55
-    SCAN_TOP_N_SYMBOLS = 300        # Сканируем топ-300 пар по объему
+    SCAN_TOP_N_SYMBOLS = 300
 
-    MIN_QUOTE_VOLUME_USD = 150_000  # Снижаем порог, так как отбор идет по топ-N
+    MIN_QUOTE_VOLUME_USD = 150_000
     MIN_PRICE = 0.001
     SCAN_INTERVAL_SECONDS = 3
 
-    # ПАТЧ: Смягчаем жесткие гейты для увеличения потока сигналов
     ATR_PERIOD = 14
     VOL_WINDOW = 50
     GATE_WICK_RATIO = 1.5
     GATE_ATR_SPIKE_MULT = 1.5
     GATE_VOL_Z = 1.2
 
-    # --- Параметры для входа и выхода ---
     ENTRY_TAIL_FRACTION = 0.3
     SL_PCT = 0.20
     TP_PCT = 0.40
 
-    # --- Управление адаптивным порогом и частотой ---
     SCORE_BASE = 1.6
     SCORE_MIN = 1.4
     SCORE_MAX = 2.4
@@ -56,7 +53,6 @@ class CONFIG:
     MAX_TRADES_PER_SCAN = 2
     SYMBOL_COOLDOWN_SEC = 120
 
-    # Заглушки для обратной совместимости
     ATR_SL_MULT = 0
     RISK_REWARD = TP_PCT / SL_PCT if SL_PCT > 0 else 0
 
@@ -101,10 +97,12 @@ def tf_seconds(tf: str) -> int:
 # Core loops
 # ---------------------------------------------------------------------------
 async def scanner_main_loop(app: Application, broadcast):
-    # ... (код инициализации остается без изменений) ...
     log.info("Wick-Spike loop starting…")
     app.bot_data.setdefault("active_trades", [])
     app.bot_data.setdefault("symbol_cooldown", {})
+    app.bot_data.setdefault("scan_task", None)
+    app.bot_data.setdefault("scan_offset", 0)
+    app.bot_data.setdefault('last_thr_bump_at', 0)
     app.bot_data['broadcast_func'] = broadcast
     if 'score_threshold' not in app.bot_data:
         app.bot_data['score_threshold'] = CONFIG.SCORE_BASE
@@ -119,6 +117,7 @@ async def scanner_main_loop(app: Application, broadcast):
         log.error(f"Sheets init error: {e}", exc_info=True)
 
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 150})
+    await exchange.load_markets(True) 
     last_flush = 0
     last_scan_time = 0
 
@@ -127,9 +126,10 @@ async def scanner_main_loop(app: Application, broadcast):
         try:
             current_time = time.time()
             if not app.bot_data.get("scan_paused", False):
-                if current_time - last_scan_time >= CONFIG.SCAN_CADENCE_SEC:
+                t = app.bot_data.get("scan_task")
+                if (not t or t.done()) and (current_time - last_scan_time >= CONFIG.SCAN_CADENCE_SEC):
                     log.info(f"Wick-Scan start: thr={app.bot_data.get('score_threshold', CONFIG.SCORE_BASE):.2f}")
-                    await _run_scan(exchange, app)
+                    app.bot_data["scan_task"] = asyncio.create_task(_run_scan(exchange, app))
                     last_scan_time = current_time
             
             await _monitor_trades(exchange, app)
@@ -140,6 +140,13 @@ async def scanner_main_loop(app: Application, broadcast):
         except Exception as e:
             log.exception("FATAL in main loop")
             await asyncio.sleep(5)
+
+    task = app.bot_data.get("scan_task")
+    if task and not task.done():
+        task.cancel()
+        with contextlib.suppress(Exception):
+            await task
+    
     await exchange.close()
 
 # ---------------------------------------------------------------------------
@@ -147,23 +154,28 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
     if len(bt.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
         return
+        
+    opened_this_scan = 0
 
     try:
         tickers = await exchange.fetch_tickers()
-        
-        # ПАТЧ: Отбираем топ-N самых ликвидных инструментов
         liquid_tickers = [t for t in tickers.values()
-                         if (t.get('quoteVolume') or 0) > CONFIG.MIN_QUOTE_VOLUME_USD
-                         and exchange.market(t['symbol']).get("type") == "swap"
-                         and t['symbol'].endswith("USDT:USDT")
-                         and "UP" not in t['symbol'] and "DOWN" not in t['symbol']]
+                            if (t.get('quoteVolume') or 0) > CONFIG.MIN_QUOTE_VOLUME_USD
+                            and exchange.market(t['symbol']).get("type") == "swap"
+                            and t['symbol'].endswith("USDT:USDT")
+                            and "UP" not in t['symbol'] and "DOWN" not in t['symbol']]
         
         liquid_tickers.sort(key=lambda x: x['quoteVolume'], reverse=True)
         top_n_symbols = {t['symbol'] for t in liquid_tickers[:CONFIG.SCAN_TOP_N_SYMBOLS]}
-        top_n_symbols.add("BTC/USDT:USDT") # Гарантируем наличие BTC
+        top_n_symbols.add("BTC/USDT:USDT")
         liquid = list(top_n_symbols)
         
-        log.info(f"Wick-Scan: получено {len(tickers)} пар; отобрано топ-{len(liquid)} по объему.")
+        offset = bt.get("scan_offset", 0)
+        liquid_rotated = liquid[offset:] + liquid[:offset]
+        if len(liquid) > 0:
+            bt["scan_offset"] = (offset + CONFIG.CHUNK_SIZE) % len(liquid)
+        
+        log.info(f"Wick-Scan: получено {len(tickers)} пар; отобрано топ-{len(liquid)}. Начинаем с офсета {offset}")
 
     except Exception as e:
         log.warning(f"ticker fetch failed: {e}")
@@ -173,8 +185,8 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         btc_ohlcv = await exchange.fetch_ohlcv("BTC/USDT:USDT", '1m', limit=10)
         btc_df = pd.DataFrame(btc_ohlcv, columns=["ts","open","high","low","close","volume"])
     except Exception as e:
-        log.warning(f"BTC fetch failed, skipping scan: {e}")
-        return
+        log.warning(f"BTC fetch failed ({e}). Continue with neutral BTC context.")
+        btc_df = None
 
     sem = asyncio.Semaphore(CONFIG.CONCURRENCY_SEMAPHORE)
     
@@ -197,28 +209,34 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             except Exception: return symbol, None
 
     scan_started = time.time()
-    candidates = []
-    opened_count = 0
-    now = time.time()
-    cooldown = bt.get("symbol_cooldown", {})
-    if now % 60 < 5: 
-        bt["symbol_cooldown"] = {s: until for s, until in cooldown.items() if until > now}
+    
+    # Периодическая очистка старых записей из кулдауна
+    if int(time.time()) % 60 < 5: 
+        current_ts_for_cleanup = time.time()
+        bt["symbol_cooldown"] = {s: until for s, until in bt.get("symbol_cooldown", {}).items() if until > current_ts_for_cleanup}
 
-    for i in range(0, len(liquid), CONFIG.CHUNK_SIZE):
-        if time.time() - scan_started > CONFIG.TIME_BUDGET_SEC:
+    for i in range(0, len(liquid_rotated), CONFIG.CHUNK_SIZE):
+        # <<< ИЗМЕНЕНО: Обновляем таймстемп для каждого чанка
+        now_ts = time.time()
+        if now_ts - scan_started > CONFIG.TIME_BUDGET_SEC:
             log.warning("Scan aborted – time budget exceeded")
             break
         
-        chunk = liquid[i:i+CONFIG.CHUNK_SIZE]
+        opened_syms_in_chunk = set()
+        chunk = liquid_rotated[i:i+CONFIG.CHUNK_SIZE]
         ohlcv_1m_data = await asyncio.gather(*[fetch_1m_data(s) for s in chunk])
-        
         gate_passed_symbols = []
         for symbol, ohlcv in ohlcv_1m_data:
-            if not ohlcv: continue
-            if cooldown.get(symbol, 0) > now: continue
+            if not ohlcv or len(ohlcv) < 2: continue
+            
+            if bt.get("symbol_cooldown", {}).get(symbol, 0) > now_ts:
+                continue
 
             df_1m = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
-            if df_1m.iloc[-1]['ts'] < (now - tf_seconds('1m')) * 1000: continue
+            
+            if df_1m.iloc[-1]['ts'] < (now_ts - tf_seconds('1m') * 1.5) * 1000:
+                continue
+
             if df_1m.iloc[-1]['close'] < CONFIG.MIN_PRICE: continue
             
             df_1m['atr'] = ta.atr(df_1m['high'], df_1m['low'], df_1m['close'], length=CONFIG.ATR_PERIOD)
@@ -238,18 +256,10 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             if (wick_ratio >= CONFIG.GATE_WICK_RATIO and 
                 spike_atr_mult >= CONFIG.GATE_ATR_SPIKE_MULT and 
                 vol_z >= CONFIG.GATE_VOL_Z):
-                gate_passed_symbols.append({
-                    'symbol': symbol, 
-                    'df_1m': df_1m,
-                    'gate_features': {
-                        'wick_ratio': wick_ratio,
-                        'spike_atr_mult': spike_atr_mult,
-                        'vol_z': vol_z
-                    }
-                })
+                gate_passed_symbols.append({'symbol': symbol, 'df_1m': df_1m, 'gate_features': {'wick_ratio': wick_ratio, 'spike_atr_mult': spike_atr_mult, 'vol_z': vol_z}})
         
         if not gate_passed_symbols:
-            log.info(f"Scan progress: {min(i + CONFIG.CHUNK_SIZE, len(liquid))}/{len(liquid)} symbols, no gates passed.")
+            await asyncio.sleep(0)
             continue
             
         ohlcv_5m_data = dict(await asyncio.gather(*[fetch_5m_data(s['symbol']) for s in gate_passed_symbols]))
@@ -257,27 +267,32 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         for item in gate_passed_symbols:
             try:
                 symbol, df_1m = item['symbol'], item['df_1m']
+                
+                htf_m5_slope, htf_penalty = 0, 0
                 ohlcv_5m = ohlcv_5m_data.get(symbol)
-                if not ohlcv_5m: continue
-                
-                df_5m = pd.DataFrame(ohlcv_5m, columns=["ts","open","high","low","close","volume"])
-                
+                if ohlcv_5m:
+                    df_5m = pd.DataFrame(ohlcv_5m, columns=["ts","open","high","low","close","volume"])
+                    ema50_m5 = ta.ema(df_5m['close'], length=50)
+                    atr_m5 = ta.atr(df_5m['high'], df_5m['low'], df_5m['close'], length=14)
+                    if len(ema50_m5) > 5 and pd.notna(atr_m5.iloc[-1]):
+                        htf_m5_slope = (ema50_m5.iloc[-1] - ema50_m5.iloc[-6]) / max(atr_m5.iloc[-1], 1e-9)
+                else:
+                    log.warning(f"No 5m data for {symbol}, proceeding with htf_slope=0 and penalty.")
+                    htf_penalty = 0.1 
+
                 gate_features = item['gate_features']
-                wick_ratio = gate_features['wick_ratio']
-                spike_atr_mult = gate_features['spike_atr_mult']
-                vol_z = gate_features['vol_z']
+                wick_ratio, spike_atr_mult, vol_z = gate_features['wick_ratio'], gate_features['spike_atr_mult'], gate_features['vol_z']
 
                 last = df_1m.iloc[-1]
                 c = last['close']
                 df_1m['ema20'] = ta.ema(df_1m['close'], length=20)
-                dist_from_mean = abs(c - df_1m.iloc[-1]['ema20']) / max(last['atr'], 1e-9) if pd.notna(df_1m.iloc[-1]['ema20']) else 0
                 
-                ema50_m5 = ta.ema(df_5m['close'], length=50)
-                atr_m5 = ta.atr(df_5m['high'], df_5m['low'], df_5m['close'], length=14)
-                htf_m5_slope = (ema50_m5.iloc[-1] - ema50_m5.iloc[-6]) / max(atr_m5.iloc[-1], 1e-9) if len(ema50_m5) > 5 else 0
+                ema20_last = df_1m['ema20'].iloc[-1]
+                if pd.isna(ema20_last): 
+                    continue
+                dist_from_mean = abs(c - ema20_last) / max(last['atr'], 1e-9)
                 
-                btc_ret_5m = (btc_df['close'].iloc[-1] / btc_df['close'].iloc[-6]) - 1 if len(btc_df) > 5 else 0
-                
+                btc_ret_5m = 0 if (btc_df is None or len(btc_df) <= 6) else (btc_df['close'].iloc[-1] / btc_df['close'].iloc[-6] - 1)
                 upper_wick = last['high'] - max(last['open'], c)
                 side = "SHORT" if upper_wick >= (min(last['open'], c) - last['low']) else "LONG"
                 
@@ -285,71 +300,86 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 if side == "LONG" and btc_ret_5m < -0.005: btc_context_bonus = -0.15
                 elif side == "SHORT" and btc_ret_5m > 0.005: btc_context_bonus = -0.15
                 
-                score = (
-                    0.35 * min(max(wick_ratio - 1.5, 0), 2.5)
-                    + 0.25 * min(max(spike_atr_mult - 1.8, 0), 2.0)
-                    + 0.20 * min(max(vol_z - 2.0, 0), 3.0)
-                    + 0.15 * min(dist_from_mean, 3.0) 
-                    - 0.15 * min(abs(htf_m5_slope), 2.0) 
-                    + 0.10 * btc_context_bonus
-                )
+                score = (0.35*min(max(wick_ratio-1.5,0),2.5) + 0.25*min(max(spike_atr_mult-1.8,0),2.0) + 0.20*min(max(vol_z-2.0,0),3.0) + 0.15*min(dist_from_mean,3.0) - 0.15*min(abs(htf_m5_slope),2.0) + 0.10*btc_context_bonus - htf_penalty)
                 
                 score_threshold = bt.get('score_threshold', CONFIG.SCORE_BASE)
-                if score >= score_threshold:
-                    candidates.append({
-                        'symbol': symbol, 'side': side, 'score': score,
-                        'last_ohlc': {'o': last['open'], 'h': last['high'], 'l': last['low'], 'c': c},
-                        'features': {
-                            'Score': round(score, 2), 'Wick_Ratio': round(wick_ratio, 2),
-                            'Spike_ATR': round(spike_atr_mult, 2), 'Vol_Z': round(vol_z, 2),
-                            'Dist_Mean': round(dist_from_mean, 2), 'HTF_Slope': round(htf_m5_slope, 2),
-                            'BTC_5m': round(btc_ret_5m * 100, 3)
-                        }
-                    })
+                
+                if score >= score_threshold and symbol not in opened_syms_in_chunk:
+                    if len(bt.get("active_trades", [])) + opened_this_scan >= CONFIG.MAX_CONCURRENT_POSITIONS:
+                        log.info(f"Skip open {symbol}: would exceed MAX_CONCURRENT_POSITIONS (reserved).")
+                        continue
+
+                    opened_syms_in_chunk.add(symbol)
+                    cand = {'symbol': symbol, 'side': side, 'score': score, 'last_ohlc': {'o': last['open'], 'h': last['high'], 'l': last['low'], 'c': c}, 'features': {'Score': round(score, 2), 'Wick_Ratio': round(wick_ratio, 2), 'Spike_ATR': round(spike_atr_mult, 2), 'Vol_Z': round(vol_z, 2), 'Dist_Mean': round(dist_from_mean, 2), 'HTF_Slope': round(htf_m5_slope, 2), 'BTC_5m': round(btc_ret_5m * 100, 3)}}
+                    
+                    task = asyncio.create_task(_open_trade(cand, exchange, app))
+                    
+                    # <<< ИЗМЕНЕНО: Исправляем замыкание, чтобы в лог попадал правильный символ
+                    sym = cand.get('symbol')
+                    def _log_open_err(t: asyncio.Task, sym=sym):
+                        ex = t.exception()
+                        if ex:
+                            log.error(f"Error in background open_trade for {sym}",
+                                      exc_info=(type(ex), ex, ex.__traceback__))
+                    task.add_done_callback(_log_open_err)
+                    
+                    opened_this_scan += 1
+                    await asyncio.sleep(0) 
+
+                    if opened_this_scan >= CONFIG.MAX_TRADES_PER_SCAN:
+                        if time.time() - bt.get('last_thr_bump_at', 0) > 10:
+                            bt['score_threshold'] = min(CONFIG.SCORE_MAX, bt.get('score_threshold', CONFIG.SCORE_BASE) + (CONFIG.SCORE_ADAPT_STEP / 2))
+                            bt['last_thr_bump_at'] = time.time()
+                            log.info(f"Early stop & thr bump: opened {opened_this_scan} trades; thr -> {bt['score_threshold']:.2f}")
+                        else:
+                            log.info(f"Early stop: opened {opened_this_scan} trades; threshold bump skipped due to anti-jitter.")
+                        return
+
             except Exception:
                 log.exception(f"Score calculation for {item.get('symbol')} failed")
 
-        log.info(f"Scan progress: {min(i + CONFIG.CHUNK_SIZE, len(liquid))}/{len(liquid)} symbols, "
-                 f"found_so_far={len(candidates)}, elapsed={time.time()-scan_started:.1f}s")
+        log.info(f"Scan progress: {min(i + CONFIG.CHUNK_SIZE, len(liquid_rotated))}/{len(liquid_rotated)} symbols, "
+                 f"opened_so_far={opened_this_scan}, elapsed={time.time()-scan_started:.1f}s")
+        
+        await asyncio.sleep(0)
     
-    found_count = len(candidates)
-    if found_count > 0:
-        candidates.sort(key=lambda x: x['score'], reverse=True)
-        for cand in candidates:
-            if opened_count >= CONFIG.MAX_TRADES_PER_SCAN: break
-            if len(bt.get("active_trades", [])) + opened_count >= CONFIG.MAX_CONCURRENT_POSITIONS: break
-            if cand['symbol'] in bt.get("symbol_cooldown", {}): continue
-            await _open_trade(cand, exchange, app)
-            opened_count += 1
-    
-    current_threshold = bt.get('score_threshold')
-    if found_count < CONFIG.TARGET_SIGNALS_PER_SCAN:
-        bt['score_threshold'] = max(CONFIG.SCORE_MIN, current_threshold - CONFIG.SCORE_ADAPT_STEP)
-    elif found_count > CONFIG.TARGET_SIGNALS_PER_SCAN * 2:
-        bt['score_threshold'] = min(CONFIG.SCORE_MAX, current_threshold + CONFIG.SCORE_ADAPT_STEP)
-
-    if found_count == 0 and opened_count == 0:
-        log.info(f"Scan finished, no suitable signals found. New threshold: {bt['score_threshold']:.2f}")
+    if opened_this_scan == 0:
+        bt['score_threshold'] = max(CONFIG.SCORE_MIN, bt.get('score_threshold', CONFIG.SCORE_BASE) - CONFIG.SCORE_ADAPT_STEP)
+        log.info(f"Scan finished: no trades opened. thr -> {bt['score_threshold']:.2f}")
     else:
-        log.info(f"Scan finished: found {found_count} candidates, opened {opened_count}. New threshold: {bt['score_threshold']:.2f}")
+        log.info(f"Scan finished: opened {opened_this_scan} trade(s). Final thr: {bt['score_threshold']:.2f}")
 
-# ... (Функции _open_trade и _monitor_trades остаются без изменений) ...
+
+# ---------------------------------------------------------------------------
 async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
     symbol, side, score = candidate['symbol'], candidate['side'], candidate['score']
     
+    if len(bt.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
+        log.warning(f"Skipping {symbol} open, MAX_CONCURRENT_POSITIONS reached.")
+        return
+    if bt.get("symbol_cooldown", {}).get(symbol, 0) > time.time():
+        log.info(f"Skipping {symbol} open, symbol is on cooldown.")
+        return
+
     entry_tail_fraction, take_profit_pct = CONFIG.ENTRY_TAIL_FRACTION, CONFIG.TP_PCT
     score_threshold = bt.get('score_threshold', CONFIG.SCORE_BASE)
     if score >= score_threshold + 0.6: entry_tail_fraction = 0.35
     if score >= score_threshold + 0.8: take_profit_pct = 0.5
 
     last_ohlc = candidate['last_ohlc']
-    o, h, l = last_ohlc['o'], last_ohlc['h'], last_ohlc['l']
+    o, h, l, c = last_ohlc['o'], last_ohlc['h'], last_ohlc['l'], last_ohlc['c']
     
     if side == "LONG":
-        entry_price = l + entry_tail_fraction * (o - l)
+        lower_tail = min(o, c) - l
+        entry_price = l + entry_tail_fraction * max(lower_tail, 0)
     else: # SHORT
-        entry_price = h - entry_tail_fraction * (h - o)
+        upper_tail = h - max(o, c)
+        entry_price = h - entry_tail_fraction * max(upper_tail, 0)
+
+    if entry_price == l or entry_price == h:
+        log.warning(f"Skipping {symbol} {side} due to zero-size tail entry calculation.")
+        return
 
     sl_off, tp_off = CONFIG.SL_PCT / 100 * entry_price, take_profit_pct / 100 * entry_price
     sl, tp = (entry_price - sl_off, entry_price + tp_off) if side == "LONG" else (entry_price + sl_off, entry_price - tp_off)
@@ -375,6 +405,7 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
 
     await trade_executor.log_open_trade(trade)
 
+# ---------------------------------------------------------------------------
 async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
     act = bt.get("active_trades", [])
@@ -410,7 +441,10 @@ async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
 
     for tr, reason, exit_p in close_list:
         tp_pct = abs(tr['TP_Price'] / tr['Entry_Price'] - 1) * 100
-        pnl_pct = tp_pct if reason == "TAKE_PROFIT" else -CONFIG.SL_PCT
+        # <<< ИЗМЕНЕНО: Считаем фактический SL% для точности
+        sl_pct_actual = abs(tr['SL_Price'] / tr['Entry_Price'] - 1) * 100
+        pnl_pct = tp_pct if reason == "TAKE_PROFIT" else -sl_pct_actual
+
         pnl_lever, pnl_usd = pnl_pct * CONFIG.LEVERAGE, CONFIG.POSITION_SIZE_USDT * pnl_pct * CONFIG.LEVERAGE / 100
         if bc := bt.get('broadcast_func'):
             emoji = "✅" if reason=="TAKE_PROFIT" else "❌"
