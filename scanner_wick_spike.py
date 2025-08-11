@@ -15,14 +15,21 @@ import trade_executor
 log = logging.getLogger("wick_spike_engine")
 
 # ---------------------------------------------------------------------------
-# CONFIG
+# CONFIG - ИЗМЕНЕНО
 # ---------------------------------------------------------------------------
 class CONFIG:
     TIMEFRAME = "1m"
     POSITION_SIZE_USDT = 10.0
     LEVERAGE = 20
     MAX_CONCURRENT_POSITIONS = 10
-    CONCURRENCY_SEMAPHORE = 10
+    
+    # ПАТЧ: Новые параметры для производительности и стабильности
+    CONCURRENCY_SEMAPHORE = 8       # Уменьшаем параллелизм
+    FETCH_TIMEOUT = 10              # Таймаут на один запрос OHLCV в секундах
+    SCAN_CADENCE_SEC = 30           # Целевая частота запусков _run_scan
+    CHUNK_SIZE = 120                # Сколько символов обрабатываем за один под-проход
+    TIME_BUDGET_SEC = 27            # Максимум времени на один полный запуск сканера
+
     MIN_QUOTE_VOLUME_USD = 200_000
     MIN_PRICE = 0.001
     SCAN_INTERVAL_SECONDS = 3
@@ -46,19 +53,14 @@ class CONFIG:
     SCORE_ADAPT_STEP = 0.1
     TARGET_SIGNALS_PER_SCAN = 1
     MAX_TRADES_PER_SCAN = 2
-    
-    # --- Кулдаун в секундах ---
     SYMBOL_COOLDOWN_SEC = 120
 
     # Заглушки для обратной совместимости
     ATR_SL_MULT = 0
     RISK_REWARD = TP_PCT / SL_PCT if SL_PCT > 0 else 0
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
-# ИЗМЕНЕНО: Полностью новая логика для работы с Google Таблицей
+# ... (Функции ensure_new_log_sheet, format_price, tf_seconds остаются без изменений) ...
 async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
     """
     Проверяет, что лист 'Trading_Log_v2' существует и имеет правильные заголовки.
@@ -67,7 +69,6 @@ async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
     loop = asyncio.get_running_loop()
     title = "Trading_Log_v2"
     
-    # Определяем обязательные заголовки здесь
     required_headers = [
         "Signal_ID", "Timestamp_UTC", "Pair", "Side", "Status",
         "Entry_Price", "Exit_Price", "Exit_Time_UTC",
@@ -82,14 +83,12 @@ async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
         ws = await loop.run_in_executor(None, lambda: gfile.worksheet(title))
         log.info(f"Worksheet '{title}' already exists. Checking headers...")
         
-        # Проверяем заголовки
         current_headers = await loop.run_in_executor(None, lambda: ws.row_values(1))
         if current_headers != required_headers:
             log.warning(f"Headers in '{title}' are outdated! Archiving old sheet and creating a new one.")
             archive_title = f"{title}_archive_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
             await loop.run_in_executor(None, lambda: ws.update_title(archive_title))
             
-            # Создаем новый лист с правильными заголовками
             ws = await loop.run_in_executor(None, lambda: gfile.add_worksheet(title=title, rows=1000, cols=len(required_headers)))
             await loop.run_in_executor(None, lambda: ws.append_row(required_headers, value_input_option="USER_ENTERED"))
             log.info(f"Archived old sheet to '{archive_title}' and created a new '{title}'.")
@@ -110,7 +109,7 @@ async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
         raise
 
     trade_executor.TRADE_LOG_WS = ws
-    trade_executor.clear_headers_cache() # Сбрасываем кэш заголовков
+    trade_executor.clear_headers_cache()
 
 def format_price(p: float) -> str:
     if p < 0.01: return f"{p:.6f}"
@@ -134,6 +133,7 @@ async def scanner_main_loop(app: Application, broadcast):
         app.bot_data['score_threshold'] = CONFIG.SCORE_BASE
         log.info(f"Инициализация порога: score_threshold = {app.bot_data['score_threshold']}")
 
+    # ... (код инициализации Google Sheets остается без изменений) ...
     try:
         creds_json = os.environ.get("GOOGLE_CREDENTIALS")
         sheet_key  = os.environ.get("SHEET_ID")
@@ -157,7 +157,9 @@ async def scanner_main_loop(app: Application, broadcast):
         try:
             current_time = time.time()
             if not app.bot_data.get("scan_paused", False):
-                if current_time - last_scan_time >= 30:
+                # ПАТЧ: Используем SCAN_CADENCE_SEC и добавляем лог начала скана
+                if current_time - last_scan_time >= CONFIG.SCAN_CADENCE_SEC:
+                    log.info(f"Wick-Scan start: thr={app.bot_data.get('score_threshold', CONFIG.SCORE_BASE):.2f}")
                     await _run_scan(exchange, app)
                     last_scan_time = current_time
             
@@ -198,99 +200,106 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         btc_ohlcv = await exchange.fetch_ohlcv("BTC/USDT:USDT", '1m', limit=10)
         btc_df = pd.DataFrame(btc_ohlcv, columns=["ts","open","high","low","close","volume"])
     except Exception as e:
-        log.warning(f"BTC fetch failed: {e}")
+        log.warning(f"BTC fetch failed, skipping scan: {e}")
         return
 
     sem = asyncio.Semaphore(CONFIG.CONCURRENCY_SEMAPHORE)
     limit_1m = CONFIG.VOL_WINDOW + CONFIG.ATR_PERIOD + 1
     limit_5m = 50 + 6
 
+    # ПАТЧ: fetch_data с индивидуальными таймаутами на каждый запрос
     async def fetch_data(symbol):
         async with sem:
             try:
-                tasks = {
-                    "1m": exchange.fetch_ohlcv(symbol, '1m', limit=limit_1m),
-                    "5m": exchange.fetch_ohlcv(symbol, '5m', limit=limit_5m)
-                }
-                results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-                data = dict(zip(tasks.keys(), results))
-                for key, value in data.items():
-                    if isinstance(value, Exception) or not value:
-                        return symbol, None
-                return symbol, data
-            except Exception:
+                ohlc1 = await asyncio.wait_for(
+                    exchange.fetch_ohlcv(symbol, '1m', limit=limit_1m),
+                    timeout=CONFIG.FETCH_TIMEOUT
+                )
+                ohlc5 = await asyncio.wait_for(
+                    exchange.fetch_ohlcv(symbol, '5m', limit=limit_5m),
+                    timeout=CONFIG.FETCH_TIMEOUT
+                )
+                return symbol, {"1m": ohlc1, "5m": ohlc5}
+            except Exception as e:
+                log.debug(f"OHLCV timeout/err {symbol}: {e.__class__.__name__}")
                 return symbol, None
 
-    all_data = await asyncio.gather(*[fetch_data(s) for s in liquid])
-
-    candidates = []
     scan_started = time.time()
-    
+    candidates = []
+    opened_count = 0
     now = time.time()
     cooldown = bt.get("symbol_cooldown", {})
     if now % 60 < 5: 
         bt["symbol_cooldown"] = {s: until for s, until in cooldown.items() if until > now}
 
-    for symbol, data_dict in all_data:
-        if time.time() - scan_started > 27:
+    # ПАТЧ: Обработка символов чанками
+    for i in range(0, len(liquid), CONFIG.CHUNK_SIZE):
+        if time.time() - scan_started > CONFIG.TIME_BUDGET_SEC:
             log.warning("Scan aborted – time budget exceeded")
             break
-
-        if not data_dict: continue
         
-        if cooldown.get(symbol, 0) > now:
-            continue
+        if opened_count >= CONFIG.MAX_TRADES_PER_SCAN:
+            log.info("Max trades per scan reached, stopping early.")
+            break
 
-        df_1m = pd.DataFrame(data_dict['1m'], columns=["ts","open","high","low","close","volume"])
-        df_5m = pd.DataFrame(data_dict['5m'], columns=["ts","open","high","low","close","volume"])
+        chunk = liquid[i:i+CONFIG.CHUNK_SIZE]
+        all_data = await asyncio.gather(*[fetch_data(s) for s in chunk])
 
-        if df_1m.iloc[-1]['ts'] < (time.time() - tf_seconds('1m')) * 1000: continue
-        if df_1m.iloc[-1]['close'] < CONFIG.MIN_PRICE: continue
+        # --- Обработка данных внутри чанка ---
+        for symbol, data_dict in all_data:
+            if not data_dict: continue
+            if cooldown.get(symbol, 0) > now: continue
+            
+            # ... (здесь вся логика расчета признаков и скоринга, она остается прежней) ...
+            df_1m = pd.DataFrame(data_dict['1m'], columns=["ts","open","high","low","close","volume"])
+            df_5m = pd.DataFrame(data_dict['5m'], columns=["ts","open","high","low","close","volume"])
 
-        # --- Расчет признаков ---
-        df_1m['ema20'] = ta.ema(df_1m['close'], length=20)
-        df_1m['atr'] = ta.atr(df_1m['high'], df_1m['low'], df_1m['close'], length=CONFIG.ATR_PERIOD)
-        vol_mu = df_1m['volume'].rolling(CONFIG.VOL_WINDOW).mean()
-        vol_sigma = df_1m['volume'].rolling(CONFIG.VOL_WINDOW).std().replace(0, 1e-9)
-        df_1m['vol_z'] = (df_1m['volume'] - vol_mu) / vol_sigma
-        last = df_1m.iloc[-1]
-        o, h, l, c = last['open'], last['high'], last['low'], last['close']
-        if pd.isna(last["vol_z"]) or pd.isna(last["atr"]) or pd.isna(last["ema20"]): continue
-        body = max(abs(c - o), 1e-9)
-        upper_wick, lower_wick = h - max(o, c), min(o, c) - l
-        wick_ratio, spike_atr_mult = max(upper_wick, lower_wick) / body, (h - l) / max(last['atr'], 1e-9)
-        vol_z, dist_from_mean = last['vol_z'], abs(c - last['ema20']) / max(last['atr'], 1e-9)
+            if df_1m.iloc[-1]['ts'] < (time.time() - tf_seconds('1m')) * 1000: continue
+            if df_1m.iloc[-1]['close'] < CONFIG.MIN_PRICE: continue
+            df_1m['ema20'] = ta.ema(df_1m['close'], length=20)
+            df_1m['atr'] = ta.atr(df_1m['high'], df_1m['low'], df_1m['close'], length=CONFIG.ATR_PERIOD)
+            vol_mu = df_1m['volume'].rolling(CONFIG.VOL_WINDOW).mean()
+            vol_sigma = df_1m['volume'].rolling(CONFIG.VOL_WINDOW).std().replace(0, 1e-9)
+            df_1m['vol_z'] = (df_1m['volume'] - vol_mu) / vol_sigma
+            last = df_1m.iloc[-1]
+            o, h, l, c = last['open'], last['high'], last['low'], last['close']
+            if pd.isna(last["vol_z"]) or pd.isna(last["atr"]) or pd.isna(last["ema20"]): continue
+            body = max(abs(c-o), 1e-9)
+            upper_wick, lower_wick = h - max(o, c), min(o, c) - l
+            wick_ratio, spike_atr_mult = max(upper_wick, lower_wick) / body, (h - l) / max(last['atr'], 1e-9)
+            vol_z, dist_from_mean = last['vol_z'], abs(c - last['ema20']) / max(last['atr'], 1e-9)
+            if not (wick_ratio >= CONFIG.GATE_WICK_RATIO and spike_atr_mult >= CONFIG.GATE_ATR_SPIKE_MULT and vol_z >= CONFIG.GATE_VOL_Z):
+                continue
+            ema50_m5 = ta.ema(df_5m['close'], length=50)
+            atr_m5 = ta.atr(df_5m['high'], df_5m['low'], df_5m['close'], length=14)
+            htf_m5_slope = (ema50_m5.iloc[-1] - ema50_m5.iloc[-6]) / max(atr_m5.iloc[-1], 1e-9) if len(ema50_m5) > 5 else 0
+            btc_ret_5m = (btc_df['close'].iloc[-1] / btc_df['close'].iloc[-6]) - 1 if len(btc_df) > 5 else 0
+            side = "SHORT" if upper_wick >= lower_wick else "LONG"
+            btc_context_bonus = 0.0
+            if side == "LONG" and btc_ret_5m < -0.005: btc_context_bonus = -0.15
+            elif side == "SHORT" and btc_ret_5m > 0.005: btc_context_bonus = -0.15
+            elif side == "LONG" and btc_ret_5m > -0.002: btc_context_bonus = 0.05
+            elif side == "SHORT" and btc_ret_5m < 0.002: btc_context_bonus = 0.05
+            score = (0.35 * min(max(wick_ratio - 1.5, 0), 2.5) + 0.25 * min(max(spike_atr_mult - 1.8, 0), 2.0) + 0.20 * min(max(vol_z - 2.0, 0), 3.0) + 0.15 * min(dist_from_mean, 3.0) - 0.15 * min(abs(htf_m5_slope), 2.0) + 0.10 * btc_context_bonus)
+            score_threshold = bt.get('score_threshold', CONFIG.SCORE_BASE)
+            if score >= score_threshold:
+                candidates.append({
+                    'symbol': symbol, 'side': side, 'score': score,
+                    'last_ohlc': {'o': o, 'h': h, 'l': l, 'c': c},
+                    'features': {
+                        'Score': round(score, 2), 'Wick_Ratio': round(wick_ratio, 2),
+                        'Spike_ATR': round(spike_atr_mult, 2), 'Vol_Z': round(vol_z, 2),
+                        'Dist_Mean': round(dist_from_mean, 2), 'HTF_Slope': round(htf_m5_slope, 2),
+                        'BTC_5m': round(btc_ret_5m * 100, 3)
+                    }
+                })
 
-        if not (wick_ratio >= CONFIG.GATE_WICK_RATIO and spike_atr_mult >= CONFIG.GATE_ATR_SPIKE_MULT and vol_z >= CONFIG.GATE_VOL_Z):
-            continue
-
-        ema50_m5 = ta.ema(df_5m['close'], length=50)
-        atr_m5 = ta.atr(df_5m['high'], df_5m['low'], df_5m['close'], length=14)
-        htf_m5_slope = (ema50_m5.iloc[-1] - ema50_m5.iloc[-6]) / max(atr_m5.iloc[-1], 1e-9) if len(ema50_m5) > 5 else 0
-        btc_ret_5m = (btc_df['close'].iloc[-1] / btc_df['close'].iloc[-6]) - 1 if len(btc_df) > 5 else 0
-        side = "SHORT" if upper_wick >= lower_wick else "LONG"
-        btc_context_bonus = 0.0
-        if side == "LONG" and btc_ret_5m < -0.005: btc_context_bonus = -0.15
-        elif side == "SHORT" and btc_ret_5m > 0.005: btc_context_bonus = -0.15
-        elif side == "LONG" and btc_ret_5m > -0.002: btc_context_bonus = 0.05
-        elif side == "SHORT" and btc_ret_5m < 0.002: btc_context_bonus = 0.05
-        score = (0.35 * min(max(wick_ratio - 1.5, 0), 2.5) + 0.25 * min(max(spike_atr_mult - 1.8, 0), 2.0) + 0.20 * min(max(vol_z - 2.0, 0), 3.0) + 0.15 * min(dist_from_mean, 3.0) - 0.15 * min(abs(htf_m5_slope), 2.0) + 0.10 * btc_context_bonus)
-        
-        score_threshold = bt.get('score_threshold', CONFIG.SCORE_BASE)
-        if score >= score_threshold:
-            candidates.append({
-                'symbol': symbol, 'side': side, 'score': score,
-                'last_ohlc': {'o': o, 'h': h, 'l': l, 'c': c},
-                'features': {
-                    'Score': round(score, 2), 'Wick_Ratio': round(wick_ratio, 2),
-                    'Spike_ATR': round(spike_atr_mult, 2), 'Vol_Z': round(vol_z, 2),
-                    'Dist_Mean': round(dist_from_mean, 2), 'HTF_Slope': round(htf_m5_slope, 2),
-                    'BTC_5m': round(btc_ret_5m * 100, 3)
-                }
-            })
+        # ПАТЧ: Логирование прогресса после каждого чанка
+        log.info(f"Scan progress: {min(i + CONFIG.CHUNK_SIZE, len(liquid))}/{len(liquid)} symbols, "
+                 f"found={len(candidates)} opened={opened_count} elapsed={time.time()-scan_started:.1f}s")
     
+    # --- Отбор и адаптация порога (после всех чанков) ---
     found_count = len(candidates)
-    opened_count = 0
     if found_count > 0:
         candidates.sort(key=lambda x: x['score'], reverse=True)
         for cand in candidates:
@@ -306,13 +315,13 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     elif found_count > CONFIG.TARGET_SIGNALS_PER_SCAN * 2:
         bt['score_threshold'] = min(CONFIG.SCORE_MAX, current_threshold + CONFIG.SCORE_ADAPT_STEP)
 
-    # ИЗМЕНЕНО: Улучшенное логирование
-    if found_count == 0:
-        log.info(f"Поиск завершен, подходящих сигналов не найдено. Текущий порог: {bt['score_threshold']:.2f}")
+    if found_count == 0 and opened_count == 0:
+        log.info(f"Scan finished, no suitable signals found. Current threshold: {bt['score_threshold']:.2f}")
     else:
-        log.info(f"Wick-Scan завершён: найдено {found_count} кандидатов, открыто {opened_count}. Порог: {bt['score_threshold']:.2f}")
+        log.info(f"Scan finished: found {found_count} candidates, opened {opened_count}. New threshold: {bt['score_threshold']:.2f}")
 
-# ---------------------------------------------------------------------------
+# ... (Функции _open_trade и _monitor_trades остаются такими же, как в предыдущем ответе, все патчи в них уже были учтены) ...
+
 async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
     symbol, side, score = candidate['symbol'], candidate['side'], candidate['score']
@@ -354,7 +363,6 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
 
     await trade_executor.log_open_trade(trade)
 
-# ---------------------------------------------------------------------------
 async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
     act = bt.get("active_trades", [])
