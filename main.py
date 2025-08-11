@@ -1,17 +1,14 @@
-# main.py
-
 import os
 import asyncio
 import logging
 from telegram import Update, constants
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, PicklePersistence
 
-# ИЗМЕНЕНО: Импортируем правильный файл сканера под привычным псевдонимом
 import scanner_wick_spike as scanner_engine 
 import trade_executor
 
 # --- Конфигурация ---
-BOT_VERSION = "SwingBot-WickSpike-1.0" # Версия обновлена для ясности
+BOT_VERSION = "SwingBot-WickSpike-2.0-Scoring" # Версия обновлена
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 log = logging.getLogger("bot")
@@ -120,11 +117,13 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if is_running:
         scanner_status = "⏸️ НА ПАУЗЕ" if is_paused else "⚡️ РАБОТАЕТ"
 
-    # ИЗМЕНЕНО: Блок параметров теперь отображает данные для стратегии "Wick-Spike"
+    # ИЗМЕНЕНО: Отображаем новые параметры
+    score_threshold = bot_data.get('score_threshold', cfg.SCORE_BASE)
     params_msg = (
-        f"• <b>Стратегия:</b> Wick-Spike\n"
-        f"• <b>SL:</b> {cfg.SL_PCT:.2f}%\n"
-        f"• <b>TP:</b> {cfg.TP_PCT:.2f}%\n"
+        f"• <b>Стратегия:</b> Wick-Spike (Scoring v2)\n"
+        f"• <b>SL/TP:</b> {cfg.SL_PCT:.2f}% / {cfg.TP_PCT:.2f}%\n"
+        f"• <b>Адаптивный порог:</b> {score_threshold:.2f} (диапазон: {cfg.SCORE_MIN}-{cfg.SCORE_MAX})\n"
+        f"• <b>Цель за скан:</b> {cfg.TARGET_SIGNALS_PER_SCAN} сигнал(а)\n"
     )
 
     msg = (
