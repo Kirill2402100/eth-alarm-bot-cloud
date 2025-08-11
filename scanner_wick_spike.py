@@ -15,7 +15,7 @@ import trade_executor
 log = logging.getLogger("wick_spike_engine")
 
 # ---------------------------------------------------------------------------
-# CONFIG
+# CONFIG - ИЗМЕНЕНО
 # ---------------------------------------------------------------------------
 class CONFIG:
     TIMEFRAME = "1m"
@@ -23,23 +23,24 @@ class CONFIG:
     LEVERAGE = 20
     MAX_CONCURRENT_POSITIONS = 10
     
-    # Параметры производительности
-    CONCURRENCY_SEMAPHORE = 10
+    # ПАТЧ: Оптимизация производительности и отбора
+    CONCURRENCY_SEMAPHORE = 12      # Увеличиваем параллелизм
     FETCH_TIMEOUT = 8
     SCAN_CADENCE_SEC = 30
     CHUNK_SIZE = 60
     TIME_BUDGET_SEC = 55
+    SCAN_TOP_N_SYMBOLS = 300        # Сканируем топ-300 пар по объему
 
-    MIN_QUOTE_VOLUME_USD = 200_000
+    MIN_QUOTE_VOLUME_USD = 150_000  # Снижаем порог, так как отбор идет по топ-N
     MIN_PRICE = 0.001
     SCAN_INTERVAL_SECONDS = 3
 
-    # --- Параметры признаков и жестких гейтов ---
+    # ПАТЧ: Смягчаем жесткие гейты для увеличения потока сигналов
     ATR_PERIOD = 14
     VOL_WINDOW = 50
-    GATE_WICK_RATIO = 1.7
-    GATE_ATR_SPIKE_MULT = 1.6
-    GATE_VOL_Z = 1.5
+    GATE_WICK_RATIO = 1.5
+    GATE_ATR_SPIKE_MULT = 1.5
+    GATE_VOL_Z = 1.2
 
     # --- Параметры для входа и выхода ---
     ENTRY_TAIL_FRACTION = 0.3
@@ -96,7 +97,6 @@ def tf_seconds(tf: str) -> int:
     n, unit = int(tf[:-1]), tf[-1].lower()
     return n * (60 if unit == "m" else 3600 if unit == "h" else 86400)
 
-
 # ---------------------------------------------------------------------------
 # Core loops
 # ---------------------------------------------------------------------------
@@ -150,14 +150,21 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
     try:
         tickers = await exchange.fetch_tickers()
-        liquid_symbols = {s for s, t in tickers.items()
-                         if (t.get("quoteVolume") or 0) > CONFIG.MIN_QUOTE_VOLUME_USD
-                         and exchange.market(s).get("type") == "swap"
-                         and s.endswith("USDT:USDT")
-                         and "UP" not in s and "DOWN" not in s}
-        liquid_symbols.add("BTC/USDT:USDT")
-        liquid = list(liquid_symbols)
-        log.info(f"Wick-Scan: получено {len(tickers)} пар; после фильтра ликвидности – {len(liquid)}")
+        
+        # ПАТЧ: Отбираем топ-N самых ликвидных инструментов
+        liquid_tickers = [t for t in tickers.values()
+                         if (t.get('quoteVolume') or 0) > CONFIG.MIN_QUOTE_VOLUME_USD
+                         and exchange.market(t['symbol']).get("type") == "swap"
+                         and t['symbol'].endswith("USDT:USDT")
+                         and "UP" not in t['symbol'] and "DOWN" not in t['symbol']]
+        
+        liquid_tickers.sort(key=lambda x: x['quoteVolume'], reverse=True)
+        top_n_symbols = {t['symbol'] for t in liquid_tickers[:CONFIG.SCAN_TOP_N_SYMBOLS]}
+        top_n_symbols.add("BTC/USDT:USDT") # Гарантируем наличие BTC
+        liquid = list(top_n_symbols)
+        
+        log.info(f"Wick-Scan: получено {len(tickers)} пар; отобрано топ-{len(liquid)} по объему.")
+
     except Exception as e:
         log.warning(f"ticker fetch failed: {e}")
         return
@@ -234,7 +241,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 gate_passed_symbols.append({
                     'symbol': symbol, 
                     'df_1m': df_1m,
-                    # ПАТЧ: Сохраняем уже посчитанные значения, чтобы не считать их заново
                     'gate_features': {
                         'wick_ratio': wick_ratio,
                         'spike_atr_mult': spike_atr_mult,
@@ -256,13 +262,11 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 
                 df_5m = pd.DataFrame(ohlcv_5m, columns=["ts","open","high","low","close","volume"])
                 
-                # --- Извлекаем значения из сохраненных данных ---
                 gate_features = item['gate_features']
                 wick_ratio = gate_features['wick_ratio']
                 spike_atr_mult = gate_features['spike_atr_mult']
                 vol_z = gate_features['vol_z']
 
-                # --- Считаем оставшиеся фичи ---
                 last = df_1m.iloc[-1]
                 c = last['close']
                 df_1m['ema20'] = ta.ema(df_1m['close'], length=20)
@@ -281,11 +285,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 if side == "LONG" and btc_ret_5m < -0.005: btc_context_bonus = -0.15
                 elif side == "SHORT" and btc_ret_5m > 0.005: btc_context_bonus = -0.15
                 
-                # ПАТЧ: Добавляем debug-лог и исправляем формулу скоринга
-                log.debug(f"{symbol} features: wick={wick_ratio:.2f}, atrSpike={spike_atr_mult:.2f}, "
-                          f"volZ={vol_z:.2f}, distMean={dist_from_mean:.2f}, htfSlope={htf_m5_slope:.2f}, "
-                          f"btcBonus={btc_context_bonus:.2f}")
-
                 score = (
                     0.35 * min(max(wick_ratio - 1.5, 0), 2.5)
                     + 0.25 * min(max(spike_atr_mult - 1.8, 0), 2.0)
@@ -313,7 +312,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         log.info(f"Scan progress: {min(i + CONFIG.CHUNK_SIZE, len(liquid))}/{len(liquid)} symbols, "
                  f"found_so_far={len(candidates)}, elapsed={time.time()-scan_started:.1f}s")
     
-    # --- Отбор и адаптация порога ---
     found_count = len(candidates)
     if found_count > 0:
         candidates.sort(key=lambda x: x['score'], reverse=True)
@@ -334,7 +332,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         log.info(f"Scan finished, no suitable signals found. New threshold: {bt['score_threshold']:.2f}")
     else:
         log.info(f"Scan finished: found {found_count} candidates, opened {opened_count}. New threshold: {bt['score_threshold']:.2f}")
-
 
 # ... (Функции _open_trade и _monitor_trades остаются без изменений) ...
 async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application):
