@@ -1,8 +1,5 @@
-# trade_executor.py
-
 import gspread
 import gspread.utils
-# ИЗМЕНЕНО: Импортируем общее исключение GSpreadException вместо CellNotFound
 from gspread.exceptions import APIError, GSpreadException
 import logging
 import asyncio
@@ -45,7 +42,8 @@ def get_headers(worksheet: gspread.Worksheet):
 def _prepare_row(headers: list, data: dict) -> list:
     if 'Signal_ID' in data:
         data['Signal_ID'] = safe_id(data['Signal_ID'])
-    for key in ['MFE_Price', 'MFE_ATR', 'MFE_TP_Pct', 'Time_in_Trade']:
+    # ИЗМЕНЕНО: Устанавливаем значения по умолчанию для всех возможных полей
+    for key in headers:
         data.setdefault(key, '')
     return [data.get(h, '') for h in headers]
 
@@ -89,7 +87,6 @@ async def flush_log_buffers():
         async with get_lock():
             PENDING_TRADES[:0] = chunk_to_flush
 
-# ИЗМЕНЕНО: Логика обработки исключений для совместимости с gspread v6+
 async def update_closed_trade(
     signal_id: str, status: str, exit_price: float, 
     pnl_usd: float, pnl_display: float, reason: str, 
@@ -105,18 +102,23 @@ async def update_closed_trade(
 
     async with get_lock():
         for row in PENDING_TRADES:
-            if len(row) > headers.index('Signal_ID') and row[headers.index('Signal_ID')] == id_clean:
-                log.info(f"Updating trade {id_clean} directly in the memory buffer.")
-                row_dict = dict(zip(headers, row))
-                row_dict.update({
-                    'Status': status, 'Exit_Price': exit_price, 'Exit_Reason': reason,
-                    'PNL_USD': pnl_usd, 'PNL_Percent': pnl_display,
-                    'Exit_Time_UTC': datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                })
-                if extra_fields: row_dict.update(extra_fields)
-                new_row = [row_dict.get(h, '') for h in headers]
-                row[:] = new_row
-                return
+            try:
+                if len(row) > headers.index('Signal_ID') and row[headers.index('Signal_ID')] == id_clean:
+                    log.info(f"Updating trade {id_clean} directly in the memory buffer.")
+                    row_dict = dict(zip(headers, row))
+                    row_dict.update({
+                        'Status': status, 'Exit_Price': exit_price, 'Exit_Reason': reason,
+                        'PNL_USD': pnl_usd, 'PNL_Percent': pnl_display,
+                        'Exit_Time_UTC': datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    if extra_fields: row_dict.update(extra_fields)
+                    new_row = [row_dict.get(h, '') for h in headers]
+                    row[:] = new_row
+                    return
+            except IndexError:
+                log.error(f"IndexError while updating buffer for {id_clean}. Row length: {len(row)}, Headers length: {len(headers)}")
+                continue
+
 
     loop = asyncio.get_running_loop()
     max_retries = 3
@@ -124,7 +126,6 @@ async def update_closed_trade(
         try:
             cell = await loop.run_in_executor(None, lambda: TRADE_LOG_WS.find(id_clean))
             
-            # Если ячейка найдена, обновляем строку
             row_idx = cell.row
             current_row_values = await loop.run_in_executor(None, lambda: TRADE_LOG_WS.row_values(row_idx))
             while len(current_row_values) < len(headers): current_row_values.append('')
@@ -144,7 +145,6 @@ async def update_closed_trade(
             return
 
         except GSpreadException as e:
-            # Сначала проверяем, является ли ошибка аналогом "Cell not found"
             if "Cell not found" in str(e):
                 log.warning(f"Trade {id_clean} not found in Sheets. Appending as a new closed row.")
                 final_data_dict = {'Signal_ID': id_clean, 'Status': status, 'Exit_Price': exit_price, 'Exit_Reason': reason, 'PNL_USD': pnl_usd, 'PNL_Percent': pnl_display, 'Exit_Time_UTC': datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")}
@@ -152,15 +152,13 @@ async def update_closed_trade(
                 final_row_data = _prepare_row(headers, final_data_dict)
                 await loop.run_in_executor(None, lambda: TRADE_LOG_WS.append_row(final_row_data, value_input_option='USER_ENTERED'))
                 log.info(f"Successfully appended closed trade {id_clean} as a new row.")
-                return # Выход, так как операция завершена
+                return 
 
-            # Затем проверяем, является ли это ошибкой квоты API
             elif isinstance(e, APIError) and e.response.status_code == 429 and attempt < max_retries - 1:
                 wait_time = 2 ** (attempt + 1)
                 log.warning(f"Google API rate limit hit on update. Retrying in {wait_time}s... (Attempt {attempt + 1}/{max_retries})")
                 await asyncio.sleep(wait_time)
             
-            # Все остальные ошибки GSpread считаем невосстановимыми для этой операции
             else:
                 log.error(f"A non-retriable GSpreadException occurred for {signal_id}: {e}", exc_info=True)
                 return
