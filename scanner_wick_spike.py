@@ -15,7 +15,7 @@ import trade_executor
 log = logging.getLogger("wick_spike_engine")
 
 # ---------------------------------------------------------------------------
-# CONFIG - ИЗМЕНЕНО
+# CONFIG
 # ---------------------------------------------------------------------------
 class CONFIG:
     TIMEFRAME = "1m"
@@ -39,16 +39,16 @@ class CONFIG:
     SL_PCT = 0.20
     TP_PCT = 0.40
 
-    # --- НОВИНКА: Управление адаптивным порогом и частотой ---
-    SCORE_BASE = 1.6 # Снижаем базовый порог для увеличения частоты
+    # --- Управление адаптивным порогом и частотой ---
+    SCORE_BASE = 1.6
     SCORE_MIN = 1.4
     SCORE_MAX = 2.4
     SCORE_ADAPT_STEP = 0.1
-    TARGET_SIGNALS_PER_SCAN = 1 # Снижаем цель для более плавной адаптации
+    TARGET_SIGNALS_PER_SCAN = 1
     MAX_TRADES_PER_SCAN = 2
     
-    # ПАТЧ: Заменяем кулдаун в "сканах" на кулдаун в секундах
-    SYMBOL_COOLDOWN_SEC = 120 # Кулдаун 2 минуты
+    # --- Кулдаун в секундах ---
+    SYMBOL_COOLDOWN_SEC = 120
 
     # Заглушки для обратной совместимости
     ATR_SL_MULT = 0
@@ -58,27 +58,49 @@ class CONFIG:
 # Helpers
 # ---------------------------------------------------------------------------
 
+# ИЗМЕНЕНО: Полностью новая логика для работы с Google Таблицей
 async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
-    """Создаёт лист 'Trading_Log_v2', если он не существует, с новыми заголовками."""
+    """
+    Проверяет, что лист 'Trading_Log_v2' существует и имеет правильные заголовки.
+    Если заголовки устарели, архивирует старый лист и создает новый.
+    """
     loop = asyncio.get_running_loop()
     title = "Trading_Log_v2"
+    
+    # Определяем обязательные заголовки здесь
+    required_headers = [
+        "Signal_ID", "Timestamp_UTC", "Pair", "Side", "Status",
+        "Entry_Price", "Exit_Price", "Exit_Time_UTC",
+        "Exit_Reason", "PNL_USD", "PNL_Percent",
+        "Score", "Score_Threshold", "Wick_Ratio", "Spike_ATR", "Vol_Z",
+        "Dist_Mean", "HTF_Slope", "BTC_5m",
+        "MFE_Price", "MAE_Price", "MFE_pct", "MAE_pct", "Time_to_TP_SL"
+    ]
+
     ws = None
     try:
         ws = await loop.run_in_executor(None, lambda: gfile.worksheet(title))
-        log.info(f"Worksheet '{title}' already exists.")
+        log.info(f"Worksheet '{title}' already exists. Checking headers...")
+        
+        # Проверяем заголовки
+        current_headers = await loop.run_in_executor(None, lambda: ws.row_values(1))
+        if current_headers != required_headers:
+            log.warning(f"Headers in '{title}' are outdated! Archiving old sheet and creating a new one.")
+            archive_title = f"{title}_archive_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
+            await loop.run_in_executor(None, lambda: ws.update_title(archive_title))
+            
+            # Создаем новый лист с правильными заголовками
+            ws = await loop.run_in_executor(None, lambda: gfile.add_worksheet(title=title, rows=1000, cols=len(required_headers)))
+            await loop.run_in_executor(None, lambda: ws.append_row(required_headers, value_input_option="USER_ENTERED"))
+            log.info(f"Archived old sheet to '{archive_title}' and created a new '{title}'.")
+        else:
+            log.info(f"Headers in '{title}' are up to date.")
+
     except gspread.exceptions.WorksheetNotFound:
         log.warning(f"Worksheet '{title}' not found. Creating...")
         try:
-            ws = await loop.run_in_executor(None, lambda: gfile.add_worksheet(title=title, rows=1000, cols=40))
-            headers = [
-                "Signal_ID", "Timestamp_UTC", "Pair", "Side", "Status",
-                "Entry_Price", "Exit_Price", "Exit_Time_UTC",
-                "Exit_Reason", "PNL_USD", "PNL_Percent",
-                "Score", "Score_Threshold", "Wick_Ratio", "Spike_ATR", "Vol_Z",
-                "Dist_Mean", "HTF_Slope", "BTC_5m",
-                "MFE_Price", "MAE_Price", "MFE_pct", "MAE_pct", "Time_to_TP_SL"
-            ]
-            await loop.run_in_executor(None, lambda: ws.append_row(headers, value_input_option="USER_ENTERED"))
+            ws = await loop.run_in_executor(None, lambda: gfile.add_worksheet(title=title, rows=1000, cols=len(required_headers)))
+            await loop.run_in_executor(None, lambda: ws.append_row(required_headers, value_input_option="USER_ENTERED"))
             log.info(f"Worksheet '{title}' created with all required headers.")
         except Exception as e:
             log.critical(f"Failed to create new worksheet '{title}': {e}")
@@ -88,7 +110,7 @@ async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
         raise
 
     trade_executor.TRADE_LOG_WS = ws
-    trade_executor.clear_headers_cache()
+    trade_executor.clear_headers_cache() # Сбрасываем кэш заголовков
 
 def format_price(p: float) -> str:
     if p < 0.01: return f"{p:.6f}"
@@ -145,7 +167,6 @@ async def scanner_main_loop(app: Application, broadcast):
                 await trade_executor.flush_log_buffers()
                 last_flush = current_time
 
-            # ПАТЧ: Удалена логика декремента кулдауна, так как он теперь основан на времени
             await asyncio.sleep(CONFIG.SCAN_INTERVAL_SECONDS)
         except Exception as e:
             log.exception("FATAL in main loop")
@@ -166,7 +187,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                          and exchange.market(s).get("type") == "swap"
                          and s.endswith("USDT:USDT")
                          and "UP" not in s and "DOWN" not in s}
-        # ПАТЧ: Гарантируем, что BTC всегда будет в списке для анализа
         liquid_symbols.add("BTC/USDT:USDT")
         liquid = list(liquid_symbols)
         log.info(f"Wick-Scan: получено {len(tickers)} пар; после фильтра ликвидности – {len(liquid)}")
@@ -174,7 +194,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         log.warning(f"ticker fetch failed: {e}")
         return
 
-    # ПАТЧ: Запрашиваем OHLCV для BTC один раз до основного цикла
     try:
         btc_ohlcv = await exchange.fetch_ohlcv("BTC/USDT:USDT", '1m', limit=10)
         btc_df = pd.DataFrame(btc_ohlcv, columns=["ts","open","high","low","close","volume"])
@@ -186,7 +205,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     limit_1m = CONFIG.VOL_WINDOW + CONFIG.ATR_PERIOD + 1
     limit_5m = 50 + 6
 
-    # ПАТЧ: fetch_data теперь не запрашивает BTC
     async def fetch_data(symbol):
         async with sem:
             try:
@@ -208,11 +226,9 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     candidates = []
     scan_started = time.time()
     
-    # ПАТЧ: Логика таймерного кулдауна
     now = time.time()
     cooldown = bt.get("symbol_cooldown", {})
-    # Оптимизированная чистка истекших ключей
-    if now % 60 < 5: # Чистим раз в минуту
+    if now % 60 < 5: 
         bt["symbol_cooldown"] = {s: until for s, until in cooldown.items() if until > now}
 
     for symbol, data_dict in all_data:
@@ -222,7 +238,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
         if not data_dict: continue
         
-        # ПАТЧ: Проверка кулдауна по времени
         if cooldown.get(symbol, 0) > now:
             continue
 
@@ -232,7 +247,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         if df_1m.iloc[-1]['ts'] < (time.time() - tf_seconds('1m')) * 1000: continue
         if df_1m.iloc[-1]['close'] < CONFIG.MIN_PRICE: continue
 
-        # --- Расчет признаков (остается без изменений) ---
+        # --- Расчет признаков ---
         df_1m['ema20'] = ta.ema(df_1m['close'], length=20)
         df_1m['atr'] = ta.atr(df_1m['high'], df_1m['low'], df_1m['close'], length=CONFIG.ATR_PERIOD)
         vol_mu = df_1m['volume'].rolling(CONFIG.VOL_WINDOW).mean()
@@ -265,7 +280,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         if score >= score_threshold:
             candidates.append({
                 'symbol': symbol, 'side': side, 'score': score,
-                'last_ohlc': {'o': o, 'h': h, 'l': l, 'c': c}, # ПАТЧ: передаем ohlc для экономии запроса
+                'last_ohlc': {'o': o, 'h': h, 'l': l, 'c': c},
                 'features': {
                     'Score': round(score, 2), 'Wick_Ratio': round(wick_ratio, 2),
                     'Spike_ATR': round(spike_atr_mult, 2), 'Vol_Z': round(vol_z, 2),
@@ -275,17 +290,15 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             })
     
     found_count = len(candidates)
+    opened_count = 0
     if found_count > 0:
         candidates.sort(key=lambda x: x['score'], reverse=True)
-
-    opened_count = 0
-    for cand in candidates:
-        if opened_count >= CONFIG.MAX_TRADES_PER_SCAN: break
-        if len(bt.get("active_trades", [])) + opened_count >= CONFIG.MAX_CONCURRENT_POSITIONS: break
-        if cand['symbol'] in bt.get("symbol_cooldown", {}): continue
-
-        await _open_trade(cand, exchange, app)
-        opened_count += 1
+        for cand in candidates:
+            if opened_count >= CONFIG.MAX_TRADES_PER_SCAN: break
+            if len(bt.get("active_trades", [])) + opened_count >= CONFIG.MAX_CONCURRENT_POSITIONS: break
+            if cand['symbol'] in bt.get("symbol_cooldown", {}): continue
+            await _open_trade(cand, exchange, app)
+            opened_count += 1
     
     current_threshold = bt.get('score_threshold')
     if found_count < CONFIG.TARGET_SIGNALS_PER_SCAN:
@@ -293,52 +306,42 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     elif found_count > CONFIG.TARGET_SIGNALS_PER_SCAN * 2:
         bt['score_threshold'] = min(CONFIG.SCORE_MAX, current_threshold + CONFIG.SCORE_ADAPT_STEP)
 
-    log.info(f"Wick-Scan завершён: найдено {found_count} кандидатов, открыто {opened_count}. Порог: {bt['score_threshold']:.2f}")
+    # ИЗМЕНЕНО: Улучшенное логирование
+    if found_count == 0:
+        log.info(f"Поиск завершен, подходящих сигналов не найдено. Текущий порог: {bt['score_threshold']:.2f}")
+    else:
+        log.info(f"Wick-Scan завершён: найдено {found_count} кандидатов, открыто {opened_count}. Порог: {bt['score_threshold']:.2f}")
 
 # ---------------------------------------------------------------------------
 async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
-    symbol = candidate['symbol']
-    side = candidate['side']
-    score = candidate['score']
+    symbol, side, score = candidate['symbol'], candidate['side'], candidate['score']
     
-    entry_tail_fraction = CONFIG.ENTRY_TAIL_FRACTION
-    take_profit_pct = CONFIG.TP_PCT
+    entry_tail_fraction, take_profit_pct = CONFIG.ENTRY_TAIL_FRACTION, CONFIG.TP_PCT
     score_threshold = bt.get('score_threshold', CONFIG.SCORE_BASE)
-
     if score >= score_threshold + 0.6: entry_tail_fraction = 0.35
     if score >= score_threshold + 0.8: take_profit_pct = 0.5
 
-    # ПАТЧ: Используем переданные ohlc, чтобы не делать новый запрос
     last_ohlc = candidate['last_ohlc']
     o, h, l = last_ohlc['o'], last_ohlc['h'], last_ohlc['l']
-
-    # ПАТЧ: Исправлена логика расчета цены входа
+    
     if side == "LONG":
         entry_price = l + entry_tail_fraction * (o - l)
     else: # SHORT
         entry_price = h - entry_tail_fraction * (h - o)
 
-    sl_off = CONFIG.SL_PCT / 100 * entry_price
-    tp_off = take_profit_pct / 100 * entry_price
-    sl = entry_price - sl_off if side == "LONG" else entry_price + sl_off
-    tp = entry_price + tp_off if side == "LONG" else entry_price - tp_off
-
+    sl_off, tp_off = CONFIG.SL_PCT / 100 * entry_price, take_profit_pct / 100 * entry_price
+    sl, tp = (entry_price - sl_off, entry_price + tp_off) if side == "LONG" else (entry_price + sl_off, entry_price - tp_off)
     sl, tp, entry_price = float(exchange.price_to_precision(symbol, sl)), float(exchange.price_to_precision(symbol, tp)), float(exchange.price_to_precision(symbol, entry_price))
 
     trade = {
-        "Signal_ID": f"{symbol}_{int(time.time())}",
-        "Pair": symbol, "Side": side,
-        "Entry_Price": entry_price, "SL_Price": sl, "TP_Price": tp,
-        "Status": "ACTIVE", "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        "Score": candidate['features']['Score'], "Score_Threshold": round(score_threshold, 2),
-        "Wick_Ratio": candidate['features']['Wick_Ratio'], "Spike_ATR": candidate['features']['Spike_ATR'],
-        "Vol_Z": candidate['features']['Vol_Z'], "Dist_Mean": candidate['features']['Dist_Mean'],
-        "HTF_Slope": candidate['features']['HTF_Slope'], "BTC_5m": candidate['features']['BTC_5m'],
+        "Signal_ID": f"{symbol}_{int(time.time())}", "Pair": symbol, "Side": side,
+        "Entry_Price": entry_price, "SL_Price": sl, "TP_Price": tp, "Status": "ACTIVE", 
+        "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        **candidate['features'], "Score_Threshold": round(score_threshold, 2),
         "MFE_Price": entry_price, "MAE_Price": entry_price
     }
     bt.setdefault("active_trades", []).append(trade)
-    # ПАТЧ: Устанавливаем таймерный кулдаун
     bt["symbol_cooldown"][symbol] = time.time() + CONFIG.SYMBOL_COOLDOWN_SEC
     log.info(f"Opened {side} {symbol} @ {entry_price} with score {trade['Score']:.2f}. Cooldown until {datetime.fromtimestamp(bt['symbol_cooldown'][symbol]).strftime('%H:%M:%S')}")
 
@@ -393,7 +396,6 @@ async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
             emoji = "✅" if reason=="TAKE_PROFIT" else "❌"
             await bc(app, f"{emoji} <b>{reason}</b> {tr['Pair']} {pnl_lever:+.2f}% (price {format_price(exit_p)})")
         
-        # ПАТЧ: Исправлен расчет времени с учетом таймзон
         entry_time = datetime.strptime(tr['Timestamp_UTC'], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         now_utc = datetime.now(timezone.utc)
         time_to_close = (now_utc - entry_time).total_seconds() / 60
