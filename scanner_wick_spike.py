@@ -77,9 +77,9 @@ async def fetch_ohlcv_tf(exchange: ccxt.Exchange, symbol: str, tf: str, limit: i
         
         # ПАТЧ: Безопасная конвертация времени для разных версий pandas
         try:
-            ts_ns = df["dt"].view("int64")
+            ts_ns = df["dt"].astype("int64") # pandas 2.x, tz-aware ok
         except Exception:
-            ts_ns = df["dt"].astype("int64")
+            ts_ns = df["dt"].view("int64")   # fallback для старых версий
         df["ts"] = (ts_ns // 1_000_000).astype(np.int64)
         
         return df[["ts", "open", "high", "low", "close", "volume"]].tail(limit).values.tolist()
@@ -152,7 +152,7 @@ async def scanner_main_loop(app: Application, broadcast):
 
     last_flush = 0
     last_candle_ts = 0
-    last_cleanup = 0 # ПАТЧ: Таймер для очистки кулдаунов
+    last_cleanup = 0
     TF_SECONDS = tf_seconds(CONFIG.TIMEFRAME)
 
     while app.bot_data.get("bot_on", False):
@@ -173,7 +173,6 @@ async def scanner_main_loop(app: Application, broadcast):
                 await trade_executor.flush_log_buffers()
                 last_flush = now
             
-            # ПАТЧ: Регулярная очистка словаря кулдаунов
             if now - last_cleanup >= 60:
                 cd = app.bot_data.get("symbol_cooldown", {})
                 app.bot_data["symbol_cooldown"] = {s: t for s, t in cd.items() if t > now}
@@ -260,7 +259,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         gate_passed_symbols = []
         for symbol, data_dict in all_data:
             if not data_dict or not data_dict.get('tf'): continue
-            # ПАТЧ: Корректная проверка кулдауна
             if bt.get("symbol_cooldown", {}).get(symbol, 0) > now: continue
             
             df_tf = pd.DataFrame(data_dict["tf"], columns=["ts","open","high","low","close","volume"])
@@ -323,7 +321,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         for cand in candidates:
             if opened_count >= CONFIG.MAX_TRADES_PER_SCAN: break
             if len(bt.get("active_trades", [])) + opened_count >= CONFIG.MAX_CONCURRENT_POSITIONS: break
-            # ПАТЧ: Корректная проверка кулдауна при открытии
             if bt.get("symbol_cooldown", {}).get(cand['symbol'], 0) > time.time(): continue
             await _open_trade(cand, exchange, app)
             opened_count += 1
@@ -338,7 +335,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         N_all = len(liquid)
         if N_all > 0:
             app.bot_data["scan_offset"] = (off + processed) % N_all
-            # ПАТЧ: Дополнительный лог для контроля ротации
             log.info(f"Rotation advanced: processed={processed}, next_offset={app.bot_data.get('scan_offset')}, pool={len(liquid)}")
     except Exception:
         log.debug("Failed to advance scan_offset", exc_info=True)
