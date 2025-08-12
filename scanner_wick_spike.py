@@ -42,6 +42,7 @@ class CONFIG:
     GATE_ATR_SPIKE_MULT = 1.5
     GATE_VOL_Z = 1.2
     GATE_BODY_ATR_MIN = 0.03
+    GATE_ATR_SPIKE_MAX = 2.8
 
     ENTRY_TAIL_FRACTION = 0.3
     SL_PCT = 0.20
@@ -318,7 +319,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             vol_z = last_vol_z
 
             pass_wick = (wick_ratio >= CONFIG.GATE_WICK_RATIO)
-            pass_atr  = (spike_atr_mult >= CONFIG.GATE_ATR_SPIKE_MULT)
+            pass_atr  = (CONFIG.GATE_ATR_SPIKE_MULT <= spike_atr_mult <= CONFIG.GATE_ATR_SPIKE_MAX)
             pass_vol  = (vol_z >= CONFIG.GATE_VOL_Z)
 
             tot_chunk["gate_wick_pass"] += int(pass_wick)
@@ -330,14 +331,20 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             if pass_atr and pass_vol:  tot_chunk["pass_AV"] += 1
 
             passes = int(pass_wick) + int(pass_atr) + int(pass_vol)
-            if passes >= 2:
+            if pass_atr and passes >= 2:
                 tot_chunk["gate_all_pass"] += 1
                 gate_passed_symbols.append({'symbol': symbol, 'df_1m': df_1m, 'bar_ts': bar_ts, 
                                             'gate_features': {'wick_ratio': wick_ratio, 'spike_atr_mult': spike_atr_mult, 
                                                               'vol_z': vol_z, 'atr': last_atr, 'passes': passes}})
             else:
                 if not pass_wick: near["wick"].append(round(wick_ratio, 2))
-                if not pass_atr:  near["atr"].append(round(spike_atr_mult, 2))
+                if not pass_atr:
+                    near["atr"].append(round(spike_atr_mult, 2))
+                    # <<< ИЗМЕНЕНО: Дополнительная телеметрия по отказам ATR
+                    if spike_atr_mult > CONFIG.GATE_ATR_SPIKE_MAX:
+                        tot_chunk["atr_too_high"] += 1
+                    elif spike_atr_mult < CONFIG.GATE_ATR_SPIKE_MULT:
+                        tot_chunk["atr_too_low"] += 1
                 if not pass_vol:  near["vol"].append(round(vol_z, 2))
                 tot_chunk["gate_all_fail"] += 1
                 continue
@@ -351,7 +358,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             f"GateDiag ch={i//CONFIG.CHUNK_SIZE+1}: "
             f"ok_1m={sum(1 for _,o in ohlcv_1m_data if o)}/{len(chunk)} (cd={tot_chunk['cooldown']}), "
             f"micro={tot_chunk['micro_body']}, "
-            f"passes>=2={tot_chunk['gate_all_pass']}, "
+            f"passes>=2(ATR_req)={tot_chunk['gate_all_pass']}, "
             f"combos(WA/WV/AV)={tot_chunk['pass_WA']}/{tot_chunk['pass_WV']}/{tot_chunk['pass_AV']}, "
             f"near_p90(wick={p90(near['wick'])} atr={p90(near['atr'])} vol={p90(near['vol'])})"
         )
@@ -406,14 +413,12 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 elif side == "SHORT" and btc_ret_5m > 0.005: btc_context_bonus = -0.15
                 
                 score = (
-                    0.35 * min(max(wick_ratio - 1.5, 0), 2.5)
-                  + 0.30 * min(max(spike_atr_mult - 1.5, 0), 2.5)
-                  + 0.20 * min(max(vol_z - 1.2, 0), 3.0)
-                  + 0.15 * min(dist_from_mean, 3.0)
-                  - 0.15 * min(abs(htf_m5_slope), 2.0)
-                  + 0.10 * btc_context_bonus
-                  - htf_penalty
-                  + 0.10 * max(passes - 2, 0)
+                    0.60 * min(max(wick_ratio - 1.5, 0), 3.0) +
+                    0.40 * min(max(spike_atr_mult - 1.5, 0), 2.5) -
+                    0.15 * min(abs(htf_m5_slope), 2.0) +
+                    0.10 * btc_context_bonus -
+                    htf_penalty +
+                    0.10 * max(passes - 2, 0)
                 )
                 
                 top_scores.append((symbol, round(score,2)))
@@ -433,10 +438,15 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                                          'Vol_Z': round(vol_z, 2), 'Dist_Mean': round(dist_from_mean, 2), 'HTF_Slope': round(htf_m5_slope, 2), 
                                          'BTC_5m': round(btc_ret_5m * 100, 3), 'ATR_last': last_atr}}
                     
-                    # <<< ИЗМЕНЕНО: Прямое ожидание для корректного подсчёта
-                    trade_opened = await _open_trade(cand, exchange, app)
-                    if trade_opened:
-                        opened_this_scan += 1
+                    # <<< ИЗМЕНЕНО: Возвращаем неблокирующий вызов с "бронированием"
+                    opened_this_scan += 1
+                    task = asyncio.create_task(_open_trade(cand, exchange, app))
+                    def _log_open_err(t, sym=cand['symbol']):
+                        ex = t.exception()
+                        if ex:
+                            log.error(f"Error in background open_trade for {sym}",
+                                      exc_info=(type(ex), ex, ex.__traceback__))
+                    task.add_done_callback(_log_open_err)
 
                     await asyncio.sleep(0) 
 
@@ -471,7 +481,8 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         f"processed={processed_symbols_count}, no_ohlcv={tot_scan['no_ohlcv']}, cooldown={tot_scan['cooldown']}, "
         f"min_price={tot_scan['min_price']}, nan={tot_scan['nan_ind']}, micro={tot_scan['micro_body']}, "
         f"combos(WA/WV/AV)={tot_scan['pass_WA']}/{tot_scan['pass_WV']}/{tot_scan['pass_AV']}, "
-        f"passed_total(2of3)={total_passed_gate}, opened={opened_this_scan}, "
+        f"atr_rejects(H/L)={tot_scan['atr_too_high']}/{tot_scan['atr_too_low']}, "
+        f"passed_total(ATR_req)={total_passed_gate}, opened={opened_this_scan}, "
         f"no_touch_rejects={bt.get('stat_no_touch',0)}"
     )
     if all_scores:
@@ -547,25 +558,28 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
     entry_price_q = float(exchange.price_to_precision(symbol, entry_price))
 
     try:
-        tk = await exchange.fetch_ticker(symbol)
-        last_px = tk.get('last') or tk.get('close') or ((tk.get('bid', 0) + tk.get('ask', 0)) / 2)
-
-        base_tol_pct = 0.15 # <<< ИЗМЕНЕНО: Более гибкий допуск
+        # <<< ИЗМЕНЕНО: Адаптивный толеранс для "касания"
+        tail = (min(o, c) - l) if side == "LONG" else (h - max(o, c))
+        safe_atr = max(float(candidate['features'].get('ATR_last', 0)), 1e-9)
         m = exchange.market(symbol)
         min_tick = (((m.get('limits') or {}).get('price') or {}).get('min')) or 0.0
-        tick_tol_pct = (min_tick / entry_price_q * 100) if (min_tick and entry_price_q > 0) else 0.0
-        touch_tol_pct = max(base_tol_pct, tick_tol_pct * 1.1)
+
+        tol_abs = max(
+            min_tick * 1.1,
+            0.10 * tail,      # 10% длины нужной тени
+            0.10 * safe_atr   # 10% ATR для масштаба
+        )
+        touch_tol_pct = max(0.03, min(0.30, (tol_abs / entry_price_q * 100) if entry_price_q > 0 else 0))
+
+        tk = await exchange.fetch_ticker(symbol)
+        last_px = tk.get('last') or tk.get('close') or ((tk.get('bid', 0) + tk.get('ask', 0)) / 2)
         
-        if side == "LONG":
-            if last_px is None or last_px > entry_price_q * (1 + touch_tol_pct / 100):
-                log.info(f"Skip {symbol}: no touch LONG (live={last_px} > entry={entry_price_q} tol={touch_tol_pct:.3f}%)")
-                bt['stat_no_touch'] = bt.get('stat_no_touch', 0) + 1
-                return
-        else:
-            if last_px is None or last_px < entry_price_q * (1 - touch_tol_pct / 100):
-                log.info(f"Skip {symbol}: no touch SHORT (live={last_px} < entry={entry_price_q} tol={touch_tol_pct:.3f}%)")
-                bt['stat_no_touch'] = bt.get('stat_no_touch', 0) + 1
-                return
+        lo = entry_price_q * (1 - touch_tol_pct/100)
+        hi = entry_price_q * (1 + touch_tol_pct/100)
+        if (last_px is None) or not (lo <= last_px <= hi):
+            log.info(f"Skip {symbol}: no touch (live={last_px}, entry={entry_price_q}, tol=±{touch_tol_pct:.3f}%)")
+            bt['stat_no_touch'] = bt.get('stat_no_touch', 0) + 1
+            return
     except Exception as e:
         log.warning(f"Could not fetch ticker for touch check on {symbol}: {e}")
         return
@@ -614,7 +628,6 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
         await bc(app, msg)
 
     await trade_executor.log_open_trade(trade)
-    return True # <<< ИЗМЕНЕНО: Возвращаем True при успехе
 
 async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
