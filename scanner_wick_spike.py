@@ -433,17 +433,11 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                                          'Vol_Z': round(vol_z, 2), 'Dist_Mean': round(dist_from_mean, 2), 'HTF_Slope': round(htf_m5_slope, 2), 
                                          'BTC_5m': round(btc_ret_5m * 100, 3), 'ATR_last': last_atr}}
                     
-                    task = asyncio.create_task(_open_trade(cand, exchange, app))
-                    
-                    sym = cand.get('symbol')
-                    def _log_open_err(t: asyncio.Task, sym=sym):
-                        ex = t.exception()
-                        if ex:
-                            log.error(f"Error in background open_trade for {sym}",
-                                      exc_info=(type(ex), ex, ex.__traceback__))
-                    task.add_done_callback(_log_open_err)
-                    
-                    opened_this_scan += 1
+                    # <<< ИЗМЕНЕНО: Прямое ожидание для корректного подсчёта
+                    trade_opened = await _open_trade(cand, exchange, app)
+                    if trade_opened:
+                        opened_this_scan += 1
+
                     await asyncio.sleep(0) 
 
                     if opened_this_scan >= CONFIG.MAX_TRADES_PER_SCAN:
@@ -556,18 +550,22 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
         tk = await exchange.fetch_ticker(symbol)
         last_px = tk.get('last') or tk.get('close') or ((tk.get('bid', 0) + tk.get('ask', 0)) / 2)
 
-        base_tol_pct = 0.05
+        base_tol_pct = 0.15 # <<< ИЗМЕНЕНО: Более гибкий допуск
         m = exchange.market(symbol)
         min_tick = (((m.get('limits') or {}).get('price') or {}).get('min')) or 0.0
         tick_tol_pct = (min_tick / entry_price_q * 100) if (min_tick and entry_price_q > 0) else 0.0
         touch_tol_pct = max(base_tol_pct, tick_tol_pct * 1.1)
         
-        lo = entry_price_q * (1 - touch_tol_pct/100)
-        hi = entry_price_q * (1 + touch_tol_pct/100)
-        if (last_px is None) or not (lo <= last_px <= hi):
-            log.info(f"Skip {symbol}: no touch (live={last_px}, entry={entry_price_q}, tol=±{touch_tol_pct:.3f}%)")
-            bt['stat_no_touch'] = bt.get('stat_no_touch', 0) + 1
-            return
+        if side == "LONG":
+            if last_px is None or last_px > entry_price_q * (1 + touch_tol_pct / 100):
+                log.info(f"Skip {symbol}: no touch LONG (live={last_px} > entry={entry_price_q} tol={touch_tol_pct:.3f}%)")
+                bt['stat_no_touch'] = bt.get('stat_no_touch', 0) + 1
+                return
+        else:
+            if last_px is None or last_px < entry_price_q * (1 - touch_tol_pct / 100):
+                log.info(f"Skip {symbol}: no touch SHORT (live={last_px} < entry={entry_price_q} tol={touch_tol_pct:.3f}%)")
+                bt['stat_no_touch'] = bt.get('stat_no_touch', 0) + 1
+                return
     except Exception as e:
         log.warning(f"Could not fetch ticker for touch check on {symbol}: {e}")
         return
@@ -616,6 +614,7 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
         await bc(app, msg)
 
     await trade_executor.log_open_trade(trade)
+    return True # <<< ИЗМЕНЕНО: Возвращаем True при успехе
 
 async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
