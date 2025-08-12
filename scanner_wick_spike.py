@@ -103,7 +103,6 @@ async def scanner_main_loop(app: Application, broadcast):
     app.bot_data.setdefault("scan_task", None)
     app.bot_data.setdefault("scan_offset", 0)
     app.bot_data.setdefault('last_thr_bump_at', 0)
-    # <<< ИЗМЕНЕНО: Ключ для троттлинга логов
     app.bot_data.setdefault('last_heartbeat_log', 0)
     app.bot_data['broadcast_func'] = broadcast
     if 'score_threshold' not in app.bot_data:
@@ -124,7 +123,6 @@ async def scanner_main_loop(app: Application, broadcast):
     last_scan_time = 0
 
     while app.bot_data.get("bot_on", False):
-        # <<< ИЗМЕНЕНО: Логируем heartbeat не чаще раза в минуту
         hb_key = "last_heartbeat_log"
         last_hb = app.bot_data.get(hb_key, 0)
         current_time = time.time()
@@ -166,27 +164,36 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     opened_this_scan = 0
 
     try:
+        universe = [
+            s for s, m in exchange.markets.items()
+            if m.get("type") == "swap"
+            and s.endswith("USDT:USDT")
+            and "UP" not in s and "DOWN" not in s
+        ]
+
         tickers = await exchange.fetch_tickers()
-        liquid_tickers = [t for t in tickers.values()
-                            if (t.get('quoteVolume') or 0) > CONFIG.MIN_QUOTE_VOLUME_USD
-                            and exchange.market(t['symbol']).get("type") == "swap"
-                            and t['symbol'].endswith("USDT:USDT")
-                            and "UP" not in t['symbol'] and "DOWN" not in t['symbol']]
+        ranked = []
+        for s in universe:
+            vol = (tickers.get(s) or {}).get("quoteVolume") or 0
+            if vol > CONFIG.MIN_QUOTE_VOLUME_USD:
+                 ranked.append((s, vol))
+
+        ranked.sort(key=lambda x: x[1], reverse=True)
         
-        liquid_tickers.sort(key=lambda x: x['quoteVolume'], reverse=True)
-        top_n_symbols = {t['symbol'] for t in liquid_tickers[:CONFIG.SCAN_TOP_N_SYMBOLS]}
-        top_n_symbols.add("BTC/USDT:USDT")
-        liquid = list(top_n_symbols)
-        
+        # <<< ИЗМЕНЕНО: Исправляем потерю сортировки, сохраняя порядок
+        liquid = [s for s, _ in ranked[:CONFIG.SCAN_TOP_N_SYMBOLS]]
+        if "BTC/USDT:USDT" not in liquid:
+            liquid.insert(0, "BTC/USDT:USDT")
+
         offset = bt.get("scan_offset", 0)
         liquid_rotated = liquid[offset:] + liquid[:offset]
         if len(liquid) > 0:
             bt["scan_offset"] = (offset + CONFIG.CHUNK_SIZE) % len(liquid)
         
-        log.info(f"Wick-Scan: получено {len(tickers)} пар; отобрано топ-{len(liquid)}. Начинаем с офсета {offset}")
+        log.info(f"Wick-Scan: найдено {len(universe)} своп-пар; отобрано топ-{len(liquid)} по объему. Начинаем с офсета {offset}")
 
     except Exception as e:
-        log.warning(f"ticker fetch failed: {e}")
+        log.warning(f"Ticker processing failed: {e}", exc_info=True)
         return
 
     try:
@@ -200,15 +207,19 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     
     async def fetch_1m_data(symbol):
         async with sem:
+            if symbol not in exchange.markets:
+                return symbol, None
             try:
                 return symbol, await asyncio.wait_for(
-                    exchange.fetch_ohlcv(symbol, '1m', limit=CONFIG.VOL_WINDOW + CONFIG.ATR_PERIOD + 1),
+                    exchange.fetch_ohlcv(symbol, '1m', limit=CONFIG.VOL_WINDOW + CONFIG.ATR_PERIOD + 2), # +2 для запаса
                     timeout=CONFIG.FETCH_TIMEOUT
                 )
             except Exception: return symbol, None
             
     async def fetch_5m_data(symbol):
         async with sem:
+            if symbol not in exchange.markets:
+                return symbol, None
             try:
                 return symbol, await asyncio.wait_for(
                     exchange.fetch_ohlcv(symbol, '5m', limit=50 + 6),
@@ -218,13 +229,11 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
     scan_started = time.time()
     
-    # Периодическая очистка старых записей из кулдауна
     if int(time.time()) % 60 < 5: 
         current_ts_for_cleanup = time.time()
         bt["symbol_cooldown"] = {s: until for s, until in bt.get("symbol_cooldown", {}).items() if until > current_ts_for_cleanup}
 
     for i in range(0, len(liquid_rotated), CONFIG.CHUNK_SIZE):
-        # <<< ИЗМЕНЕНО: Обновляем таймстемп для каждого чанка
         now_ts = time.time()
         if now_ts - scan_started > CONFIG.TIME_BUDGET_SEC:
             log.warning("Scan aborted – time budget exceeded")
@@ -235,14 +244,18 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         ohlcv_1m_data = await asyncio.gather(*[fetch_1m_data(s) for s in chunk])
         gate_passed_symbols = []
         for symbol, ohlcv in ohlcv_1m_data:
-            if not ohlcv or len(ohlcv) < 2: continue
+            # <<< ИЗМЕНЕНО: Ранний отсев по длине истории
+            need_len = max(CONFIG.VOL_WINDOW, CONFIG.ATR_PERIOD) + 1
+            if not ohlcv or len(ohlcv) < need_len: 
+                continue
             
             if bt.get("symbol_cooldown", {}).get(symbol, 0) > now_ts:
                 continue
 
             df_1m = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
             
-            if df_1m.iloc[-1]['ts'] < (now_ts - tf_seconds('1m') * 1.5) * 1000:
+            # <<< ИЗМЕНЕНО: Более "чуткая" проверка на свежесть бара
+            if df_1m.iloc[-1]['ts'] < (now_ts - tf_seconds('1m') * 1.1) * 1000:
                 continue
 
             if df_1m.iloc[-1]['close'] < CONFIG.MIN_PRICE: continue
@@ -322,7 +335,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                     
                     task = asyncio.create_task(_open_trade(cand, exchange, app))
                     
-                    # <<< ИЗМЕНЕНО: Исправляем замыкание, чтобы в лог попадал правильный символ
                     sym = cand.get('symbol')
                     def _log_open_err(t: asyncio.Task, sym=sym):
                         ex = t.exception()
@@ -358,7 +370,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         log.info(f"Scan finished: opened {opened_this_scan} trade(s). Final thr: {bt['score_threshold']:.2f}")
 
 
-# ---------------------------------------------------------------------------
+# ... (Функции _open_trade и _monitor_trades остаются без изменений, они уже в идеальном состоянии) ...
 async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
     symbol, side, score = candidate['symbol'], candidate['side'], candidate['score']
@@ -413,7 +425,6 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
 
     await trade_executor.log_open_trade(trade)
 
-# ---------------------------------------------------------------------------
 async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
     act = bt.get("active_trades", [])
@@ -449,7 +460,6 @@ async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
 
     for tr, reason, exit_p in close_list:
         tp_pct = abs(tr['TP_Price'] / tr['Entry_Price'] - 1) * 100
-        # <<< ИЗМЕНЕНО: Считаем фактический SL% для точности
         sl_pct_actual = abs(tr['SL_Price'] / tr['Entry_Price'] - 1) * 100
         pnl_pct = tp_pct if reason == "TAKE_PROFIT" else -sl_pct_actual
 
