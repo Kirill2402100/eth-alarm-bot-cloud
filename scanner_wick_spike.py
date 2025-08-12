@@ -106,7 +106,6 @@ async def scanner_main_loop(app: Application, broadcast):
     app.bot_data.setdefault("scan_offset", 0)
     app.bot_data.setdefault('last_thr_bump_at', 0)
     app.bot_data.setdefault('last_heartbeat_log', 0)
-    # <<< ИЗМЕНЕНО: Инициализация счётчика отказов по "касанию"
     app.bot_data.setdefault('stat_no_touch', 0)
     app.bot_data['broadcast_func'] = broadcast
     if 'score_threshold' not in app.bot_data:
@@ -167,6 +166,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         
     opened_this_scan = 0
     total_passed_gate = 0
+    all_scores = []
 
     def p90(xs):
         return "-" if not xs else round(np.percentile(xs, 90), 2)
@@ -260,7 +260,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         
         gate_passed_symbols = []
         for symbol, ohlcv in ohlcv_1m_data:
-            need_len = max(CONFIG.VOL_WINDOW, CONFIG.ATR_PERIOD) + 2 # +2 для iloc[-2]
+            need_len = max(CONFIG.VOL_WINDOW, CONFIG.ATR_PERIOD) + 2
             if not ohlcv or len(ohlcv) < need_len: 
                 tot_chunk["no_ohlcv"] += 1; continue
             
@@ -271,7 +271,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             
             now_ms = time.time() * 1000
             use_last = df_1m.iloc[-1]
-            if now_ms - use_last['ts'] < tf_seconds('1m') * 1000 * 0.95: # Ждём почти полного закрытия
+            if now_ms - use_last['ts'] < tf_seconds('1m') * 1000 * 0.95:
                 if len(df_1m) < 2: continue
                 use_last = df_1m.iloc[-2]
             
@@ -282,7 +282,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 tot_chunk["min_price"] += 1; continue
             
             df_slice = df_1m[df_1m['ts'] <= bar_ts]
-            if len(df_slice) < need_len -1:
+            if len(df_slice) < need_len - 1:
                 tot_chunk["nan_ind"] += 1; continue
 
             last_atr = ta.atr(df_slice['high'], df_slice['low'], df_slice['close'], length=CONFIG.ATR_PERIOD).iloc[-1]
@@ -323,7 +323,9 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             passes = int(pass_wick) + int(pass_atr) + int(pass_vol)
             if passes >= 2:
                 tot_chunk["gate_all_pass"] += 1
-                gate_passed_symbols.append({'symbol': symbol, 'df_1m': df_1m, 'bar_ts': bar_ts, 'gate_features': {'wick_ratio': wick_ratio, 'spike_atr_mult': spike_atr_mult, 'vol_z': vol_z, 'atr': last_atr}})
+                gate_passed_symbols.append({'symbol': symbol, 'df_1m': df_1m, 'bar_ts': bar_ts, 
+                                            'gate_features': {'wick_ratio': wick_ratio, 'spike_atr_mult': spike_atr_mult, 
+                                                              'vol_z': vol_z, 'atr': last_atr, 'passes': passes}})
             else:
                 if not pass_wick: near["wick"].append(round(wick_ratio, 2))
                 if not pass_atr:  near["atr"].append(round(spike_atr_mult, 2))
@@ -374,6 +376,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
                 gate_features = item['gate_features']
                 wick_ratio, spike_atr_mult, vol_z, last_atr = gate_features['wick_ratio'], gate_features['spike_atr_mult'], gate_features['vol_z'], gate_features['atr']
+                passes = gate_features.get('passes', 0)
 
                 last = df_slice.iloc[-1]
                 c = last['close']
@@ -393,7 +396,17 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 if side == "LONG" and btc_ret_5m < -0.005: btc_context_bonus = -0.15
                 elif side == "SHORT" and btc_ret_5m > 0.005: btc_context_bonus = -0.15
                 
-                score = (0.35*min(max(wick_ratio-1.5,0),2.5) + 0.25*min(max(spike_atr_mult-1.8,0),2.0) + 0.20*min(max(vol_z-2.0,0),3.0) + 0.15*min(dist_from_mean,3.0) - 0.15*min(abs(htf_m5_slope),2.0) + 0.10*btc_context_bonus - htf_penalty)
+                score = (
+                    0.35 * min(max(wick_ratio - 1.5, 0), 2.5)
+                  + 0.30 * min(max(spike_atr_mult - 1.5, 0), 2.5)
+                  + 0.20 * min(max(vol_z - 1.2, 0), 3.0)
+                  + 0.15 * min(dist_from_mean, 3.0)
+                  - 0.15 * min(abs(htf_m5_slope), 2.0)
+                  + 0.10 * btc_context_bonus
+                  - htf_penalty
+                  + 0.10 * max(passes - 2, 0)
+                )
+                
                 top_scores.append((symbol, round(score,2)))
                 
                 score_threshold = bt.get('score_threshold', CONFIG.SCORE_BASE)
@@ -440,8 +453,10 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 log.exception(f"Score calculation for {item.get('symbol')} failed")
         
         if top_scores:
-            top_scores.sort(key=lambda x: x[1], reverse=True)
-            log.debug(f"Top scores sample: {top_scores[:5]}")
+            all_scores.extend(s for _, s in top_scores)
+            best_score_chunk = max(s for _, s in top_scores)
+            ge_thr_chunk = sum(1 for _, s in top_scores if s >= bt.get('score_threshold', CONFIG.SCORE_BASE))
+            log.info(f"ScoreDiag ch={i//CONFIG.CHUNK_SIZE+1}: best={best_score_chunk:.2f}, >=thr={ge_thr_chunk}/{len(top_scores)} (thr={bt.get('score_threshold', CONFIG.SCORE_BASE):.2f})")
         
         await asyncio.sleep(0)
     
@@ -451,12 +466,19 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     log.info(
         "GateDiag scan: "
         f"processed={processed_symbols_count}, no_ohlcv={tot_scan['no_ohlcv']}, cooldown={tot_scan['cooldown']}, "
-        f"stale={tot_scan['stale']}, min_price={tot_scan['min_price']}, nan={tot_scan['nan_ind']}, micro={tot_scan['micro_body']}, "
+        f"min_price={tot_scan['min_price']}, nan={tot_scan['nan_ind']}, micro={tot_scan['micro_body']}, "
         f"combos(WA/WV/AV)={tot_scan['pass_WA']}/{tot_scan['pass_WV']}/{tot_scan['pass_AV']}, "
-        f"passed_total(2of3)={total_passed_gate} == sum_chunks={tot_scan['gate_all_pass']}, opened={opened_this_scan}, "
+        f"passed_total(2of3)={total_passed_gate}, opened={opened_this_scan}, "
         f"no_touch_rejects={bt.get('stat_no_touch',0)}"
     )
-    bt['stat_no_touch'] = 0 # Сбрасываем счётчик
+    if all_scores:
+        best_overall = max(all_scores)
+        p90_score = np.percentile(all_scores, 90)
+        cnt_ge_thr = sum(1 for s in all_scores if s >= bt.get('score_threshold', CONFIG.SCORE_BASE))
+        log.info(f"ScoreDiag scan: best={best_overall:.2f}, p90={p90_score:.2f} "
+                 f">=thr={cnt_ge_thr}/{len(all_scores)} (thr={bt.get('score_threshold', CONFIG.SCORE_BASE):.2f})")
+
+    bt['stat_no_touch'] = 0
     
     if opened_this_scan == 0:
         bt['score_threshold'] = max(CONFIG.SCORE_MIN, bt.get('score_threshold', CONFIG.SCORE_BASE) - CONFIG.SCORE_ADAPT_STEP)
@@ -498,10 +520,8 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
         upper_tail = h - max(o, c)
         entry_price = h - entry_tail_fraction * max(upper_tail, 0)
 
-    # <<< ИЗМЕНЕНО: Квантуем цену ДО проверки и расчётов
     entry_price_q = float(exchange.price_to_precision(symbol, entry_price))
 
-    # <<< ИЗМЕНЕНО: Направленная и адаптированная к тику проверка "касания"
     try:
         tk = await exchange.fetch_ticker(symbol)
         last_px = tk.get('last') or tk.get('close') or ((tk.get('bid', 0) + tk.get('ask', 0)) / 2)
@@ -511,17 +531,14 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
         min_tick = (((m.get('limits') or {}).get('price') or {}).get('min')) or 0.0
         tick_tol_pct = (min_tick / entry_price_q * 100) if (min_tick and entry_price_q > 0) else 0.0
         touch_tol_pct = max(base_tol_pct, tick_tol_pct * 1.1)
-
-        if side == "LONG":
-            if last_px is None or last_px > entry_price_q * (1 + touch_tol_pct / 100):
-                log.info(f"Skip {symbol}: no touch LONG (live={last_px} > entry={entry_price_q} tol={touch_tol_pct:.3f}%)")
-                bt['stat_no_touch'] = bt.get('stat_no_touch', 0) + 1
-                return
-        else:  # SHORT
-            if last_px is None or last_px < entry_price_q * (1 - touch_tol_pct / 100):
-                log.info(f"Skip {symbol}: no touch SHORT (live={last_px} < entry={entry_price_q} tol={touch_tol_pct:.3f}%)")
-                bt['stat_no_touch'] = bt.get('stat_no_touch', 0) + 1
-                return
+        
+        # <<< ИЗМЕНЕНО: Симметричная проверка "касания"
+        lo = entry_price_q * (1 - touch_tol_pct/100)
+        hi = entry_price_q * (1 + touch_tol_pct/100)
+        if (last_px is None) or not (lo <= last_px <= hi):
+            log.info(f"Skip {symbol}: no touch (live={last_px}, entry={entry_price_q}, tol=±{touch_tol_pct:.3f}%)")
+            bt['stat_no_touch'] = bt.get('stat_no_touch', 0) + 1
+            return
     except Exception as e:
         log.warning(f"Could not fetch ticker for touch check on {symbol}: {e}")
         return
@@ -537,6 +554,17 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
     sl = (entry_price_q - sl_dist_price) if side == "LONG" else (entry_price_q + sl_dist_price)
     tp = (entry_price_q + tp_dist_price) if side == "LONG" else (entry_price_q - tp_dist_price)
     sl, tp = float(exchange.price_to_precision(symbol, sl)), float(exchange.price_to_precision(symbol, tp))
+    
+    # <<< ИЗМЕНЕНО: Гарантируем, что SL/TP не "прилипли" к входу после округления
+    m = exchange.market(symbol)
+    tick = (((m.get('limits') or {}).get('price') or {}).get('min')) or 0.0
+    if tick:
+        if abs(sl - entry_price_q) < tick:
+            sl = entry_price_q - tick if side=="LONG" else entry_price_q + tick
+            sl = float(exchange.price_to_precision(symbol, sl))
+        if abs(tp - entry_price_q) < tick:
+            tp = entry_price_q + tick if side=="LONG" else entry_price_q - tick
+            tp = float(exchange.price_to_precision(symbol, tp))
 
     trade = {
         "Signal_ID": f"{symbol}_{int(time.time())}", "Pair": symbol, "Side": side,
