@@ -53,7 +53,7 @@ class CONFIG:
     MAX_TRADES_PER_SCAN = 2
     SYMBOL_COOLDOWN_SEC = 120
 
-    ATR_SL_MULT = 0
+    ATR_SL_MULT = 0.6
     RISK_REWARD = TP_PCT / SL_PCT if SL_PCT > 0 else 0
 
 
@@ -66,7 +66,7 @@ async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
         "Entry_Price", "Exit_Price", "Exit_Time_UTC",
         "Exit_Reason", "PNL_USD", "PNL_Percent",
         "Score", "Score_Threshold", "Wick_Ratio", "Spike_ATR", "Vol_Z",
-        "Dist_Mean", "HTF_Slope", "BTC_5m",
+        "Dist_Mean", "HTF_Slope", "BTC_5m", "ATR_last", "Entry_Bar_TS",
         "MFE_Price", "MAE_Price", "MFE_pct", "MAE_pct", "Time_to_TP_SL"
     ]
     ws = None
@@ -180,7 +180,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
         ranked.sort(key=lambda x: x[1], reverse=True)
         
-        # <<< ИЗМЕНЕНО: Исправляем потерю сортировки, сохраняя порядок
         liquid = [s for s, _ in ranked[:CONFIG.SCAN_TOP_N_SYMBOLS]]
         if "BTC/USDT:USDT" not in liquid:
             liquid.insert(0, "BTC/USDT:USDT")
@@ -207,24 +206,19 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     
     async def fetch_1m_data(symbol):
         async with sem:
-            if symbol not in exchange.markets:
-                return symbol, None
+            if symbol not in exchange.markets: return symbol, None
             try:
                 return symbol, await asyncio.wait_for(
-                    exchange.fetch_ohlcv(symbol, '1m', limit=CONFIG.VOL_WINDOW + CONFIG.ATR_PERIOD + 2), # +2 для запаса
-                    timeout=CONFIG.FETCH_TIMEOUT
-                )
+                    exchange.fetch_ohlcv(symbol, '1m', limit=CONFIG.VOL_WINDOW + CONFIG.ATR_PERIOD + 2),
+                    timeout=CONFIG.FETCH_TIMEOUT)
             except Exception: return symbol, None
             
     async def fetch_5m_data(symbol):
         async with sem:
-            if symbol not in exchange.markets:
-                return symbol, None
+            if symbol not in exchange.markets: return symbol, None
             try:
                 return symbol, await asyncio.wait_for(
-                    exchange.fetch_ohlcv(symbol, '5m', limit=50 + 6),
-                    timeout=CONFIG.FETCH_TIMEOUT
-                )
+                    exchange.fetch_ohlcv(symbol, '5m', limit=50 + 6), timeout=CONFIG.FETCH_TIMEOUT)
             except Exception: return symbol, None
 
     scan_started = time.time()
@@ -244,7 +238,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         ohlcv_1m_data = await asyncio.gather(*[fetch_1m_data(s) for s in chunk])
         gate_passed_symbols = []
         for symbol, ohlcv in ohlcv_1m_data:
-            # <<< ИЗМЕНЕНО: Ранний отсев по длине истории
             need_len = max(CONFIG.VOL_WINDOW, CONFIG.ATR_PERIOD) + 1
             if not ohlcv or len(ohlcv) < need_len: 
                 continue
@@ -254,11 +247,11 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
             df_1m = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
             
-            # <<< ИЗМЕНЕНО: Более "чуткая" проверка на свежесть бара
             if df_1m.iloc[-1]['ts'] < (now_ts - tf_seconds('1m') * 1.1) * 1000:
                 continue
 
-            if df_1m.iloc[-1]['close'] < CONFIG.MIN_PRICE: continue
+            last = df_1m.iloc[-1]
+            if last['close'] < CONFIG.MIN_PRICE: continue
             
             df_1m['atr'] = ta.atr(df_1m['high'], df_1m['low'], df_1m['close'], length=CONFIG.ATR_PERIOD)
             vol_mu = df_1m['volume'].rolling(CONFIG.VOL_WINDOW).mean()
@@ -269,9 +262,15 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             if pd.isna(last["vol_z"]) or pd.isna(last["atr"]): continue
             
             h, l, o, c = last['high'], last['low'], last['open'], last['close']
-            body = max(abs(c-o), 1e-9)
+            body = abs(c - o)
+            if body / c < 0.0005: 
+                continue
+            
+            # <<< ИЗМЕНЕНО: Защита от деления на ноль при слабом ATR
+            safe_atr = max(float(last['atr']), 1e-9)
+            
             wick_ratio = max(h - max(o, c), min(o, c) - l) / body
-            spike_atr_mult = (h - l) / max(last['atr'], 1e-9)
+            spike_atr_mult = (h - l) / safe_atr
             vol_z = last['vol_z']
 
             if (wick_ratio >= CONFIG.GATE_WICK_RATIO and 
@@ -308,10 +307,13 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 c = last['close']
                 df_1m['ema20'] = ta.ema(df_1m['close'], length=20)
                 
-                ema20_last = df_1m['ema20'].iloc[-1]
+                ema20_last = df_1m['iloc'][-1]
                 if pd.isna(ema20_last): 
                     continue
-                dist_from_mean = abs(c - ema20_last) / max(last['atr'], 1e-9)
+                
+                # <<< ИЗМЕНЕНО: Защита от деления на ноль при слабом ATR
+                safe_atr = max(float(last['atr']), 1e-9)
+                dist_from_mean = abs(c - ema20_last) / safe_atr
                 
                 btc_ret_5m = 0 if (btc_df is None or len(btc_df) <= 6) else (btc_df['close'].iloc[-1] / btc_df['close'].iloc[-6] - 1)
                 upper_wick = last['high'] - max(last['open'], c)
@@ -331,7 +333,12 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                         continue
 
                     opened_syms_in_chunk.add(symbol)
-                    cand = {'symbol': symbol, 'side': side, 'score': score, 'last_ohlc': {'o': last['open'], 'h': last['high'], 'l': last['low'], 'c': c}, 'features': {'Score': round(score, 2), 'Wick_Ratio': round(wick_ratio, 2), 'Spike_ATR': round(spike_atr_mult, 2), 'Vol_Z': round(vol_z, 2), 'Dist_Mean': round(dist_from_mean, 2), 'HTF_Slope': round(htf_m5_slope, 2), 'BTC_5m': round(btc_ret_5m * 100, 3)}}
+                    cand = {'symbol': symbol, 'side': side, 'score': score, 
+                            'last_ohlc': {'o': last['open'], 'h': last['high'], 'l': last['low'], 'c': c},
+                            'bar_ts': int(last['ts']), 
+                            'features': {'Score': round(score, 2), 'Wick_Ratio': round(wick_ratio, 2), 'Spike_ATR': round(spike_atr_mult, 2), 
+                                         'Vol_Z': round(vol_z, 2), 'Dist_Mean': round(dist_from_mean, 2), 'HTF_Slope': round(htf_m5_slope, 2), 
+                                         'BTC_5m': round(btc_ret_5m * 100, 3), 'ATR_last': last['atr']}}
                     
                     task = asyncio.create_task(_open_trade(cand, exchange, app))
                     
@@ -370,7 +377,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         log.info(f"Scan finished: opened {opened_this_scan} trade(s). Final thr: {bt['score_threshold']:.2f}")
 
 
-# ... (Функции _open_trade и _monitor_trades остаются без изменений, они уже в идеальном состоянии) ...
+# ... (Функции _open_trade и _monitor_trades остаются в идеальном состоянии) ...
 async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
     symbol, side, score = candidate['symbol'], candidate['side'], candidate['score']
@@ -401,8 +408,15 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
         log.warning(f"Skipping {symbol} {side} due to zero-size tail entry calculation.")
         return
 
-    sl_off, tp_off = CONFIG.SL_PCT / 100 * entry_price, take_profit_pct / 100 * entry_price
-    sl, tp = (entry_price - sl_off, entry_price + tp_off) if side == "LONG" else (entry_price + sl_off, entry_price - tp_off)
+    sl_dist_pct = entry_price * CONFIG.SL_PCT / 100
+    sl_dist_atr = candidate['features'].get('ATR_last', 0) * CONFIG.ATR_SL_MULT
+    sl_dist_price = max(sl_dist_pct, sl_dist_atr)
+
+    tp_dist_price = entry_price * take_profit_pct / 100
+
+    sl = (entry_price - sl_dist_price) if side == "LONG" else (entry_price + sl_dist_price)
+    tp = (entry_price + tp_dist_price) if side == "LONG" else (entry_price - tp_dist_price)
+
     sl, tp, entry_price = float(exchange.price_to_precision(symbol, sl)), float(exchange.price_to_precision(symbol, tp)), float(exchange.price_to_precision(symbol, entry_price))
 
     trade = {
@@ -410,6 +424,7 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
         "Entry_Price": entry_price, "SL_Price": sl, "TP_Price": tp, "Status": "ACTIVE", 
         "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         **candidate['features'], "Score_Threshold": round(score_threshold, 2),
+        "Entry_Bar_TS": candidate.get("bar_ts"),
         "MFE_Price": entry_price, "MAE_Price": entry_price
     }
     bt.setdefault("active_trades", []).append(trade)
@@ -417,10 +432,12 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
     log.info(f"Opened {side} {symbol} @ {entry_price} with score {trade['Score']:.2f}. Cooldown until {datetime.fromtimestamp(bt['symbol_cooldown'][symbol]).strftime('%H:%M:%S')}")
 
     if bc := bt.get('broadcast_func'):
+        sl_actual_pct = abs(sl / entry_price - 1) * 100
+        tp_actual_pct = abs(tp / entry_price - 1) * 100
         msg = (f"⚡ <b>Wick-Spike {side} (Score: {trade['Score']:.2f})</b>\n\n"
                f"<b>Пара:</b> {symbol}\n<b>Вход:</b> <code>{format_price(entry_price)}</code>\n"
-               f"<b>SL:</b> <code>{format_price(sl)}</code> (-{abs(sl/entry_price-1)*100:.2f}%)\n"
-               f"<b>TP:</b> <code>{format_price(tp)}</code> (+{abs(tp/entry_price-1)*100:.2f}%)")
+               f"<b>SL:</b> <code>{format_price(sl)}</code> (-{sl_actual_pct:.2f}%)\n"
+               f"<b>TP:</b> <code>{format_price(tp)}</code> (+{tp_actual_pct:.2f}%)")
         await bc(app, msg)
 
     await trade_executor.log_open_trade(trade)
@@ -441,20 +458,52 @@ async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
     latest_bars = dict(await asyncio.gather(*[fetch(t['Pair']) for t in act]))
     close_list: List[Tuple[dict,str,float]] = []
 
+    bar_ts_map = {s: b[0] for s, b in latest_bars.items() if b}
+    need_live_price = [t for t in act if bar_ts_map.get(t['Pair']) == t.get('Entry_Bar_TS')]
+
+    async def fetch_last(symbol):
+        async with sem:
+            try:
+                tk = await asyncio.wait_for(exchange.fetch_ticker(symbol), timeout=6)
+                return symbol, tk.get('last')
+            except Exception:
+                return symbol, None
+
+    last_prices = dict(await asyncio.gather(*[fetch_last(t['Pair']) for t in need_live_price]))
+    
     for tr in act:
         bar = latest_bars.get(tr['Pair'])
         if bar is None: continue
-        last_high, last_low = bar[2], bar[3]
         
-        entry, mfe_price, mae_price = tr['Entry_Price'], tr.get('MFE_Price', tr['Entry_Price']), tr.get('MAE_Price', tr['Entry_Price'])
-        if tr['Side'] == "LONG":
-            tr['MFE_Price'], tr['MAE_Price'] = max(mfe_price, last_high), min(mae_price, last_low)
-            if last_low <= tr['SL_Price']: close_list.append((tr, "STOP_LOSS", tr['SL_Price']))
-            elif last_high >= tr['TP_Price']: close_list.append((tr, "TAKE_PROFIT", tr['TP_Price']))
-        else: # SHORT
-            tr['MFE_Price'], tr['MAE_Price'] = min(mfe_price, last_low), max(mae_price, last_high)
-            if last_high >= tr['SL_Price']: close_list.append((tr, "STOP_LOSS", tr['SL_Price']))
-            elif last_low <= tr['TP_Price']: close_list.append((tr, "TAKE_PROFIT", tr['TP_Price']))
+        bar_ts, last_high, last_low = bar[0], bar[2], bar[3]
+
+        if bar_ts == tr.get('Entry_Bar_TS'):
+            px = last_prices.get(tr['Pair'])
+            if px is None: continue
+            
+            if tr['Side'] == "LONG":
+                tr['MFE_Price'] = max(tr.get('MFE_Price', tr['Entry_Price']), px)
+                tr['MAE_Price'] = min(tr.get('MAE_Price', tr['Entry_Price']), px)
+                if px <= tr['SL_Price']: close_list.append((tr, "STOP_LOSS", px))
+                elif px >= tr['TP_Price']: close_list.append((tr, "TAKE_PROFIT", px))
+            else: # SHORT
+                tr['MFE_Price'] = min(tr.get('MFE_Price', tr['Entry_Price']), px)
+                tr['MAE_Price'] = max(tr.get('MAE_Price', tr['Entry_Price']), px)
+                if px >= tr['SL_Price']: close_list.append((tr, "STOP_LOSS", px))
+                elif px <= tr['TP_Price']: close_list.append((tr, "TAKE_PROFIT", px))
+        
+        else:
+            if tr['Side'] == "LONG":
+                tr['MFE_Price'] = max(tr.get('MFE_Price', tr['Entry_Price']), last_high)
+                tr['MAE_Price'] = min(tr.get('MAE_Price', tr['Entry_Price']), last_low)
+                if last_low <= tr['SL_Price']: close_list.append((tr, "STOP_LOSS", tr['SL_Price']))
+                elif last_high >= tr['TP_Price']: close_list.append((tr, "TAKE_PROFIT", tr['TP_Price']))
+            else: # SHORT
+                tr['MFE_Price'] = min(tr.get('MFE_Price', tr['Entry_Price']), last_low)
+                tr['MAE_Price'] = max(tr.get('MAE_Price', tr['Entry_Price']), last_high)
+                if last_high >= tr['SL_Price']: close_list.append((tr, "STOP_LOSS", tr['SL_Price']))
+                elif last_low <= tr['TP_Price']: close_list.append((tr, "TAKE_PROFIT", tr['TP_Price']))
+
 
     if not close_list: return
 
