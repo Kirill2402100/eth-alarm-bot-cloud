@@ -41,7 +41,6 @@ class CONFIG:
     GATE_WICK_RATIO = 1.5
     GATE_ATR_SPIKE_MULT = 1.5
     GATE_VOL_Z = 1.2
-    # <<< ИЗМЕНЕНО: Фильтр микротела вынесен в конфиг и временно ослаблен
     GATE_BODY_ATR_MIN = 0.03
 
     ENTRY_TAIL_FRACTION = 0.3
@@ -107,6 +106,8 @@ async def scanner_main_loop(app: Application, broadcast):
     app.bot_data.setdefault("scan_offset", 0)
     app.bot_data.setdefault('last_thr_bump_at', 0)
     app.bot_data.setdefault('last_heartbeat_log', 0)
+    # <<< ИЗМЕНЕНО: Инициализация счётчика отказов по "касанию"
+    app.bot_data.setdefault('stat_no_touch', 0)
     app.bot_data['broadcast_func'] = broadcast
     if 'score_threshold' not in app.bot_data:
         app.bot_data['score_threshold'] = CONFIG.SCORE_BASE
@@ -167,7 +168,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     opened_this_scan = 0
     total_passed_gate = 0
 
-    # <<< ИЗМЕНЕНО: Вспомогательная функция для перцентиля
     def p90(xs):
         return "-" if not xs else round(np.percentile(xs, 90), 2)
 
@@ -246,7 +246,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             log.warning("Scan aborted – time budget exceeded")
             break
         
-        # <<< ИЗМЕНЕНО: Расширенная телеметрия для чанка
         tot_chunk = Counter()
         near = {"wick": [], "atr": [], "vol": []}
         tot_chunk.update({"pass_WA":0, "pass_WV":0, "pass_AV":0})
@@ -261,7 +260,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         
         gate_passed_symbols = []
         for symbol, ohlcv in ohlcv_1m_data:
-            need_len = max(CONFIG.VOL_WINDOW, CONFIG.ATR_PERIOD) + 1
+            need_len = max(CONFIG.VOL_WINDOW, CONFIG.ATR_PERIOD) + 2 # +2 для iloc[-2]
             if not ohlcv or len(ohlcv) < need_len: 
                 tot_chunk["no_ohlcv"] += 1; continue
             
@@ -270,25 +269,35 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
             df_1m = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
             
-            if df_1m.iloc[-1]['ts'] < (now_ts - tf_seconds('1m') * 1.1) * 1000:
-                tot_chunk["stale"] += 1; continue
+            now_ms = time.time() * 1000
+            use_last = df_1m.iloc[-1]
+            if now_ms - use_last['ts'] < tf_seconds('1m') * 1000 * 0.95: # Ждём почти полного закрытия
+                if len(df_1m) < 2: continue
+                use_last = df_1m.iloc[-2]
+            
+            last = use_last
+            bar_ts = int(last['ts'])
 
-            last = df_1m.iloc[-1]
             if last['close'] < CONFIG.MIN_PRICE:
                 tot_chunk["min_price"] += 1; continue
             
-            df_1m['atr'] = ta.atr(df_1m['high'], df_1m['low'], df_1m['close'], length=CONFIG.ATR_PERIOD)
-            vol_mu = df_1m['volume'].rolling(CONFIG.VOL_WINDOW).mean()
-            vol_sigma = df_1m['volume'].rolling(CONFIG.VOL_WINDOW).std().replace(0, 1e-9)
-            df_1m['vol_z'] = (df_1m['volume'] - vol_mu) / vol_sigma
-            last = df_1m.iloc[-1]
+            df_slice = df_1m[df_1m['ts'] <= bar_ts]
+            if len(df_slice) < need_len -1:
+                tot_chunk["nan_ind"] += 1; continue
 
-            if pd.isna(last["vol_z"]) or pd.isna(last["atr"]):
+            last_atr = ta.atr(df_slice['high'], df_slice['low'], df_slice['close'], length=CONFIG.ATR_PERIOD).iloc[-1]
+            vol_series = df_slice['volume'].rolling(CONFIG.VOL_WINDOW)
+            vol_mu = vol_series.mean().iloc[-1]
+            vol_sigma = vol_series.std().iloc[-1]
+            last_vol = df_slice['volume'].iloc[-1]
+            last_vol_z = (last_vol - vol_mu) / max(vol_sigma, 1e-9)
+
+            if pd.isna(last_vol_z) or pd.isna(last_atr):
                 tot_chunk["nan_ind"] += 1; continue
             
             h, l, o, c = last['high'], last['low'], last['open'], last['close']
             body = abs(c - o)
-            safe_atr = max(float(last['atr']), 1e-9)
+            safe_atr = max(float(last_atr), 1e-9)
 
             if (body / safe_atr) < CONFIG.GATE_BODY_ATR_MIN:
                 tot_chunk["micro_body"] += 1; continue
@@ -297,7 +306,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             
             wick_ratio = max(h - max(o, c), min(o, c) - l) / body_safe
             spike_atr_mult = (h - l) / safe_atr
-            vol_z = last['vol_z']
+            vol_z = last_vol_z
 
             pass_wick = (wick_ratio >= CONFIG.GATE_WICK_RATIO)
             pass_atr  = (spike_atr_mult >= CONFIG.GATE_ATR_SPIKE_MULT)
@@ -307,7 +316,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             tot_chunk["gate_atr_pass"]  += int(pass_atr)
             tot_chunk["gate_vol_pass"]  += int(pass_vol)
             
-            # <<< ИЗМЕНЕНО: Считаем комбинации
             if pass_wick and pass_atr: tot_chunk["pass_WA"] += 1
             if pass_wick and pass_vol: tot_chunk["pass_WV"] += 1
             if pass_atr and pass_vol:  tot_chunk["pass_AV"] += 1
@@ -315,7 +323,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             passes = int(pass_wick) + int(pass_atr) + int(pass_vol)
             if passes >= 2:
                 tot_chunk["gate_all_pass"] += 1
-                gate_passed_symbols.append({'symbol': symbol, 'df_1m': df_1m, 'gate_features': {'wick_ratio': wick_ratio, 'spike_atr_mult': spike_atr_mult, 'vol_z': vol_z}})
+                gate_passed_symbols.append({'symbol': symbol, 'df_1m': df_1m, 'bar_ts': bar_ts, 'gate_features': {'wick_ratio': wick_ratio, 'spike_atr_mult': spike_atr_mult, 'vol_z': vol_z, 'atr': last_atr}})
             else:
                 if not pass_wick: near["wick"].append(round(wick_ratio, 2))
                 if not pass_atr:  near["atr"].append(round(spike_atr_mult, 2))
@@ -328,7 +336,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         for k, v in tot_chunk.items():
             tot_scan[k] += v
 
-        # <<< ИЗМЕНЕНО: Расширенный лог чанка с перцентилями и комбинациями
         log.info(
             f"GateDiag ch={i//CONFIG.CHUNK_SIZE+1}: "
             f"ok_1m={sum(1 for _,o in ohlcv_1m_data if o)}/{len(chunk)} (cd={tot_chunk['cooldown']}), "
@@ -349,7 +356,8 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
         for item in gate_passed_symbols:
             try:
-                symbol, df_1m = item['symbol'], item['df_1m']
+                symbol, df_1m, bar_ts = item['symbol'], item['df_1m'], item['bar_ts']
+                df_slice = df_1m[df_1m['ts'] <= bar_ts]
                 
                 htf_m5_slope, htf_penalty = 0, 0
                 ohlcv_5m = ohlcv_5m_data.get(symbol)
@@ -365,17 +373,16 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 else: htf_penalty = 0.1 
 
                 gate_features = item['gate_features']
-                wick_ratio, spike_atr_mult, vol_z = gate_features['wick_ratio'], gate_features['spike_atr_mult'], gate_features['vol_z']
+                wick_ratio, spike_atr_mult, vol_z, last_atr = gate_features['wick_ratio'], gate_features['spike_atr_mult'], gate_features['vol_z'], gate_features['atr']
 
-                last = df_1m.iloc[-1]
+                last = df_slice.iloc[-1]
                 c = last['close']
-                df_1m['ema20'] = ta.ema(df_1m['close'], length=20)
                 
-                ema20_last = df_1m['ema20'].iloc[-1]
+                ema20_last = ta.ema(df_slice['close'], length=20).iloc[-1]
                 if pd.isna(ema20_last): 
                     continue
                 
-                safe_atr = max(float(last['atr']), 1e-9)
+                safe_atr = max(float(last_atr), 1e-9)
                 dist_from_mean = abs(c - ema20_last) / safe_atr
                 
                 btc_ret_5m = 0 if (btc_df is None or len(btc_df) < 6) else (btc_df['close'].iloc[-1] / btc_df['close'].iloc[-6] - 1)
@@ -387,7 +394,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 elif side == "SHORT" and btc_ret_5m > 0.005: btc_context_bonus = -0.15
                 
                 score = (0.35*min(max(wick_ratio-1.5,0),2.5) + 0.25*min(max(spike_atr_mult-1.8,0),2.0) + 0.20*min(max(vol_z-2.0,0),3.0) + 0.15*min(dist_from_mean,3.0) - 0.15*min(abs(htf_m5_slope),2.0) + 0.10*btc_context_bonus - htf_penalty)
-                top_scores.append((symbol, round(score,2))) # <<< ИЗМЕНЕНО: Собираем скоры
+                top_scores.append((symbol, round(score,2)))
                 
                 score_threshold = bt.get('score_threshold', CONFIG.SCORE_BASE)
                 
@@ -399,10 +406,10 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                     opened_syms_in_chunk.add(symbol)
                     cand = {'symbol': symbol, 'side': side, 'score': score, 
                             'last_ohlc': {'o': last['open'], 'h': last['high'], 'l': last['low'], 'c': c},
-                            'bar_ts': int(last['ts']), 
+                            'bar_ts': bar_ts, 
                             'features': {'Score': round(score, 2), 'Wick_Ratio': round(wick_ratio, 2), 'Spike_ATR': round(spike_atr_mult, 2), 
                                          'Vol_Z': round(vol_z, 2), 'Dist_Mean': round(dist_from_mean, 2), 'HTF_Slope': round(htf_m5_slope, 2), 
-                                         'BTC_5m': round(btc_ret_5m * 100, 3), 'ATR_last': last['atr']}}
+                                         'BTC_5m': round(btc_ret_5m * 100, 3), 'ATR_last': last_atr}}
                     
                     task = asyncio.create_task(_open_trade(cand, exchange, app))
                     
@@ -432,7 +439,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             except Exception:
                 log.exception(f"Score calculation for {item.get('symbol')} failed")
         
-        # <<< ИЗМЕНЕНО: Логируем топ-5 скоров из чанка
         if top_scores:
             top_scores.sort(key=lambda x: x[1], reverse=True)
             log.debug(f"Top scores sample: {top_scores[:5]}")
@@ -447,8 +453,10 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         f"processed={processed_symbols_count}, no_ohlcv={tot_scan['no_ohlcv']}, cooldown={tot_scan['cooldown']}, "
         f"stale={tot_scan['stale']}, min_price={tot_scan['min_price']}, nan={tot_scan['nan_ind']}, micro={tot_scan['micro_body']}, "
         f"combos(WA/WV/AV)={tot_scan['pass_WA']}/{tot_scan['pass_WV']}/{tot_scan['pass_AV']}, "
-        f"passed_total(2of3)={total_passed_gate} == sum_chunks={tot_scan['gate_all_pass']}, opened={opened_this_scan}"
+        f"passed_total(2of3)={total_passed_gate} == sum_chunks={tot_scan['gate_all_pass']}, opened={opened_this_scan}, "
+        f"no_touch_rejects={bt.get('stat_no_touch',0)}"
     )
+    bt['stat_no_touch'] = 0 # Сбрасываем счётчик
     
     if opened_this_scan == 0:
         bt['score_threshold'] = max(CONFIG.SCORE_MIN, bt.get('score_threshold', CONFIG.SCORE_BASE) - CONFIG.SCORE_ADAPT_STEP)
@@ -457,10 +465,16 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         log.info(f"Scan finished: opened {opened_this_scan} trade(s). Final thr: {bt['score_threshold']:.2f}")
 
 
-# ... (Функции _open_trade и _monitor_trades остаются в идеальном состоянии) ...
+# ---------------------------------------------------------------------------
 async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
     symbol, side, score = candidate['symbol'], candidate['side'], candidate['score']
+    
+    delay_ms = 1500
+    wait_sec = max(0, (candidate['bar_ts'] + tf_seconds('1m')*1000 + delay_ms - int(time.time()*1000)) / 1000)
+    if wait_sec > 0:
+        log.debug(f"Wait before entry {symbol}: {wait_sec:.2f}s (bar_ts={candidate['bar_ts']})")
+        await asyncio.sleep(wait_sec)
     
     if len(bt.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
         log.warning(f"Skipping {symbol} open, MAX_CONCURRENT_POSITIONS reached.")
@@ -484,38 +498,63 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
         upper_tail = h - max(o, c)
         entry_price = h - entry_tail_fraction * max(upper_tail, 0)
 
-    if entry_price == l or entry_price == h:
+    # <<< ИЗМЕНЕНО: Квантуем цену ДО проверки и расчётов
+    entry_price_q = float(exchange.price_to_precision(symbol, entry_price))
+
+    # <<< ИЗМЕНЕНО: Направленная и адаптированная к тику проверка "касания"
+    try:
+        tk = await exchange.fetch_ticker(symbol)
+        last_px = tk.get('last') or tk.get('close') or ((tk.get('bid', 0) + tk.get('ask', 0)) / 2)
+
+        base_tol_pct = 0.05
+        m = exchange.market(symbol)
+        min_tick = (((m.get('limits') or {}).get('price') or {}).get('min')) or 0.0
+        tick_tol_pct = (min_tick / entry_price_q * 100) if (min_tick and entry_price_q > 0) else 0.0
+        touch_tol_pct = max(base_tol_pct, tick_tol_pct * 1.1)
+
+        if side == "LONG":
+            if last_px is None or last_px > entry_price_q * (1 + touch_tol_pct / 100):
+                log.info(f"Skip {symbol}: no touch LONG (live={last_px} > entry={entry_price_q} tol={touch_tol_pct:.3f}%)")
+                bt['stat_no_touch'] = bt.get('stat_no_touch', 0) + 1
+                return
+        else:  # SHORT
+            if last_px is None or last_px < entry_price_q * (1 - touch_tol_pct / 100):
+                log.info(f"Skip {symbol}: no touch SHORT (live={last_px} < entry={entry_price_q} tol={touch_tol_pct:.3f}%)")
+                bt['stat_no_touch'] = bt.get('stat_no_touch', 0) + 1
+                return
+    except Exception as e:
+        log.warning(f"Could not fetch ticker for touch check on {symbol}: {e}")
+        return
+
+    if entry_price_q == l or entry_price_q == h:
         log.warning(f"Skipping {symbol} {side} due to zero-size tail entry calculation.")
         return
 
-    sl_dist_pct = entry_price * CONFIG.SL_PCT / 100
+    sl_dist_pct = entry_price_q * CONFIG.SL_PCT / 100
     sl_dist_atr = candidate['features'].get('ATR_last', 0) * CONFIG.ATR_SL_MULT
     sl_dist_price = max(sl_dist_pct, sl_dist_atr)
-
-    tp_dist_price = entry_price * take_profit_pct / 100
-
-    sl = (entry_price - sl_dist_price) if side == "LONG" else (entry_price + sl_dist_price)
-    tp = (entry_price + tp_dist_price) if side == "LONG" else (entry_price - tp_dist_price)
-
-    sl, tp, entry_price = float(exchange.price_to_precision(symbol, sl)), float(exchange.price_to_precision(symbol, tp)), float(exchange.price_to_precision(symbol, entry_price))
+    tp_dist_price = entry_price_q * take_profit_pct / 100
+    sl = (entry_price_q - sl_dist_price) if side == "LONG" else (entry_price_q + sl_dist_price)
+    tp = (entry_price_q + tp_dist_price) if side == "LONG" else (entry_price_q - tp_dist_price)
+    sl, tp = float(exchange.price_to_precision(symbol, sl)), float(exchange.price_to_precision(symbol, tp))
 
     trade = {
         "Signal_ID": f"{symbol}_{int(time.time())}", "Pair": symbol, "Side": side,
-        "Entry_Price": entry_price, "SL_Price": sl, "TP_Price": tp, "Status": "ACTIVE", 
+        "Entry_Price": entry_price_q, "SL_Price": sl, "TP_Price": tp, "Status": "ACTIVE", 
         "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         **candidate['features'], "Score_Threshold": round(score_threshold, 2),
         "Entry_Bar_TS": candidate.get("bar_ts"),
-        "MFE_Price": entry_price, "MAE_Price": entry_price
+        "MFE_Price": entry_price_q, "MAE_Price": entry_price_q
     }
     bt.setdefault("active_trades", []).append(trade)
     bt["symbol_cooldown"][symbol] = time.time() + CONFIG.SYMBOL_COOLDOWN_SEC
-    log.info(f"Opened {side} {symbol} @ {entry_price} with score {trade['Score']:.2f}. Cooldown until {datetime.fromtimestamp(bt['symbol_cooldown'][symbol]).strftime('%H:%M:%S')}")
+    log.info(f"Opened {side} {symbol} @ {entry_price_q} with score {trade['Score']:.2f}. Cooldown until {datetime.fromtimestamp(bt['symbol_cooldown'][symbol]).strftime('%H:%M:%S')}")
 
     if bc := bt.get('broadcast_func'):
-        sl_actual_pct = abs(sl / entry_price - 1) * 100
-        tp_actual_pct = abs(tp / entry_price - 1) * 100
+        sl_actual_pct = abs(sl / entry_price_q - 1) * 100
+        tp_actual_pct = abs(tp / entry_price_q - 1) * 100
         msg = (f"⚡ <b>Wick-Spike {side} (Score: {trade['Score']:.2f})</b>\n\n"
-               f"<b>Пара:</b> {symbol}\n<b>Вход:</b> <code>{format_price(entry_price)}</code>\n"
+               f"<b>Пара:</b> {symbol}\n<b>Вход:</b> <code>{format_price(entry_price_q)}</code>\n"
                f"<b>SL:</b> <code>{format_price(sl)}</code> (-{sl_actual_pct:.2f}%)\n"
                f"<b>TP:</b> <code>{format_price(tp)}</code> (+{tp_actual_pct:.2f}%)")
         await bc(app, msg)
