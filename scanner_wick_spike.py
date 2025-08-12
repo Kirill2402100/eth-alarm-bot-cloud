@@ -39,10 +39,16 @@ class CONFIG:
     ATR_PERIOD = 14
     VOL_WINDOW = 50
     GATE_WICK_RATIO = 1.5
-    GATE_ATR_SPIKE_MULT = 1.35
+    GATE_ATR_SPIKE_MULT = 1.5
     GATE_VOL_Z = 1.2
     GATE_BODY_ATR_MIN = 0.03
-    GATE_ATR_SPIKE_MAX = 2.8
+    GATE_ATR_SPIKE_MAX = 2.5
+    # <<< ИЗМЕНЕНО: Расширяем список исключаемых стейблкоинов
+    EXCLUDE_STABLE_BASES = {
+        "USDC", "USDT", "BUSD", "FDUSD", "DAI", "TUSD", "USDD", "PYUSD",
+        "USDE", "USDP", "GUSD", "USD+", "USDX", "EOSDT"
+    }
+    MAX_POSITIONS_PER_SYMBOL = 1
 
     ENTRY_TAIL_FRACTION = 0.3
     SL_PCT = 0.20
@@ -171,8 +177,11 @@ async def scanner_main_loop(app: Application, broadcast):
 # ---------------------------------------------------------------------------
 async def _run_scan(exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
+    # <<< ИЗМЕНЕНО: Более надёжная проверка на общее число позиций
     if len(bt.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
         return
+    
+    active_symbol_counts = Counter(t["Pair"] for t in bt.get("active_trades", []) if t.get("Status") == "ACTIVE")
         
     opened_this_scan = 0
     total_passed_gate = 0
@@ -187,6 +196,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             if m.get("type") == "swap"
             and s.endswith("USDT:USDT")
             and "UP" not in s and "DOWN" not in s
+            and (m.get("base","").upper() not in CONFIG.EXCLUDE_STABLE_BASES)
         ]
 
         tickers = await exchange.fetch_tickers()
@@ -261,9 +271,13 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         tot_chunk.update({"pass_WA":0, "pass_WV":0, "pass_AV":0})
         
         opened_syms_in_chunk = set()
-        chunk = liquid_rotated[i:i+CONFIG.CHUNK_SIZE]
+        chunk_raw = liquid_rotated[i:i+CONFIG.CHUNK_SIZE]
+        chunk = [s for s in chunk_raw if active_symbol_counts.get(s, 0) < CONFIG.MAX_POSITIONS_PER_SYMBOL]
+        if len(chunk) < len(chunk_raw):
+            tot_chunk["already_active"] += (len(chunk_raw) - len(chunk))
         
-        processed_symbols_count += len(chunk)
+        # <<< ИЗМЕНЕНО: Офсет сдвигается на размер исходного чанка
+        processed_symbols_count += len(chunk_raw)
         
         ohlcv_1m_data = await asyncio.gather(*[fetch_1m_data(s) for s in chunk])
         await asyncio.sleep(0)
@@ -276,6 +290,9 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             
             if bt.get("symbol_cooldown", {}).get(symbol, 0) > now_ts:
                 tot_chunk["cooldown"] += 1; continue
+            
+            if active_symbol_counts.get(symbol, 0) >= CONFIG.MAX_POSITIONS_PER_SYMBOL:
+                tot_chunk["already_active"] += 1; continue
 
             df_1m = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
             
@@ -340,7 +357,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 if not pass_wick: near["wick"].append(round(wick_ratio, 2))
                 if not pass_atr:
                     near["atr"].append(round(spike_atr_mult, 2))
-                    # <<< ИЗМЕНЕНО: Дополнительная телеметрия по отказам ATR
                     if spike_atr_mult > CONFIG.GATE_ATR_SPIKE_MAX:
                         tot_chunk["atr_too_high"] += 1
                     elif spike_atr_mult < CONFIG.GATE_ATR_SPIKE_MULT:
@@ -356,7 +372,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
         log.info(
             f"GateDiag ch={i//CONFIG.CHUNK_SIZE+1}: "
-            f"ok_1m={sum(1 for _,o in ohlcv_1m_data if o)}/{len(chunk)} (cd={tot_chunk['cooldown']}), "
+            f"ok_1m={sum(1 for _,o in ohlcv_1m_data if o)}/{len(chunk)} (cd={tot_chunk['cooldown']}, act={tot_chunk['already_active']}), "
             f"micro={tot_chunk['micro_body']}, "
             f"passes>=2(ATR_req)={tot_chunk['gate_all_pass']}, "
             f"combos(WA/WV/AV)={tot_chunk['pass_WA']}/{tot_chunk['pass_WV']}/{tot_chunk['pass_AV']}, "
@@ -412,14 +428,15 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 if side == "LONG" and btc_ret_5m < -0.005: btc_context_bonus = -0.15
                 elif side == "SHORT" and btc_ret_5m > 0.005: btc_context_bonus = -0.15
                 
+                side_penalty = 0.1 if side == "LONG" else 0.0
                 score = (
                     0.60 * min(max(wick_ratio - 1.5, 0), 3.0) +
                     0.40 * min(max(spike_atr_mult - 1.5, 0), 2.5) -
-                    0.15 * min(abs(htf_m5_slope), 2.0) +
+                    0.25 * min(abs(htf_m5_slope), 2.0) +
                     0.10 * btc_context_bonus -
                     htf_penalty +
                     0.10 * max(passes - 2, 0)
-                )
+                ) - side_penalty
                 
                 top_scores.append((symbol, round(score,2)))
                 
@@ -438,7 +455,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                                          'Vol_Z': round(vol_z, 2), 'Dist_Mean': round(dist_from_mean, 2), 'HTF_Slope': round(htf_m5_slope, 2), 
                                          'BTC_5m': round(btc_ret_5m * 100, 3), 'ATR_last': last_atr}}
                     
-                    # <<< ИЗМЕНЕНО: Возвращаем неблокирующий вызов с "бронированием"
                     opened_this_scan += 1
                     task = asyncio.create_task(_open_trade(cand, exchange, app))
                     def _log_open_err(t, sym=cand['symbol']):
@@ -479,6 +495,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     log.info(
         "GateDiag scan: "
         f"processed={processed_symbols_count}, no_ohlcv={tot_scan['no_ohlcv']}, cooldown={tot_scan['cooldown']}, "
+        f"already_active={tot_scan['already_active']}, "
         f"min_price={tot_scan['min_price']}, nan={tot_scan['nan_ind']}, micro={tot_scan['micro_body']}, "
         f"combos(WA/WV/AV)={tot_scan['pass_WA']}/{tot_scan['pass_WV']}/{tot_scan['pass_AV']}, "
         f"atr_rejects(H/L)={tot_scan['atr_too_high']}/{tot_scan['atr_too_low']}, "
@@ -527,6 +544,12 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
     bt = app.bot_data
     symbol, side, score = candidate['symbol'], candidate['side'], candidate['score']
     
+    # <<< ИЗМЕНЕНО: Проверка на лимит позиций по конкретному символу
+    active_cnt = sum(1 for t in bt.get("active_trades", []) if t["Pair"] == symbol and t.get("Status") == "ACTIVE")
+    if active_cnt >= CONFIG.MAX_POSITIONS_PER_SYMBOL:
+        log.info(f"Skip {symbol}: already have {active_cnt} ACTIVE positions (limit={CONFIG.MAX_POSITIONS_PER_SYMBOL}).")
+        return
+
     delay_ms = 1500
     wait_sec = max(0, (candidate['bar_ts'] + tf_seconds('1m')*1000 + delay_ms - int(time.time()*1000)) / 1000)
     if wait_sec > 0:
@@ -558,17 +581,13 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
     entry_price_q = float(exchange.price_to_precision(symbol, entry_price))
 
     try:
-        # <<< ИЗМЕНЕНО: Адаптивный толеранс для "касания"
+        # <<< ИЗМЕНЕНО: Возвращаем симметричное окно для "касания"
         tail = (min(o, c) - l) if side == "LONG" else (h - max(o, c))
         safe_atr = max(float(candidate['features'].get('ATR_last', 0)), 1e-9)
         m = exchange.market(symbol)
         min_tick = (((m.get('limits') or {}).get('price') or {}).get('min')) or 0.0
 
-        tol_abs = max(
-            min_tick * 1.1,
-            0.10 * tail,      # 10% длины нужной тени
-            0.10 * safe_atr   # 10% ATR для масштаба
-        )
+        tol_abs = max(min_tick * 1.1, 0.10 * tail, 0.10 * safe_atr)
         touch_tol_pct = max(0.03, min(0.30, (tol_abs / entry_price_q * 100) if entry_price_q > 0 else 0))
 
         tk = await exchange.fetch_ticker(symbol)
