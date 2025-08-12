@@ -58,6 +58,15 @@ class CONFIG:
     ATR_SL_MULT = 0.6
     RISK_REWARD = TP_PCT / SL_PCT if SL_PCT > 0 else 0
 
+    THRESHOLD_MODE = "adaptive"
+    THR_Q_MAIN = 0.98
+    THR_Q_MED = 0.95
+    THR_Q_SMALL = 0.90
+    THR_PAD = 0.02
+    THR_MIN_SAMPLES = 12
+    THR_SMOOTH_ALPHA = 0.4
+    THR_MAX_JUMP = 0.15
+
 
 # ... (Функции ensure_new_log_sheet, format_price, tf_seconds остаются без изменений) ...
 async def ensure_new_log_sheet(gfile: gspread.Spreadsheet):
@@ -341,7 +350,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         log.info(
             f"GateDiag ch={i//CONFIG.CHUNK_SIZE+1}: "
             f"ok_1m={sum(1 for _,o in ohlcv_1m_data if o)}/{len(chunk)} (cd={tot_chunk['cooldown']}), "
-            f"stale={tot_chunk['stale']}, micro={tot_chunk['micro_body']}, "
+            f"micro={tot_chunk['micro_body']}, "
             f"passes>=2={tot_chunk['gate_all_pass']}, "
             f"combos(WA/WV/AV)={tot_chunk['pass_WA']}/{tot_chunk['pass_WV']}/{tot_chunk['pass_AV']}, "
             f"near_p90(wick={p90(near['wick'])} atr={p90(near['atr'])} vol={p90(near['vol'])})"
@@ -480,11 +489,32 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
     bt['stat_no_touch'] = 0
     
-    if opened_this_scan == 0:
-        bt['score_threshold'] = max(CONFIG.SCORE_MIN, bt.get('score_threshold', CONFIG.SCORE_BASE) - CONFIG.SCORE_ADAPT_STEP)
-        log.info(f"Scan finished: no trades opened. thr -> {bt['score_threshold']:.2f}")
-    else:
-        log.info(f"Scan finished: opened {opened_this_scan} trade(s). Final thr: {bt['score_threshold']:.2f}")
+    if CONFIG.THRESHOLD_MODE == "adaptive" and all_scores:
+        n = len(all_scores)
+        old_thr = bt.get('score_threshold', CONFIG.SCORE_BASE)
+        if n >= CONFIG.THR_MIN_SAMPLES:
+            if n < 20:
+                q = float(np.quantile(all_scores, CONFIG.THR_Q_SMALL))
+            elif n < 50:
+                q = float(np.quantile(all_scores, CONFIG.THR_Q_MED))
+            else:
+                q = float(np.quantile(all_scores, CONFIG.THR_Q_MAIN))
+            target = q + CONFIG.THR_PAD
+            target = max(CONFIG.SCORE_MIN, min(CONFIG.SCORE_MAX, target))
+            
+            proposed = (1 - CONFIG.THR_SMOOTH_ALPHA) * old_thr + CONFIG.THR_SMOOTH_ALPHA * target
+            delta = max(-CONFIG.THR_MAX_JUMP, min(CONFIG.THR_MAX_JUMP, proposed - old_thr))
+            new_thr = round(old_thr + delta, 2)
+            bt['score_threshold'] = new_thr
+            log.info(f"Thr(adapt): n={n}, q={q:.2f}, target={target:.2f} → {new_thr:.2f} (old={old_thr:.2f})")
+        else:
+            if opened_this_scan == 0:
+                bt['score_threshold'] = max(CONFIG.SCORE_MIN, old_thr - CONFIG.SCORE_ADAPT_STEP)
+                log.info(f"Thr(step-fallback): few samples (n={n}). thr -> {bt['score_threshold']:.2f}")
+            else:
+                log.info(f"Thr(step-fallback): few samples (n={n}). keep thr={old_thr:.2f}")
+    
+    log.info(f"Scan finished: opened={opened_this_scan}, thr_now={bt.get('score_threshold', CONFIG.SCORE_BASE):.2f}")
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +562,6 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
         tick_tol_pct = (min_tick / entry_price_q * 100) if (min_tick and entry_price_q > 0) else 0.0
         touch_tol_pct = max(base_tol_pct, tick_tol_pct * 1.1)
         
-        # <<< ИЗМЕНЕНО: Симметричная проверка "касания"
         lo = entry_price_q * (1 - touch_tol_pct/100)
         hi = entry_price_q * (1 + touch_tol_pct/100)
         if (last_px is None) or not (lo <= last_px <= hi):
@@ -555,7 +584,6 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
     tp = (entry_price_q + tp_dist_price) if side == "LONG" else (entry_price_q - tp_dist_price)
     sl, tp = float(exchange.price_to_precision(symbol, sl)), float(exchange.price_to_precision(symbol, tp))
     
-    # <<< ИЗМЕНЕНО: Гарантируем, что SL/TP не "прилипли" к входу после округления
     m = exchange.market(symbol)
     tick = (((m.get('limits') or {}).get('price') or {}).get('min')) or 0.0
     if tick:
