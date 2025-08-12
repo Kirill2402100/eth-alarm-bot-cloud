@@ -16,7 +16,7 @@ import trade_executor
 log = logging.getLogger("wick_spike_engine")
 
 # ---------------------------------------------------------------------------
-# CONFIG
+# CONFIG - ИЗМЕНЕНО
 # ---------------------------------------------------------------------------
 class CONFIG:
     TIMEFRAME = "1m"
@@ -24,12 +24,13 @@ class CONFIG:
     LEVERAGE = 20
     MAX_CONCURRENT_POSITIONS = 10
     
-    CONCURRENCY_SEMAPHORE = 12
-    FETCH_TIMEOUT = 8
+    # <<< ИЗМЕНЕНО: Финальная настройка производительности
+    CONCURRENCY_SEMAPHORE = 20
+    FETCH_TIMEOUT = 6
     SCAN_CADENCE_SEC = 15
     CHUNK_SIZE = 60
-    TIME_BUDGET_SEC = 55
-    SCAN_TOP_N_SYMBOLS = 300
+    TIME_BUDGET_SEC = 75
+    SCAN_TOP_N_SYMBOLS = 200
 
     MIN_QUOTE_VOLUME_USD = 150_000
     MIN_PRICE = 0.001
@@ -162,6 +163,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         return
         
     opened_this_scan = 0
+    total_passed_gate = 0
 
     try:
         universe = [
@@ -186,8 +188,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
         offset = bt.get("scan_offset", 0)
         liquid_rotated = liquid[offset:] + liquid[:offset]
-        if len(liquid) > 0:
-            bt["scan_offset"] = (offset + CONFIG.CHUNK_SIZE) % len(liquid)
+        processed_symbols_count = 0
         
         log.info(f"Wick-Scan: найдено {len(universe)} своп-пар; отобрано топ-{len(liquid)} по объему. Начинаем с офсета {offset}")
 
@@ -235,7 +236,12 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         
         opened_syms_in_chunk = set()
         chunk = liquid_rotated[i:i+CONFIG.CHUNK_SIZE]
+        
         ohlcv_1m_data = await asyncio.gather(*[fetch_1m_data(s) for s in chunk])
+        
+        # <<< ИЗМЕНЕНО: Более точный подсчёт прогресса для ротации
+        processed_symbols_count += sum(1 for _, o in ohlcv_1m_data if o)
+        
         gate_passed_symbols = []
         for symbol, ohlcv in ohlcv_1m_data:
             need_len = max(CONFIG.VOL_WINDOW, CONFIG.ATR_PERIOD) + 1
@@ -263,13 +269,14 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             
             h, l, o, c = last['high'], last['low'], last['open'], last['close']
             body = abs(c - o)
-            if body / c < 0.0005: 
+
+            if body / max(c, 1e-9) < 0.0005: 
                 continue
-            
-            # <<< ИЗМЕНЕНО: Защита от деления на ноль при слабом ATR
+            body_safe = max(body, 1e-9)
+
             safe_atr = max(float(last['atr']), 1e-9)
             
-            wick_ratio = max(h - max(o, c), min(o, c) - l) / body
+            wick_ratio = max(h - max(o, c), min(o, c) - l) / body_safe
             spike_atr_mult = (h - l) / safe_atr
             vol_z = last['vol_z']
 
@@ -278,6 +285,11 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 vol_z >= CONFIG.GATE_VOL_Z):
                 gate_passed_symbols.append({'symbol': symbol, 'df_1m': df_1m, 'gate_features': {'wick_ratio': wick_ratio, 'spike_atr_mult': spike_atr_mult, 'vol_z': vol_z}})
         
+        total_passed_gate += len(gate_passed_symbols)
+        log.debug(f"Chunk {i//CONFIG.CHUNK_SIZE+1}: {len(chunk)} syms -> "
+                  f"{sum(1 for _,o in ohlcv_1m_data if o)} ok OHLCV -> "
+                  f"{len(gate_passed_symbols)} passed gate")
+
         if not gate_passed_symbols:
             await asyncio.sleep(0)
             continue
@@ -290,14 +302,19 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 
                 htf_m5_slope, htf_penalty = 0, 0
                 ohlcv_5m = ohlcv_5m_data.get(symbol)
+                # <<< ИЗМЕНЕНО: Более надёжная проверка для EMA50 slope
                 if ohlcv_5m:
-                    df_5m = pd.DataFrame(ohlcv_5m, columns=["ts","open","high","low","close","volume"])
-                    ema50_m5 = ta.ema(df_5m['close'], length=50)
-                    atr_m5 = ta.atr(df_5m['high'], df_5m['low'], df_5m['close'], length=14)
-                    if len(ema50_m5) > 5 and pd.notna(atr_m5.iloc[-1]):
-                        htf_m5_slope = (ema50_m5.iloc[-1] - ema50_m5.iloc[-6]) / max(atr_m5.iloc[-1], 1e-9)
+                    df_5m = pd.DataFrame(ohlcv_5m, columns=["ts", "open", "high", "low", "close", "volume"])
+                    if len(df_5m) >= 56:
+                        ema50_m5 = ta.ema(df_5m['close'], length=50)
+                        atr_m5 = ta.atr(df_5m['high'], df_5m['low'], df_5m['close'], length=14)
+                        if pd.notna(ema50_m5.iloc[-1]) and pd.notna(ema50_m5.iloc[-6]) and pd.notna(atr_m5.iloc[-1]):
+                            htf_m5_slope = (ema50_m5.iloc[-1] - ema50_m5.iloc[-6]) / max(float(atr_m5.iloc[-1]), 1e-9)
+                        else:
+                            htf_penalty = 0.1
+                    else:
+                        htf_penalty = 0.1
                 else:
-                    log.warning(f"No 5m data for {symbol}, proceeding with htf_slope=0 and penalty.")
                     htf_penalty = 0.1 
 
                 gate_features = item['gate_features']
@@ -307,15 +324,14 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 c = last['close']
                 df_1m['ema20'] = ta.ema(df_1m['close'], length=20)
                 
-                ema20_last = df_1m['iloc'][-1]
+                ema20_last = df_1m['ema20'].iloc[-1]
                 if pd.isna(ema20_last): 
                     continue
                 
-                # <<< ИЗМЕНЕНО: Защита от деления на ноль при слабом ATR
                 safe_atr = max(float(last['atr']), 1e-9)
                 dist_from_mean = abs(c - ema20_last) / safe_atr
                 
-                btc_ret_5m = 0 if (btc_df is None or len(btc_df) <= 6) else (btc_df['close'].iloc[-1] / btc_df['close'].iloc[-6] - 1)
+                btc_ret_5m = 0 if (btc_df is None or len(btc_df) < 6) else (btc_df['close'].iloc[-1] / btc_df['close'].iloc[-6] - 1)
                 upper_wick = last['high'] - max(last['open'], c)
                 side = "SHORT" if upper_wick >= (min(last['open'], c) - last['low']) else "LONG"
                 
@@ -360,6 +376,9 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                             log.info(f"Early stop & thr bump: opened {opened_this_scan} trades; thr -> {bt['score_threshold']:.2f}")
                         else:
                             log.info(f"Early stop: opened {opened_this_scan} trades; threshold bump skipped due to anti-jitter.")
+                        
+                        if len(liquid) > 0:
+                            bt["scan_offset"] = (offset + processed_symbols_count) % len(liquid)
                         return
 
             except Exception:
@@ -369,6 +388,12 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                  f"opened_so_far={opened_this_scan}, elapsed={time.time()-scan_started:.1f}s")
         
         await asyncio.sleep(0)
+    
+    if len(liquid) > 0:
+        bt["scan_offset"] = (offset + processed_symbols_count) % len(liquid)
+
+    # <<< ИЗМЕНЕНО: Добавляем итоговый debug-лог
+    log.debug(f"Scan end: processed={processed_symbols_count}, passed_gate_total={total_passed_gate}, opened={opened_this_scan}")
     
     if opened_this_scan == 0:
         bt['score_threshold'] = max(CONFIG.SCORE_MIN, bt.get('score_threshold', CONFIG.SCORE_BASE) - CONFIG.SCORE_ADAPT_STEP)
@@ -465,7 +490,9 @@ async def _monitor_trades(exchange: ccxt.Exchange, app: Application):
         async with sem:
             try:
                 tk = await asyncio.wait_for(exchange.fetch_ticker(symbol), timeout=6)
-                return symbol, tk.get('last')
+                last = tk.get('last') or tk.get('close') \
+                       or ( (tk.get('bid') and tk.get('ask')) and (tk['bid']+tk['ask'])/2 )
+                return symbol, last
             except Exception:
                 return symbol, None
 
