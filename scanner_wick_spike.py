@@ -3,6 +3,8 @@ import asyncio, time, logging, json, os
 import contextlib
 from datetime import datetime, timezone
 from typing import Optional, Tuple, List, Dict
+# <<< ИЗМЕНЕНЕИЕ: Импортируем Counter в начале файла для доступа в _run_scan
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -16,7 +18,7 @@ import trade_executor
 log = logging.getLogger("wick_spike_engine")
 
 # ---------------------------------------------------------------------------
-# CONFIG - ИЗМЕНЕНО
+# CONFIG - ИЗМЕНЕНО ДЛЯ ДИАГНОСТИКИ
 # ---------------------------------------------------------------------------
 class CONFIG:
     TIMEFRAME = "1m"
@@ -24,12 +26,12 @@ class CONFIG:
     LEVERAGE = 20
     MAX_CONCURRENT_POSITIONS = 10
     
-    # <<< ИЗМЕНЕНО: Финальная настройка производительности
     CONCURRENCY_SEMAPHORE = 20
     FETCH_TIMEOUT = 6
     SCAN_CADENCE_SEC = 15
     CHUNK_SIZE = 60
     TIME_BUDGET_SEC = 75
+    # <<< ИЗМЕНЕНО: Возвращаем к значению из логов для консистентности
     SCAN_TOP_N_SYMBOLS = 200
 
     MIN_QUOTE_VOLUME_USD = 150_000
@@ -39,7 +41,8 @@ class CONFIG:
     ATR_PERIOD = 14
     VOL_WINDOW = 50
     GATE_WICK_RATIO = 1.5
-    GATE_ATR_SPIKE_MULT = 1.5
+    # <<< ИЗМЕНЕНО: Временно ослабляем гейт для сбора данных
+    GATE_ATR_SPIKE_MULT = 1.3
     GATE_VOL_Z = 1.2
 
     ENTRY_TAIL_FRACTION = 0.3
@@ -204,6 +207,8 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         btc_df = None
 
     sem = asyncio.Semaphore(CONFIG.CONCURRENCY_SEMAPHORE)
+    # <<< ИЗМЕНЕНО: Инициализация счётчика для телеметрии
+    tot_scan = Counter()
     
     async def fetch_1m_data(symbol):
         async with sem:
@@ -234,19 +239,22 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             log.warning("Scan aborted – time budget exceeded")
             break
         
+        # <<< ИЗМЕНЕНО: Инициализация счётчиков для чанка
+        tot_chunk = Counter()
+        near = {"wick": [], "atr": [], "vol": []}
+
         opened_syms_in_chunk = set()
         chunk = liquid_rotated[i:i+CONFIG.CHUNK_SIZE]
         
         ohlcv_1m_data = await asyncio.gather(*[fetch_1m_data(s) for s in chunk])
         
-        # <<< ИЗМЕНЕНО: Более точный подсчёт прогресса для ротации
         processed_symbols_count += sum(1 for _, o in ohlcv_1m_data if o)
         
         gate_passed_symbols = []
         for symbol, ohlcv in ohlcv_1m_data:
             need_len = max(CONFIG.VOL_WINDOW, CONFIG.ATR_PERIOD) + 1
             if not ohlcv or len(ohlcv) < need_len: 
-                continue
+                tot_chunk["no_ohlcv"] += 1; continue
             
             if bt.get("symbol_cooldown", {}).get(symbol, 0) > now_ts:
                 continue
@@ -254,10 +262,11 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             df_1m = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
             
             if df_1m.iloc[-1]['ts'] < (now_ts - tf_seconds('1m') * 1.1) * 1000:
-                continue
+                tot_chunk["stale"] += 1; continue
 
             last = df_1m.iloc[-1]
-            if last['close'] < CONFIG.MIN_PRICE: continue
+            if last['close'] < CONFIG.MIN_PRICE:
+                tot_chunk["min_price"] += 1; continue
             
             df_1m['atr'] = ta.atr(df_1m['high'], df_1m['low'], df_1m['close'], length=CONFIG.ATR_PERIOD)
             vol_mu = df_1m['volume'].rolling(CONFIG.VOL_WINDOW).mean()
@@ -265,30 +274,57 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             df_1m['vol_z'] = (df_1m['volume'] - vol_mu) / vol_sigma
             last = df_1m.iloc[-1]
 
-            if pd.isna(last["vol_z"]) or pd.isna(last["atr"]): continue
+            if pd.isna(last["vol_z"]) or pd.isna(last["atr"]):
+                tot_chunk["nan_ind"] += 1; continue
             
             h, l, o, c = last['high'], last['low'], last['open'], last['close']
             body = abs(c - o)
-
-            if body / max(c, 1e-9) < 0.0005: 
-                continue
-            body_safe = max(body, 1e-9)
-
             safe_atr = max(float(last['atr']), 1e-9)
+
+            # <<< ИЗМЕНЕНО: Временное ослабление фильтра микротела + телеметрия
+            if (body / safe_atr) < 0.05:
+                tot_chunk["micro_body"] += 1; continue
+            
+            body_safe = max(body, 1e-9)
             
             wick_ratio = max(h - max(o, c), min(o, c) - l) / body_safe
             spike_atr_mult = (h - l) / safe_atr
             vol_z = last['vol_z']
 
-            if (wick_ratio >= CONFIG.GATE_WICK_RATIO and 
-                spike_atr_mult >= CONFIG.GATE_ATR_SPIKE_MULT and 
-                vol_z >= CONFIG.GATE_VOL_Z):
-                gate_passed_symbols.append({'symbol': symbol, 'df_1m': df_1m, 'gate_features': {'wick_ratio': wick_ratio, 'spike_atr_mult': spike_atr_mult, 'vol_z': vol_z}})
+            # <<< ИЗМЕНЕНО: Детальная проверка гейтов и сбор near-miss
+            pass_wick = (wick_ratio >= CONFIG.GATE_WICK_RATIO)
+            pass_atr  = (spike_atr_mult >= CONFIG.GATE_ATR_SPIKE_MULT)
+            pass_vol  = (vol_z >= CONFIG.GATE_VOL_Z)
+
+            tot_chunk["gate_wick_pass"] += int(pass_wick)
+            tot_chunk["gate_atr_pass"]  += int(pass_atr)
+            tot_chunk["gate_vol_pass"]  += int(pass_vol)
+
+            if not (pass_wick and pass_atr and pass_vol):
+                if not pass_wick: near["wick"].append(round(wick_ratio, 2))
+                if not pass_atr:  near["atr"].append(round(spike_atr_mult, 2))
+                if not pass_vol:  near["vol"].append(round(vol_z, 2))
+                tot_chunk["gate_all_fail"] += 1
+                continue
+            
+            tot_chunk["gate_all_pass"] += 1
+            gate_passed_symbols.append({'symbol': symbol, 'df_1m': df_1m, 'gate_features': {'wick_ratio': wick_ratio, 'spike_atr_mult': spike_atr_mult, 'vol_z': vol_z}})
         
         total_passed_gate += len(gate_passed_symbols)
-        log.debug(f"Chunk {i//CONFIG.CHUNK_SIZE+1}: {len(chunk)} syms -> "
-                  f"{sum(1 for _,o in ohlcv_1m_data if o)} ok OHLCV -> "
-                  f"{len(gate_passed_symbols)} passed gate")
+        
+        # <<< ИЗМЕНЕНО: Агрегируем статистику чанка в общую
+        for k, v in tot_chunk.items():
+            tot_scan[k] += v
+
+        # <<< ИЗМЕНЕНО: Выводим лаконичный лог-диагностику по чанку
+        log.info(
+            f"GateDiag ch={i//CONFIG.CHUNK_SIZE+1}: "
+            f"ok_1m={sum(1 for _,o in ohlcv_1m_data if o)}/{len(chunk)}, "
+            f"stale={tot_chunk['stale']}, micro={tot_chunk['micro_body']}, "
+            f"nan={tot_chunk['nan_ind']}, gate_pass={tot_chunk['gate_all_pass']}, "
+            f"gate_fail={tot_chunk['gate_all_fail']}, "
+            f"near(wick,max={max(near['wick'], default='-')} atr,max={max(near['atr'], default='-')} vol,max={max(near['vol'], default='-')})"
+        )
 
         if not gate_passed_symbols:
             await asyncio.sleep(0)
@@ -302,7 +338,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 
                 htf_m5_slope, htf_penalty = 0, 0
                 ohlcv_5m = ohlcv_5m_data.get(symbol)
-                # <<< ИЗМЕНЕНО: Более надёжная проверка для EMA50 slope
                 if ohlcv_5m:
                     df_5m = pd.DataFrame(ohlcv_5m, columns=["ts", "open", "high", "low", "close", "volume"])
                     if len(df_5m) >= 56:
@@ -310,12 +345,9 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                         atr_m5 = ta.atr(df_5m['high'], df_5m['low'], df_5m['close'], length=14)
                         if pd.notna(ema50_m5.iloc[-1]) and pd.notna(ema50_m5.iloc[-6]) and pd.notna(atr_m5.iloc[-1]):
                             htf_m5_slope = (ema50_m5.iloc[-1] - ema50_m5.iloc[-6]) / max(float(atr_m5.iloc[-1]), 1e-9)
-                        else:
-                            htf_penalty = 0.1
-                    else:
-                        htf_penalty = 0.1
-                else:
-                    htf_penalty = 0.1 
+                        else: htf_penalty = 0.1
+                    else: htf_penalty = 0.1
+                else: htf_penalty = 0.1 
 
                 gate_features = item['gate_features']
                 wick_ratio, spike_atr_mult, vol_z = gate_features['wick_ratio'], gate_features['spike_atr_mult'], gate_features['vol_z']
@@ -383,17 +415,19 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
             except Exception:
                 log.exception(f"Score calculation for {item.get('symbol')} failed")
-
-        log.info(f"Scan progress: {min(i + CONFIG.CHUNK_SIZE, len(liquid_rotated))}/{len(liquid_rotated)} symbols, "
-                 f"opened_so_far={opened_this_scan}, elapsed={time.time()-scan_started:.1f}s")
         
         await asyncio.sleep(0)
     
     if len(liquid) > 0:
         bt["scan_offset"] = (offset + processed_symbols_count) % len(liquid)
 
-    # <<< ИЗМЕНЕНО: Добавляем итоговый debug-лог
-    log.debug(f"Scan end: processed={processed_symbols_count}, passed_gate_total={total_passed_gate}, opened={opened_this_scan}")
+    log.info(
+        "GateDiag scan: "
+        f"no_ohlcv={tot_scan['no_ohlcv']}, stale={tot_scan['stale']}, min_price={tot_scan['min_price']}, "
+        f"nan={tot_scan['nan_ind']}, micro={tot_scan['micro_body']}, "
+        f"gate_wick_pass={tot_scan['gate_wick_pass']}, gate_atr_pass={tot_scan['gate_atr_pass']}, gate_vol_pass={tot_scan['gate_vol_pass']}, "
+        f"gate_all_pass={tot_scan['gate_all_pass']}, gate_all_fail={tot_scan['gate_all_fail']}"
+    )
     
     if opened_this_scan == 0:
         bt['score_threshold'] = max(CONFIG.SCORE_MIN, bt.get('score_threshold', CONFIG.SCORE_BASE) - CONFIG.SCORE_ADAPT_STEP)
@@ -462,7 +496,7 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
         msg = (f"⚡ <b>Wick-Spike {side} (Score: {trade['Score']:.2f})</b>\n\n"
                f"<b>Пара:</b> {symbol}\n<b>Вход:</b> <code>{format_price(entry_price)}</code>\n"
                f"<b>SL:</b> <code>{format_price(sl)}</code> (-{sl_actual_pct:.2f}%)\n"
-               f"<b>TP:</b> <code>{format_price(tp)}</code> (+{tp_actual_pct:.2f}%)")
+               f"<b>TP:</b> <code>{format_price(tp)}</code> (+<code/>{tp_actual_pct:.2f}%)")
         await bc(app, msg)
 
     await trade_executor.log_open_trade(trade)
