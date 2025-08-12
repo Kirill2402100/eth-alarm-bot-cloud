@@ -3,7 +3,6 @@ import asyncio, time, logging, json, os
 import contextlib
 from datetime import datetime, timezone
 from typing import Optional, Tuple, List, Dict
-# <<< ИЗМЕНЕНЕИЕ: Импортируем Counter в начале файла для доступа в _run_scan
 from collections import Counter
 
 import numpy as np
@@ -18,7 +17,7 @@ import trade_executor
 log = logging.getLogger("wick_spike_engine")
 
 # ---------------------------------------------------------------------------
-# CONFIG - ИЗМЕНЕНО ДЛЯ ДИАГНОСТИКИ
+# CONFIG
 # ---------------------------------------------------------------------------
 class CONFIG:
     TIMEFRAME = "1m"
@@ -26,12 +25,11 @@ class CONFIG:
     LEVERAGE = 20
     MAX_CONCURRENT_POSITIONS = 10
     
-    CONCURRENCY_SEMAPHORE = 20
-    FETCH_TIMEOUT = 6
+    CONCURRENCY_SEMAPHORE = 12
+    FETCH_TIMEOUT = 8
     SCAN_CADENCE_SEC = 15
     CHUNK_SIZE = 60
     TIME_BUDGET_SEC = 75
-    # <<< ИЗМЕНЕНО: Возвращаем к значению из логов для консистентности
     SCAN_TOP_N_SYMBOLS = 200
 
     MIN_QUOTE_VOLUME_USD = 150_000
@@ -41,9 +39,10 @@ class CONFIG:
     ATR_PERIOD = 14
     VOL_WINDOW = 50
     GATE_WICK_RATIO = 1.5
-    # <<< ИЗМЕНЕНО: Временно ослабляем гейт для сбора данных
-    GATE_ATR_SPIKE_MULT = 1.3
+    GATE_ATR_SPIKE_MULT = 1.5
     GATE_VOL_Z = 1.2
+    # <<< ИЗМЕНЕНО: Фильтр микротела вынесен в конфиг и временно ослаблен
+    GATE_BODY_ATR_MIN = 0.03
 
     ENTRY_TAIL_FRACTION = 0.3
     SL_PCT = 0.20
@@ -168,6 +167,10 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     opened_this_scan = 0
     total_passed_gate = 0
 
+    # <<< ИЗМЕНЕНО: Вспомогательная функция для перцентиля
+    def p90(xs):
+        return "-" if not xs else round(np.percentile(xs, 90), 2)
+
     try:
         universe = [
             s for s, m in exchange.markets.items()
@@ -179,7 +182,12 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         tickers = await exchange.fetch_tickers()
         ranked = []
         for s in universe:
-            vol = (tickers.get(s) or {}).get("quoteVolume") or 0
+            t = tickers.get(s) or {}
+            qv = t.get("quoteVolume") \
+                or (t.get("info") or {}).get("quote_volume") \
+                or ((t.get("baseVolume") or 0) * (t.get("last") or 0))
+            vol = float(qv or 0)
+            
             if vol > CONFIG.MIN_QUOTE_VOLUME_USD:
                  ranked.append((s, vol))
 
@@ -207,7 +215,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         btc_df = None
 
     sem = asyncio.Semaphore(CONFIG.CONCURRENCY_SEMAPHORE)
-    # <<< ИЗМЕНЕНО: Инициализация счётчика для телеметрии
     tot_scan = Counter()
     
     async def fetch_1m_data(symbol):
@@ -239,16 +246,18 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             log.warning("Scan aborted – time budget exceeded")
             break
         
-        # <<< ИЗМЕНЕНО: Инициализация счётчиков для чанка
+        # <<< ИЗМЕНЕНО: Расширенная телеметрия для чанка
         tot_chunk = Counter()
         near = {"wick": [], "atr": [], "vol": []}
-
+        tot_chunk.update({"pass_WA":0, "pass_WV":0, "pass_AV":0})
+        
         opened_syms_in_chunk = set()
         chunk = liquid_rotated[i:i+CONFIG.CHUNK_SIZE]
         
-        ohlcv_1m_data = await asyncio.gather(*[fetch_1m_data(s) for s in chunk])
+        processed_symbols_count += len(chunk)
         
-        processed_symbols_count += sum(1 for _, o in ohlcv_1m_data if o)
+        ohlcv_1m_data = await asyncio.gather(*[fetch_1m_data(s) for s in chunk])
+        await asyncio.sleep(0)
         
         gate_passed_symbols = []
         for symbol, ohlcv in ohlcv_1m_data:
@@ -257,7 +266,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 tot_chunk["no_ohlcv"] += 1; continue
             
             if bt.get("symbol_cooldown", {}).get(symbol, 0) > now_ts:
-                continue
+                tot_chunk["cooldown"] += 1; continue
 
             df_1m = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
             
@@ -281,8 +290,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             body = abs(c - o)
             safe_atr = max(float(last['atr']), 1e-9)
 
-            # <<< ИЗМЕНЕНО: Временное ослабление фильтра микротела + телеметрия
-            if (body / safe_atr) < 0.05:
+            if (body / safe_atr) < CONFIG.GATE_BODY_ATR_MIN:
                 tot_chunk["micro_body"] += 1; continue
             
             body_safe = max(body, 1e-9)
@@ -291,7 +299,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             spike_atr_mult = (h - l) / safe_atr
             vol_z = last['vol_z']
 
-            # <<< ИЗМЕНЕНО: Детальная проверка гейтов и сбор near-miss
             pass_wick = (wick_ratio >= CONFIG.GATE_WICK_RATIO)
             pass_atr  = (spike_atr_mult >= CONFIG.GATE_ATR_SPIKE_MULT)
             pass_vol  = (vol_z >= CONFIG.GATE_VOL_Z)
@@ -299,31 +306,36 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             tot_chunk["gate_wick_pass"] += int(pass_wick)
             tot_chunk["gate_atr_pass"]  += int(pass_atr)
             tot_chunk["gate_vol_pass"]  += int(pass_vol)
+            
+            # <<< ИЗМЕНЕНО: Считаем комбинации
+            if pass_wick and pass_atr: tot_chunk["pass_WA"] += 1
+            if pass_wick and pass_vol: tot_chunk["pass_WV"] += 1
+            if pass_atr and pass_vol:  tot_chunk["pass_AV"] += 1
 
-            if not (pass_wick and pass_atr and pass_vol):
+            passes = int(pass_wick) + int(pass_atr) + int(pass_vol)
+            if passes >= 2:
+                tot_chunk["gate_all_pass"] += 1
+                gate_passed_symbols.append({'symbol': symbol, 'df_1m': df_1m, 'gate_features': {'wick_ratio': wick_ratio, 'spike_atr_mult': spike_atr_mult, 'vol_z': vol_z}})
+            else:
                 if not pass_wick: near["wick"].append(round(wick_ratio, 2))
                 if not pass_atr:  near["atr"].append(round(spike_atr_mult, 2))
                 if not pass_vol:  near["vol"].append(round(vol_z, 2))
                 tot_chunk["gate_all_fail"] += 1
                 continue
-            
-            tot_chunk["gate_all_pass"] += 1
-            gate_passed_symbols.append({'symbol': symbol, 'df_1m': df_1m, 'gate_features': {'wick_ratio': wick_ratio, 'spike_atr_mult': spike_atr_mult, 'vol_z': vol_z}})
         
         total_passed_gate += len(gate_passed_symbols)
         
-        # <<< ИЗМЕНЕНО: Агрегируем статистику чанка в общую
         for k, v in tot_chunk.items():
             tot_scan[k] += v
 
-        # <<< ИЗМЕНЕНО: Выводим лаконичный лог-диагностику по чанку
+        # <<< ИЗМЕНЕНО: Расширенный лог чанка с перцентилями и комбинациями
         log.info(
             f"GateDiag ch={i//CONFIG.CHUNK_SIZE+1}: "
-            f"ok_1m={sum(1 for _,o in ohlcv_1m_data if o)}/{len(chunk)}, "
+            f"ok_1m={sum(1 for _,o in ohlcv_1m_data if o)}/{len(chunk)} (cd={tot_chunk['cooldown']}), "
             f"stale={tot_chunk['stale']}, micro={tot_chunk['micro_body']}, "
-            f"nan={tot_chunk['nan_ind']}, gate_pass={tot_chunk['gate_all_pass']}, "
-            f"gate_fail={tot_chunk['gate_all_fail']}, "
-            f"near(wick,max={max(near['wick'], default='-')} atr,max={max(near['atr'], default='-')} vol,max={max(near['vol'], default='-')})"
+            f"passes>=2={tot_chunk['gate_all_pass']}, "
+            f"combos(WA/WV/AV)={tot_chunk['pass_WA']}/{tot_chunk['pass_WV']}/{tot_chunk['pass_AV']}, "
+            f"near_p90(wick={p90(near['wick'])} atr={p90(near['atr'])} vol={p90(near['vol'])})"
         )
 
         if not gate_passed_symbols:
@@ -331,6 +343,9 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             continue
             
         ohlcv_5m_data = dict(await asyncio.gather(*[fetch_5m_data(s['symbol']) for s in gate_passed_symbols]))
+        await asyncio.sleep(0)
+        
+        top_scores = []
 
         for item in gate_passed_symbols:
             try:
@@ -372,6 +387,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 elif side == "SHORT" and btc_ret_5m > 0.005: btc_context_bonus = -0.15
                 
                 score = (0.35*min(max(wick_ratio-1.5,0),2.5) + 0.25*min(max(spike_atr_mult-1.8,0),2.0) + 0.20*min(max(vol_z-2.0,0),3.0) + 0.15*min(dist_from_mean,3.0) - 0.15*min(abs(htf_m5_slope),2.0) + 0.10*btc_context_bonus - htf_penalty)
+                top_scores.append((symbol, round(score,2))) # <<< ИЗМЕНЕНО: Собираем скоры
                 
                 score_threshold = bt.get('score_threshold', CONFIG.SCORE_BASE)
                 
@@ -416,6 +432,11 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             except Exception:
                 log.exception(f"Score calculation for {item.get('symbol')} failed")
         
+        # <<< ИЗМЕНЕНО: Логируем топ-5 скоров из чанка
+        if top_scores:
+            top_scores.sort(key=lambda x: x[1], reverse=True)
+            log.debug(f"Top scores sample: {top_scores[:5]}")
+        
         await asyncio.sleep(0)
     
     if len(liquid) > 0:
@@ -423,10 +444,10 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
     log.info(
         "GateDiag scan: "
-        f"no_ohlcv={tot_scan['no_ohlcv']}, stale={tot_scan['stale']}, min_price={tot_scan['min_price']}, "
-        f"nan={tot_scan['nan_ind']}, micro={tot_scan['micro_body']}, "
-        f"gate_wick_pass={tot_scan['gate_wick_pass']}, gate_atr_pass={tot_scan['gate_atr_pass']}, gate_vol_pass={tot_scan['gate_vol_pass']}, "
-        f"gate_all_pass={tot_scan['gate_all_pass']}, gate_all_fail={tot_scan['gate_all_fail']}"
+        f"processed={processed_symbols_count}, no_ohlcv={tot_scan['no_ohlcv']}, cooldown={tot_scan['cooldown']}, "
+        f"stale={tot_scan['stale']}, min_price={tot_scan['min_price']}, nan={tot_scan['nan_ind']}, micro={tot_scan['micro_body']}, "
+        f"combos(WA/WV/AV)={tot_scan['pass_WA']}/{tot_scan['pass_WV']}/{tot_scan['pass_AV']}, "
+        f"passed_total(2of3)={total_passed_gate} == sum_chunks={tot_scan['gate_all_pass']}, opened={opened_this_scan}"
     )
     
     if opened_this_scan == 0:
@@ -496,7 +517,7 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
         msg = (f"⚡ <b>Wick-Spike {side} (Score: {trade['Score']:.2f})</b>\n\n"
                f"<b>Пара:</b> {symbol}\n<b>Вход:</b> <code>{format_price(entry_price)}</code>\n"
                f"<b>SL:</b> <code>{format_price(sl)}</code> (-{sl_actual_pct:.2f}%)\n"
-               f"<b>TP:</b> <code>{format_price(tp)}</code> (+<code/>{tp_actual_pct:.2f}%)")
+               f"<b>TP:</b> <code>{format_price(tp)}</code> (+{tp_actual_pct:.2f}%)")
         await bc(app, msg)
 
     await trade_executor.log_open_trade(trade)
