@@ -141,9 +141,14 @@ async def build_range(exchange, symbol: str):
 def compute_indicators_5m(df: pd.DataFrame) -> dict:
     atr5m = ta.atr(df["high"], df["low"], df["close"], length=14).iloc[-1]
     rsi = ta.rsi(df["close"], length=CONFIG.RSI_LEN).iloc[-1]
+    # ИЗМЕНЕНО: Более надежный выбор колонки ADX
     adx_df = ta.adx(df["high"], df["low"], df["close"], length=CONFIG.ADX_LEN)
-    adx_col = adx_df.filter(like=f"ADX_{CONFIG.ADX_LEN}").columns[0]
-    adx = adx_df[adx_col].iloc[-1]
+    adx_cols = adx_df.filter(like=f"ADX_{CONFIG.ADX_LEN}").columns
+    if not adx_cols.empty:
+        adx = adx_df[adx_cols[0]].iloc[-1]
+    else:
+        raise ValueError(f"Could not find ADX column for length {CONFIG.ADX_LEN}")
+
     ema20 = ta.ema(df["close"], length=20).iloc[-1]
     vol_z = (df["volume"].iloc[-1] - df["volume"].rolling(CONFIG.VOL_WIN).mean().iloc[-1]) / \
             max(df["volume"].rolling(CONFIG.VOL_WIN).std().iloc[-1], 1e-9)
@@ -167,7 +172,8 @@ def compute_indicators_5m(df: pd.DataFrame) -> dict:
 # Position State Manager
 # ---------------------------------------------------------------------------
 class Position:
-    def __init__(self, side: str, signal_id: str, leverage: int | None=None, atr_extra: float=0.0):
+    # ИЗМЕНЕНО: Убран неиспользуемый atr_extra
+    def __init__(self, side: str, signal_id: str, leverage: int | None=None):
         self.side = side
         self.signal_id = signal_id
         self.steps_filled = 0
@@ -179,7 +185,6 @@ class Position:
         self.sl_price = None
         self.open_ts = time.time()
         self.leverage = leverage or CONFIG.LEVERAGE
-        self.atr_extra = atr_extra
         self.max_steps = CONFIG.DCA_LEVELS
         self.reserved_one = False
 
@@ -317,10 +322,8 @@ async def scanner_main_loop(app: Application, broadcast):
                 side_cand = "LONG" if pos_in <= 0.30 else ("SHORT" if pos_in >= 0.70 else None)
                 
                 if side_cand:
-                    atr_extra = 0.25 if (pos_in <= 0.20 or pos_in >= 0.80) else 0.0
-                    pos = Position(side_cand, signal_id=f"{symbol.split('/')[0]}_{int(now)}", atr_extra=atr_extra)
+                    pos = Position(side_cand, signal_id=f"{symbol.split('/')[0]}_{int(now)}")
                     pos.plan_margins(bank)
-                    # ИЗМЕНЕНО: Вход + 4 обычных усреднения
                     pos.max_steps = min(5, CONFIG.DCA_LEVELS)
                     pos.reserved_one = False
                     pos.leverage = CONFIG.LEVERAGE
@@ -329,6 +332,9 @@ async def scanner_main_loop(app: Application, broadcast):
                     app.bot_data["position"] = pos
                     
                     liq = approx_liq_price(pos.avg, pos.side, pos.leverage)
+                    dist_to_liq_pct = abs(liq / pos.avg - 1) * 100
+                    liq_arrow = "↓" if pos.side == "LONG" else "↑"
+
                     nxt = pos.next_dca_price(ind["atr5m"])
                     nxt_txt = fmt(nxt)
                     cum_margin = sum(pos.step_margins[:pos.steps_filled])
@@ -341,7 +347,7 @@ async def scanner_main_loop(app: Application, broadcast):
                             f"Вход: <code>{fmt(px)}</code>\n"
                             f"Депозит (старт): <b>{cum_margin:.2f} USDT</b> | Плечо: <b>{pos.leverage}x</b>\n"
                             f"TP: <code>{fmt(pos.tp_price)}</code> (+{CONFIG.TP_PCT*100:.2f}%)\n"
-                            f"Ликвидация≈ <code>{fmt(liq)}</code>\n"
+                            f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_to_liq_pct:+.2f}%)\n"
                             f"След. усреднение по цене: <code>{nxt_txt}</code> (осталось усреднений: {remaining} из 5)"
                         )
                     await trade_executor.bmr_log_event({
@@ -369,6 +375,8 @@ async def scanner_main_loop(app: Application, broadcast):
                             margin, _ = pos.add_step(px)
                             pos.max_steps = pos.steps_filled
                             liq = approx_liq_price(pos.avg, pos.side, pos.leverage)
+                            dist_to_liq_pct = abs(liq / pos.avg - 1) * 100
+                            liq_arrow = "↓" if pos.side == "LONG" else "↑"
                             cum_margin = sum(pos.step_margins[:pos.steps_filled])
                             if bc := app.bot_data.get('broadcast_func'):
                                 await bc(app,
@@ -376,7 +384,7 @@ async def scanner_main_loop(app: Application, broadcast):
                                     f"Цена: <code>{fmt(px)}</code>\n"
                                     f"Добор (резерв): <b>{margin:.2f} USDT</b> | Депозит (текущий): <b>{cum_margin:.2f} USDT</b>\n"
                                     f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
-                                    f"Ликвидация≈ <code>{fmt(liq)}</code>")
+                                    f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_to_liq_pct:+.2f}%)")
                             await trade_executor.bmr_log_event({
                                 "Event_ID": f"RETEST_ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
                                 "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -389,6 +397,8 @@ async def scanner_main_loop(app: Application, broadcast):
                         if nxt and ((pos.side=="LONG" and px <= nxt) or (pos.side=="SHORT" and px >= nxt)):
                             margin, _ = pos.add_step(px)
                             liq = approx_liq_price(pos.avg, pos.side, pos.leverage)
+                            dist_to_liq_pct = abs(liq / pos.avg - 1) * 100
+                            liq_arrow = "↓" if pos.side == "LONG" else "↑"
                             nxt2 = pos.next_dca_price(ind["atr5m"])
                             nxt2_txt = fmt(nxt2)
                             cum_margin = sum(pos.step_margins[:pos.steps_filled])
@@ -400,7 +410,7 @@ async def scanner_main_loop(app: Application, broadcast):
                                     f"Цена: <code>{fmt(px)}</code>\n"
                                     f"Добор: <b>{margin:.2f} USDT</b> | Депозит (текущий): <b>{cum_margin:.2f} USDT</b>\n"
                                     f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
-                                    f"Ликвидация≈ <code>{fmt(liq)}</code>\n"
+                                    f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_to_liq_pct:+.2f}%)\n"
                                     f"След. усреднение по цене: <code>{nxt2_txt}</code> (осталось: {remaining} из 5)")
                             await trade_executor.bmr_log_event({
                                 "Event_ID": f"ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
@@ -442,7 +452,6 @@ async def scanner_main_loop(app: Application, broadcast):
                     reason = "TP_HIT" if tp_hit else "SL_HIT"
                     exit_p = pos.tp_price if tp_hit else pos.sl_price
                     time_min = (time.time()-pos.open_ts)/60.0
-                    # ИЗМЕНЕНО: Корректный расчет P&L для трейлинг-стопа
                     raw_pnl = (exit_p / pos.avg - 1.0) * (1 if pos.side == "LONG" else -1)
                     pnl_pct = raw_pnl * 100 * pos.leverage
                     pnl_usd = sum(pos.step_margins[:pos.steps_filled]) * (pnl_pct/100.0)
