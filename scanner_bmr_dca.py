@@ -17,7 +17,7 @@ log = logging.getLogger("bmr_dca_engine")
 # CONFIG
 # ---------------------------------------------------------------------------
 class CONFIG:
-    SYMBOL = "EURC/USDT:USDT"
+    SYMBOL = "EUR/USDT:USDT"
     TF_ENTRY = "5m"
     TF_RANGE = "1h"
     RANGE_LOOKBACK_DAYS = 90
