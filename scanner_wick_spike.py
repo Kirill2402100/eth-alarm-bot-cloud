@@ -50,8 +50,8 @@ class CONFIG:
     MAX_POSITIONS_PER_SYMBOL = 1
 
     HTF_STRONG_TREND = 1.0
-    BTC_5M_TREND_BLOCK = 0.006 # 0.6%
-    GATE_WICK_RATIO_LONG = 1.6
+    BTC_5M_TREND_BLOCK = 0.006
+    GATE_WICK_RATIO_LONG = 1.7
     GATE_ATR_SPIKE_MAX_LONG = 2.4
 
     ENTRY_TAIL_FRACTION = 0.3
@@ -276,7 +276,13 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         
         opened_syms_in_chunk = set()
         chunk_raw = liquid_rotated[i:i+CONFIG.CHUNK_SIZE]
-        chunk = [s for s in chunk_raw if active_symbol_counts.get(s, 0) < CONFIG.MAX_POSITIONS_PER_SYMBOL]
+        
+        res = bt.get("reserved_symbols", set())
+        chunk = [
+            s for s in chunk_raw
+            if active_symbol_counts.get(s, 0) < CONFIG.MAX_POSITIONS_PER_SYMBOL
+            and s not in res
+        ]
         if len(chunk) < len(chunk_raw):
             tot_chunk["already_active"] += (len(chunk_raw) - len(chunk))
         
@@ -347,8 +353,18 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                     tot_chunk["long_atr_hi_reject"] += 1; continue
             
             pass_wick = (wick_ratio >= CONFIG.GATE_WICK_RATIO)
-            pass_atr  = (CONFIG.GATE_ATR_SPIKE_MULT <= spike_atr_mult <= CONFIG.GATE_ATR_SPIKE_MAX)
-            pass_vol  = (vol_z >= CONFIG.GATE_VOL_Z)
+            
+            # <<< ИЗМЕНЕНО: Исправлена логика мягкого гейта ATR
+            pass_atr = (
+                CONFIG.GATE_ATR_SPIKE_MULT <= spike_atr_mult <= CONFIG.GATE_ATR_SPIKE_MAX
+            ) or (
+                CONFIG.GATE_ATR_SPIKE_MULT * 0.95 <= spike_atr_mult <= CONFIG.GATE_ATR_SPIKE_MAX
+                and wick_ratio >= CONFIG.GATE_WICK_RATIO + 0.3
+            )
+
+            pass_vol_hard = (vol_z >= CONFIG.GATE_VOL_Z)
+            pass_vol_soft = (vol_z >= 0.9 and wick_ratio >= CONFIG.GATE_WICK_RATIO + 0.2)
+            pass_vol = pass_vol_hard or pass_vol_soft
 
             tot_chunk["gate_wick_pass"] += int(pass_wick)
             tot_chunk["gate_atr_pass"]  += int(pass_atr)
@@ -445,19 +461,24 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 if btc_block:
                     tot_chunk["btc_block_reject"] += 1; continue
                 
-                btc_context_bonus = 0.0
-                if side == "LONG" and btc_ret_5m < -0.005: btc_context_bonus = -0.15
-                elif side == "SHORT" and btc_ret_5m > 0.005: btc_context_bonus = -0.15
+                ctr = (side == "LONG" and htf_m5_slope < 0) or (side == "SHORT" and htf_m5_slope > 0)
+                trend_term = (-0.25 * min(abs(htf_m5_slope), 2.0)) if ctr else (0.15 if abs(htf_m5_slope) > 0.3 else 0.0)
+
+                btc_context_penalty = 0.0
+                if side == "LONG" and btc_ret_5m < -0.005: btc_context_penalty = -0.12
+                elif side == "SHORT" and btc_ret_5m > 0.005: btc_context_penalty = -0.12
+
+                dist_penalty = -0.05 if dist_from_mean > 3.0 else 0.0
                 
-                side_penalty = 0.1 if side == "LONG" else 0.0
                 score = (
                     0.60 * min(max(wick_ratio - 1.5, 0), 3.0) +
-                    0.40 * min(max(spike_atr_mult - 1.5, 0), 2.5) -
-                    0.25 * min(abs(htf_m5_slope), 2.0) +
-                    0.10 * btc_context_bonus -
+                    0.40 * min(max(spike_atr_mult - 1.5, 0), 2.5) +
+                    trend_term +
+                    btc_context_penalty +
+                    dist_penalty -
                     htf_penalty +
                     0.10 * max(passes - 2, 0)
-                ) - side_penalty
+                ) - (0.1 if side == "LONG" else 0.0)
                 
                 top_scores.append((symbol, side, round(score,2)))
                 
@@ -538,8 +559,8 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     )
     if all_scores:
         thr = bt.get('score_threshold', CONFIG.SCORE_BASE)
-        best_overall = max(s for _, s in all_scores)
-        p90_score = np.percentile([s for _, s in all_scores], 90)
+        best_overall = max(s for _, s in all_scores) if all_scores else 0
+        p90_score = np.percentile([s for _, s in all_scores], 90) if all_scores else 0
         cnt_ge_thr = sum(
             1 for sd, s in all_scores
             if s >= (thr + 0.10 if sd == "LONG" else thr)
@@ -553,12 +574,13 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         n = len(all_scores)
         old_thr = bt.get('score_threshold', CONFIG.SCORE_BASE)
         if n >= CONFIG.THR_MIN_SAMPLES:
+            scores_only = [s for _, s in all_scores]
             if n < 20:
-                q = float(np.quantile([s for _, s in all_scores], CONFIG.THR_Q_SMALL))
+                q = float(np.quantile(scores_only, CONFIG.THR_Q_SMALL))
             elif n < 50:
-                q = float(np.quantile([s for _, s in all_scores], CONFIG.THR_Q_MED))
+                q = float(np.quantile(scores_only, CONFIG.THR_Q_MED))
             else:
-                q = float(np.quantile([s for _, s in all_scores], CONFIG.THR_Q_MAIN))
+                q = float(np.quantile(scores_only, CONFIG.THR_Q_MAIN))
             target = q + CONFIG.THR_PAD
             target = max(CONFIG.SCORE_MIN, min(CONFIG.SCORE_MAX, target))
             
@@ -579,7 +601,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     log.info(f"Scan finished: opened={opened_this_scan}, thr_now={bt.get('score_threshold', CONFIG.SCORE_BASE):.2f}")
 
 
-# ---------------------------------------------------------------------------
+# ... (Функции _open_trade и _monitor_trades остаются в идеальном состоянии) ...
 async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
     symbol, side, score = candidate['symbol'], candidate['side'], candidate['score']
