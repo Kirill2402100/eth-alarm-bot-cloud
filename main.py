@@ -1,10 +1,9 @@
 import os
 import asyncio
 import logging
-from telegram import Update, constants
+from telegram import Update, constants, BotCommand
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, PicklePersistence
 
-# Импортируем новый движок стратегии
 import scanner_bmr_dca as scanner_engine
 import trade_executor
 
@@ -12,13 +11,22 @@ import trade_executor
 BOT_VERSION = "BMR-DCA EURC v0.1"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# ИЗМЕНЕНО: Проверка наличия токена перед запуском
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN env var is not set")
+
+# ДОБАВЛЕНО: Безопасные дефолты для команды /status
+DEFAULT_BANK_USDT = 1000.0
+DEFAULT_BUFFER_OVER_EDGE = 0.30
 
 log = logging.getLogger("bot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# --- Утилиты ---
+def is_loop_running(app: Application) -> bool:
+    """Проверяет, запущен ли основной цикл сканера."""
+    task = app.bot_data.get('main_loop_task')
+    return task is not None and not task.done()
 
 async def post_init(app: Application):
     """Выполняется после запуска приложения."""
@@ -29,12 +37,14 @@ async def post_init(app: Application):
         app.bot_data['main_loop_task'] = task
 
     await app.bot.set_my_commands([
-        ('start', 'Запустить/перезапустить бота'),
-        ('run', 'Запустить сканер'),
-        ('stop', 'Остановить сканер'),
-        ('status', 'Показать текущий статус и параметры'),
-        ('pause', 'Приостановить поиск новых сигналов'),
-        ('resume', 'Возобновить поиск новых сигналов'),
+        BotCommand("start", "Запустить/перезапустить бота"),
+        BotCommand("run", "Запустить сканер"),
+        BotCommand("stop", "Остановить сканер"),
+        BotCommand("status", "Показать текущий статус и параметры"),
+        BotCommand("pause", "Приостановить поиск новых сигналов"),
+        BotCommand("resume", "Возобновить поиск новых сигналов"),
+        BotCommand("setbank", "Установить общий банк позиции, USDT"),
+        BotCommand("setbuf", "Установить буфер за границей (напр. 0.3 или 30%)"),
     ])
 
 async def broadcast(app: Application, txt: str):
@@ -51,20 +61,18 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     bd = ctx.bot_data
     bd.setdefault('chat_ids', set()).add(chat_id)
-    # ИЗМЕНЕНО: Инициализируем флаги для предсказуемого состояния
     bd.setdefault('run_loop_on_startup', False)
     bd.setdefault('scan_paused', False)
     log.info(f"Пользователь {chat_id} запустил бота.")
     await update.message.reply_text(
-        f"✅ <b>Бот v{BOT_VERSION} запущен.</b>\nИспользуйте /run для запуска сканера.",
+        f"✅ <b>Бот {BOT_VERSION} запущен.</b>\nИспользуйте /run для запуска сканера.",
         parse_mode=constants.ParseMode.HTML
     )
 
 async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /run."""
     app = ctx.application
-    is_running = not (app.bot_data.get('main_loop_task') is None or app.bot_data['main_loop_task'].done())
-    if is_running:
+    if is_loop_running(app):
         await update.message.reply_text("ℹ️ Сканер уже запущен. Для остановки используйте /stop.")
         return
 
@@ -79,44 +87,66 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /stop."""
     app = ctx.application
-    is_running = not (app.bot_data.get('main_loop_task') is None or app.bot_data['main_loop_task'].done())
-    if not is_running:
+    if not is_loop_running(app):
         await update.message.reply_text("ℹ️ Сканер уже остановлен.")
         return
 
     app.bot_data['bot_on'] = False
     if app.bot_data.get('main_loop_task'):
-        app.bot_data['main_loop_task'].cancel()
+        task = app.bot_data['main_loop_task']
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            log.info("Основной цикл успешно остановлен.")
+        app.bot_data['main_loop_task'] = None
+        
     app.bot_data['run_loop_on_startup'] = False
     log.info("Команда /stop: останавливаем основной цикл.")
     await update.message.reply_text("🛑 <b>Сканер остановлен.</b>")
 
 async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Приостанавливает поиск новых сигналов."""
-    is_running = ctx.bot_data.get('bot_on', False)
-    if not is_running:
+    if not is_loop_running(ctx.application):
         await update.message.reply_text("ℹ️ Сканер не запущен, нечего ставить на паузу.")
         return
-
     ctx.bot_data["scan_paused"] = True
     log.info("Команда /pause: поиск новых сигналов приостановлен.")
     await update.message.reply_text("⏸️ <b>Поиск новых сигналов приостановлен.</b>\nСопровождение открытых сделок продолжается. Для возобновления используйте /resume.")
 
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Возобновляет поиск новых сигналов."""
-    is_running = ctx.bot_data.get('bot_on', False)
-    if not is_running:
+    if not is_loop_running(ctx.application):
         await update.message.reply_text("ℹ️ Сканер не запущен.")
         return
-
     ctx.bot_data["scan_paused"] = False
     log.info("Команда /resume: поиск новых сигналов возобновлен.")
     await update.message.reply_text("▶️ <b>Поиск новых сигналов возобновлён.</b>")
 
+async def cmd_setbank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = float(ctx.args[0])
+        if val <= 0: raise ValueError
+        ctx.bot_data["safety_bank_usdt"] = val
+        await update.message.reply_text(f"💰 Банк на позицию установлен: {val:.2f} USDT")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Использование: /setbank 1000")
+
+async def cmd_setbuf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        raw = ctx.args[0].strip().replace('%','')
+        v = float(raw)
+        buf = v/100.0 if v > 1 else v
+        if not (0.0 < buf < 0.9): raise ValueError
+        ctx.bot_data["buffer_over_edge"] = buf
+        await update.message.reply_text(f"🛡️ Буфер за границей установлен: {buf:.2%}")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Использование: /setbuf 0.30 (или 30%)")
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Показывает текущий статус бота и параметры стратегии."""
     bot_data = ctx.bot_data
-    is_running = not (bot_data.get('main_loop_task') is None or bot_data['main_loop_task'].done())
+    is_running = is_loop_running(ctx.application)
     is_paused = bot_data.get("scan_paused", False)
     
     active_position = bot_data.get('position', None)
@@ -126,25 +156,40 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if is_running:
         scanner_status = "⏸️ НА ПАУЗЕ" if is_paused else "⚡️ РАБОТАЕТ"
 
+    # ИЗМЕНЕНО: Весь блок заменен на отказоустойчивый
     position_status = "Нет активной позиции."
-    # ИЗМЕНЕНО: Безопасное форматирование для вывода статуса
     if active_position:
         pos = active_position
         sl_show = f"{pos.sl_price:.6f}" if pos.sl_price is not None else "N/A"
         tp_show = f"{pos.tp_price:.6f}" if getattr(pos, "tp_price", None) else "N/A"
         avg_show = f"{pos.avg:.6f}" if getattr(pos, "avg", None) else "N/A"
 
+        # безопасные значения для max_steps и плеча
+        max_steps = getattr(pos, "max_steps", (len(getattr(pos, "step_margins", [])) or scanner_engine.CONFIG.DCA_LEVELS))
+        lev_show = getattr(pos, "leverage", getattr(scanner_engine.CONFIG, "LEVERAGE", "N/A"))
+
         position_status = (
             f"• <b>Сигнал ID:</b> {pos.signal_id}\n"
             f"• <b>Сторона:</b> {pos.side}\n"
-            f"• <b>Ступеней:</b> {pos.steps_filled} / {cfg.DCA_LEVELS}\n"
+            f"• <b>Плечо:</b> {lev_show}x\n"
+            f"• <b>Ступеней:</b> {pos.steps_filled} / {max_steps}\n"
             f"• <b>Средняя цена:</b> <code>{avg_show}</code>\n"
             f"• <b>TP/SL:</b> <code>{tp_show}</code> / <code>{sl_show}</code>"
         )
-
+    
+    # безопасные дефолты для bank / buffer / step
+    bank = bot_data.get("safety_bank_usdt", getattr(cfg, "SAFETY_BANK_USDT", DEFAULT_BANK_USDT))
+    buf  = bot_data.get("buffer_over_edge", getattr(cfg, "BUFFER_OVER_EDGE", DEFAULT_BUFFER_OVER_EDGE))
+    step = bot_data.get("base_step_margin", getattr(cfg, "BASE_STEP_MARGIN", 10.0))
+    
     msg = (
-        f"<b>Состояние бота v{BOT_VERSION}</b>\n\n"
+        f"<b>Состояние бота {BOT_VERSION}</b>\n\n"
         f"<b>Статус сканера:</b> {scanner_status}\n\n"
+        f"<b><u>Риск/банк:</u></b>\n"
+        f"• Банк позиции: <b>{bank:.2f} USDT</b>\n"
+        f"• Буфер за границей: <b>{buf:.2%}</b>\n"
+        f"• Депозит на шаг: <b>{step:.2f} USDT</b> (неактивно при bank-first)\n"
+        f"• DCA: 4 внутр. + 1 резерв\n\n"
         f"<b><u>Активная позиция:</u></b>\n{position_status}"
     )
 
@@ -161,6 +206,10 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("setbank", cmd_setbank))
+    app.add_handler(CommandHandler("setbuf", cmd_setbuf))
+    # Команда /setstep временно отключена, т.к. логика bank-first ее не использует
+    # app.add_handler(CommandHandler("setstep", cmd_setstep))
 
-    log.info(f"Bot v{BOT_VERSION} starting...")
+    log.info(f"Bot {BOT_VERSION} starting...")
     app.run_polling()
