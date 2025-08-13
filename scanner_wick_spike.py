@@ -43,12 +43,16 @@ class CONFIG:
     GATE_VOL_Z = 1.2
     GATE_BODY_ATR_MIN = 0.03
     GATE_ATR_SPIKE_MAX = 2.5
-    # <<< ИЗМЕНЕНО: Расширяем список исключаемых стейблкоинов
     EXCLUDE_STABLE_BASES = {
         "USDC", "USDT", "BUSD", "FDUSD", "DAI", "TUSD", "USDD", "PYUSD",
         "USDE", "USDP", "GUSD", "USD+", "USDX", "EOSDT"
     }
     MAX_POSITIONS_PER_SYMBOL = 1
+
+    HTF_STRONG_TREND = 1.0
+    BTC_5M_TREND_BLOCK = 0.006 # 0.6%
+    GATE_WICK_RATIO_LONG = 1.7
+    GATE_ATR_SPIKE_MAX_LONG = 2.4
 
     ENTRY_TAIL_FRACTION = 0.3
     SL_PCT = 0.20
@@ -123,6 +127,7 @@ async def scanner_main_loop(app: Application, broadcast):
     app.bot_data.setdefault('last_thr_bump_at', 0)
     app.bot_data.setdefault('last_heartbeat_log', 0)
     app.bot_data.setdefault('stat_no_touch', 0)
+    app.bot_data.setdefault("reserved_symbols", set())
     app.bot_data['broadcast_func'] = broadcast
     if 'score_threshold' not in app.bot_data:
         app.bot_data['score_threshold'] = CONFIG.SCORE_BASE
@@ -177,7 +182,6 @@ async def scanner_main_loop(app: Application, broadcast):
 # ---------------------------------------------------------------------------
 async def _run_scan(exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
-    # <<< ИЗМЕНЕНО: Более надёжная проверка на общее число позиций
     if len(bt.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
         return
     
@@ -276,7 +280,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         if len(chunk) < len(chunk_raw):
             tot_chunk["already_active"] += (len(chunk_raw) - len(chunk))
         
-        # <<< ИЗМЕНЕНО: Офсет сдвигается на размер исходного чанка
         processed_symbols_count += len(chunk_raw)
         
         ohlcv_1m_data = await asyncio.gather(*[fetch_1m_data(s) for s in chunk])
@@ -334,7 +337,15 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             wick_ratio = max(h - max(o, c), min(o, c) - l) / body_safe
             spike_atr_mult = (h - l) / safe_atr
             vol_z = last_vol_z
+            upper_wick = h - max(o, c)
+            side = "SHORT" if upper_wick >= (min(o, c) - l) else "LONG"
 
+            if side == "LONG":
+                if wick_ratio < CONFIG.GATE_WICK_RATIO_LONG:
+                    tot_chunk["long_wick_reject"] += 1; continue
+                if spike_atr_mult > CONFIG.GATE_ATR_SPIKE_MAX_LONG:
+                    tot_chunk["long_atr_hi_reject"] += 1; continue
+            
             pass_wick = (wick_ratio >= CONFIG.GATE_WICK_RATIO)
             pass_atr  = (CONFIG.GATE_ATR_SPIKE_MULT <= spike_atr_mult <= CONFIG.GATE_ATR_SPIKE_MAX)
             pass_vol  = (vol_z >= CONFIG.GATE_VOL_Z)
@@ -423,6 +434,16 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 btc_ret_5m = 0 if (btc_df is None or len(btc_df) < 6) else (btc_df['close'].iloc[-1] / btc_df['close'].iloc[-6] - 1)
                 upper_wick = last['high'] - max(last['open'], c)
                 side = "SHORT" if upper_wick >= (min(last['open'], c) - last['low']) else "LONG"
+
+                strong_ctr = (side == "LONG" and htf_m5_slope < -CONFIG.HTF_STRONG_TREND) or \
+                             (side == "SHORT" and htf_m5_slope > CONFIG.HTF_STRONG_TREND)
+                if strong_ctr:
+                    tot_chunk["strong_ctr_reject"] += 1; continue
+
+                btc_block = (side == "LONG" and btc_ret_5m < -CONFIG.BTC_5M_TREND_BLOCK) or \
+                            (side == "SHORT" and btc_ret_5m > CONFIG.BTC_5M_TREND_BLOCK)
+                if btc_block:
+                    tot_chunk["btc_block_reject"] += 1; continue
                 
                 btc_context_bonus = 0.0
                 if side == "LONG" and btc_ret_5m < -0.005: btc_context_bonus = -0.15
@@ -438,15 +459,22 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                     0.10 * max(passes - 2, 0)
                 ) - side_penalty
                 
-                top_scores.append((symbol, round(score,2)))
+                top_scores.append((symbol, side, round(score,2)))
                 
-                score_threshold = bt.get('score_threshold', CONFIG.SCORE_BASE)
+                final_thr = bt.get('score_threshold', CONFIG.SCORE_BASE)
+                if side == "LONG":
+                    final_thr += 0.10
                 
-                if score >= score_threshold and symbol not in opened_syms_in_chunk:
+                if score >= final_thr and symbol not in opened_syms_in_chunk:
                     if len(bt.get("active_trades", [])) + opened_this_scan >= CONFIG.MAX_CONCURRENT_POSITIONS:
                         log.info(f"Skip open {symbol}: would exceed MAX_CONCURRENT_POSITIONS (reserved).")
                         continue
-
+                    
+                    res = bt.get("reserved_symbols", set())
+                    if symbol in res:
+                        continue
+                    res.add(symbol)
+                    
                     opened_syms_in_chunk.add(symbol)
                     cand = {'symbol': symbol, 'side': side, 'score': score, 
                             'last_ohlc': {'o': last['open'], 'h': last['high'], 'l': last['low'], 'c': c},
@@ -457,12 +485,14 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                     
                     opened_this_scan += 1
                     task = asyncio.create_task(_open_trade(cand, exchange, app))
-                    def _log_open_err(t, sym=cand['symbol']):
+                    
+                    def _cleanup_reservation(t, sym=cand['symbol']):
+                        bt["reserved_symbols"].discard(sym)
                         ex = t.exception()
                         if ex:
                             log.error(f"Error in background open_trade for {sym}",
                                       exc_info=(type(ex), ex, ex.__traceback__))
-                    task.add_done_callback(_log_open_err)
+                    task.add_done_callback(_cleanup_reservation)
 
                     await asyncio.sleep(0) 
 
@@ -482,10 +512,14 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                 log.exception(f"Score calculation for {item.get('symbol')} failed")
         
         if top_scores:
-            all_scores.extend(s for _, s in top_scores)
-            best_score_chunk = max(s for _, s in top_scores)
-            ge_thr_chunk = sum(1 for _, s in top_scores if s >= bt.get('score_threshold', CONFIG.SCORE_BASE))
-            log.info(f"ScoreDiag ch={i//CONFIG.CHUNK_SIZE+1}: best={best_score_chunk:.2f}, >=thr={ge_thr_chunk}/{len(top_scores)} (thr={bt.get('score_threshold', CONFIG.SCORE_BASE):.2f})")
+            all_scores.extend((sd, s) for _, sd, s in top_scores)
+            thr = bt.get('score_threshold', CONFIG.SCORE_BASE)
+            ge_thr_chunk = sum(
+                1 for _, sd, s in top_scores
+                if s >= (thr + 0.10 if sd == "LONG" else thr)
+            )
+            best_score_chunk = max(s for _, _, s in top_scores)
+            log.info(f"ScoreDiag ch={i//CONFIG.CHUNK_SIZE+1}: best={best_score_chunk:.2f}, >=thr={ge_thr_chunk}/{len(top_scores)} (thr={thr:.2f} [+0.1 LONG])")
         
         await asyncio.sleep(0)
     
@@ -495,19 +529,23 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
     log.info(
         "GateDiag scan: "
         f"processed={processed_symbols_count}, no_ohlcv={tot_scan['no_ohlcv']}, cooldown={tot_scan['cooldown']}, "
-        f"already_active={tot_scan['already_active']}, "
-        f"min_price={tot_scan['min_price']}, nan={tot_scan['nan_ind']}, micro={tot_scan['micro_body']}, "
-        f"combos(WA/WV/AV)={tot_scan['pass_WA']}/{tot_scan['pass_WV']}/{tot_scan['pass_AV']}, "
+        f"already_active={tot_scan['already_active']}, min_price={tot_scan['min_price']}, nan={tot_scan['nan_ind']}, "
+        f"micro={tot_scan['micro_body']}, strong_ctr_reject={tot_scan['strong_ctr_reject']}, btc_block_reject={tot_scan['btc_block_reject']}, "
+        f"long_wick_reject={tot_scan['long_wick_reject']}, long_atr_hi_reject={tot_scan['long_atr_hi_reject']}, "
         f"atr_rejects(H/L)={tot_scan['atr_too_high']}/{tot_scan['atr_too_low']}, "
         f"passed_total(ATR_req)={total_passed_gate}, opened={opened_this_scan}, "
         f"no_touch_rejects={bt.get('stat_no_touch',0)}"
     )
     if all_scores:
-        best_overall = max(all_scores)
-        p90_score = np.percentile(all_scores, 90)
-        cnt_ge_thr = sum(1 for s in all_scores if s >= bt.get('score_threshold', CONFIG.SCORE_BASE))
+        thr = bt.get('score_threshold', CONFIG.SCORE_BASE)
+        best_overall = max(s for _, s in all_scores)
+        p90_score = np.percentile([s for _, s in all_scores], 90)
+        cnt_ge_thr = sum(
+            1 for sd, s in all_scores
+            if s >= (thr + 0.10 if sd == "LONG" else thr)
+        )
         log.info(f"ScoreDiag scan: best={best_overall:.2f}, p90={p90_score:.2f} "
-                 f">=thr={cnt_ge_thr}/{len(all_scores)} (thr={bt.get('score_threshold', CONFIG.SCORE_BASE):.2f})")
+                 f">=thr={cnt_ge_thr}/{len(all_scores)} (thr={thr:.2f} [+0.1 LONG])")
 
     bt['stat_no_touch'] = 0
     
@@ -516,11 +554,11 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         old_thr = bt.get('score_threshold', CONFIG.SCORE_BASE)
         if n >= CONFIG.THR_MIN_SAMPLES:
             if n < 20:
-                q = float(np.quantile(all_scores, CONFIG.THR_Q_SMALL))
+                q = float(np.quantile([s for _, s in all_scores], CONFIG.THR_Q_SMALL))
             elif n < 50:
-                q = float(np.quantile(all_scores, CONFIG.THR_Q_MED))
+                q = float(np.quantile([s for _, s in all_scores], CONFIG.THR_Q_MED))
             else:
-                q = float(np.quantile(all_scores, CONFIG.THR_Q_MAIN))
+                q = float(np.quantile([s for _, s in all_scores], CONFIG.THR_Q_MAIN))
             target = q + CONFIG.THR_PAD
             target = max(CONFIG.SCORE_MIN, min(CONFIG.SCORE_MAX, target))
             
@@ -530,11 +568,13 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
             bt['score_threshold'] = new_thr
             log.info(f"Thr(adapt): n={n}, q={q:.2f}, target={target:.2f} → {new_thr:.2f} (old={old_thr:.2f})")
         else:
-            if opened_this_scan == 0:
+            hard_rejects = tot_scan['strong_ctr_reject'] + tot_scan['btc_block_reject'] \
+                         + tot_scan['long_wick_reject'] + tot_scan['long_atr_hi_reject']
+            if opened_this_scan == 0 and hard_rejects < 3:
                 bt['score_threshold'] = max(CONFIG.SCORE_MIN, old_thr - CONFIG.SCORE_ADAPT_STEP)
                 log.info(f"Thr(step-fallback): few samples (n={n}). thr -> {bt['score_threshold']:.2f}")
             else:
-                log.info(f"Thr(step-fallback): few samples (n={n}). keep thr={old_thr:.2f}")
+                log.info(f"Thr(step-fallback): skip lowering (n={n}, hard_rejects={hard_rejects})")
     
     log.info(f"Scan finished: opened={opened_this_scan}, thr_now={bt.get('score_threshold', CONFIG.SCORE_BASE):.2f}")
 
@@ -544,7 +584,6 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
     bt = app.bot_data
     symbol, side, score = candidate['symbol'], candidate['side'], candidate['score']
     
-    # <<< ИЗМЕНЕНО: Проверка на лимит позиций по конкретному символу
     active_cnt = sum(1 for t in bt.get("active_trades", []) if t["Pair"] == symbol and t.get("Status") == "ACTIVE")
     if active_cnt >= CONFIG.MAX_POSITIONS_PER_SYMBOL:
         log.info(f"Skip {symbol}: already have {active_cnt} ACTIVE positions (limit={CONFIG.MAX_POSITIONS_PER_SYMBOL}).")
@@ -564,9 +603,14 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
         return
 
     entry_tail_fraction, take_profit_pct = CONFIG.ENTRY_TAIL_FRACTION, CONFIG.TP_PCT
-    score_threshold = bt.get('score_threshold', CONFIG.SCORE_BASE)
-    if score >= score_threshold + 0.6: entry_tail_fraction = 0.35
-    if score >= score_threshold + 0.8: take_profit_pct = 0.5
+    thr_now = bt.get('score_threshold', CONFIG.SCORE_BASE)
+    
+    adj = 0.05 * min(max(candidate['features']['Wick_Ratio'] - 1.5, 0), 3.0) \
+        + 0.05 * min(max(candidate['features']['Spike_ATR'] - 1.6, 0), 1.0)
+    entry_tail_fraction = max(entry_tail_fraction, min(CONFIG.ENTRY_TAIL_FRACTION + adj, 0.5))
+
+    if score >= thr_now + 0.6: entry_tail_fraction = max(entry_tail_fraction, 0.35)
+    if score >= thr_now + 0.8: take_profit_pct = 0.5
 
     last_ohlc = candidate['last_ohlc']
     o, h, l, c = last_ohlc['o'], last_ohlc['h'], last_ohlc['l'], last_ohlc['c']
@@ -581,7 +625,6 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
     entry_price_q = float(exchange.price_to_precision(symbol, entry_price))
 
     try:
-        # <<< ИЗМЕНЕНО: Возвращаем симметричное окно для "касания"
         tail = (min(o, c) - l) if side == "LONG" else (h - max(o, c))
         safe_atr = max(float(candidate['features'].get('ATR_last', 0)), 1e-9)
         m = exchange.market(symbol)
@@ -629,7 +672,8 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
         "Signal_ID": f"{symbol}_{int(time.time())}", "Pair": symbol, "Side": side,
         "Entry_Price": entry_price_q, "SL_Price": sl, "TP_Price": tp, "Status": "ACTIVE", 
         "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        **candidate['features'], "Score_Threshold": round(score_threshold, 2),
+        **candidate['features'],
+        "Score_Threshold": round(thr_now, 2),
         "Entry_Bar_TS": candidate.get("bar_ts"),
         "MFE_Price": entry_price_q, "MAE_Price": entry_price_q
     }
