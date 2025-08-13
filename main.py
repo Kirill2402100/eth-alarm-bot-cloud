@@ -14,7 +14,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN env var is not set")
 
-# ДОБАВЛЕНО: Безопасные дефолты для команды /status
 DEFAULT_BANK_USDT = 1000.0
 DEFAULT_BUFFER_OVER_EDGE = 0.30
 
@@ -25,7 +24,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # --- Утилиты ---
 def is_loop_running(app: Application) -> bool:
     """Проверяет, запущен ли основной цикл сканера."""
-    task = app.bot_data.get('main_loop_task')
+    # ИЗМЕНЕНО: Читаем атрибут приложения, а не bot_data
+    task = getattr(app, "_main_loop_task", None)
     return task is not None and not task.done()
 
 async def post_init(app: Application):
@@ -34,9 +34,9 @@ async def post_init(app: Application):
     if app.bot_data.get('run_loop_on_startup', False):
         log.info("Обнаружен флаг 'run_loop_on_startup'. Запускаю основной цикл.")
         task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
-        app.bot_data['main_loop_task'] = task
+        # ИЗМЕНЕНО: Сохраняем задачу как атрибут приложения
+        setattr(app, "_main_loop_task", task)
 
-    # ИЗМЕНЕНО: Используем BotCommand и скрываем /setstep
     await app.bot.set_my_commands([
         BotCommand("start", "Запустить/перезапустить бота"),
         BotCommand("run", "Запустить сканер"),
@@ -49,13 +49,19 @@ async def post_init(app: Application):
     ])
 
 async def broadcast(app: Application, txt: str):
-    """Отправляет сообщение всем подписанным пользователям."""
-    chat_ids = app.bot_data.get('chat_ids', set())
-    for cid in chat_ids:
+    """Отправляет сообщение всем подписанным пользователям с очисткой заблокировавших."""
+    chat_ids = set(app.bot_data.get('chat_ids', set()))
+    # ИЗМЕНЕНО: Итерируемся по копии, чтобы безопасно удалять элементы
+    for cid in list(chat_ids):
         try:
             await app.bot.send_message(chat_id=cid, text=txt, parse_mode=constants.ParseMode.HTML)
         except Exception as e:
             log.error(f"Не удалось отправить сообщение в чат {cid}: {e}")
+            # Опционально: удаляем пользователя, который заблокировал бота
+            if "bot was blocked" in str(e):
+                chat_ids.discard(cid)
+                log.info(f"Чат {cid} удален из списка рассылки (бот заблокирован).")
+    app.bot_data['chat_ids'] = chat_ids
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start."""
@@ -65,7 +71,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bd.setdefault('run_loop_on_startup', False)
     bd.setdefault('scan_paused', False)
     log.info(f"Пользователь {chat_id} запустил бота.")
-    # ИЗМЕНЕНО: Убрана лишняя 'v'
     await update.message.reply_text(
         f"✅ <b>Бот {BOT_VERSION} запущен.</b>\nИспользуйте /run для запуска сканера.",
         parse_mode=constants.ParseMode.HTML
@@ -82,10 +87,10 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     app.bot_data['run_loop_on_startup'] = True
     app.bot_data['scan_paused'] = False
     log.info("Команда /run: запускаем основной цикл.")
-    # ИЗМЕНЕНО: Добавлен parse_mode=HTML
-    await update.message.reply_text("🚀 <b>Запускаю сканер...</b>", parse_mode=constants.ParseMode.HTML)
     task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
-    app.bot_data['main_loop_task'] = task
+    # ИЗМЕНЕНО: Сохраняем задачу как атрибут приложения
+    setattr(app, "_main_loop_task", task)
+    await update.message.reply_text("🚀 <b>Запускаю сканер...</b>", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /stop."""
@@ -95,19 +100,19 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     app.bot_data['bot_on'] = False
-    # ИЗМЕНЕНО: Аккуратное завершение цикла
-    if app.bot_data.get('main_loop_task'):
-        task = app.bot_data['main_loop_task']
+    # ИЗМЕНЕНО: Читаем атрибут приложения и аккуратно завершаем
+    task = getattr(app, "_main_loop_task", None)
+    if task:
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             log.info("Основной цикл успешно остановлен.")
-        app.bot_data['main_loop_task'] = None
+        setattr(app, "_main_loop_task", None)
         
     app.bot_data['run_loop_on_startup'] = False
     log.info("Команда /stop: останавливаем основной цикл.")
-    await update.message.reply_text("🛑 <b>Сканер остановлен.</b>")
+    await update.message.reply_text("🛑 <b>Сканер остановлен.</b>", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Приостанавливает поиск новых сигналов."""
@@ -116,7 +121,7 @@ async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     ctx.bot_data["scan_paused"] = True
     log.info("Команда /pause: поиск новых сигналов приостановлен.")
-    await update.message.reply_text("⏸️ <b>Поиск новых сигналов приостановлен.</b>\nСопровождение открытых сделок продолжается. Для возобновления используйте /resume.")
+    await update.message.reply_text("⏸️ <b>Поиск новых сигналов приостановлен.</b>\nСопровождение открытых сделок продолжается. Для возобновления используйте /resume.", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Возобновляет поиск новых сигналов."""
@@ -125,7 +130,7 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     ctx.bot_data["scan_paused"] = False
     log.info("Команда /resume: поиск новых сигналов возобновлен.")
-    await update.message.reply_text("▶️ <b>Поиск новых сигналов возобновлён.</b>")
+    await update.message.reply_text("▶️ <b>Поиск новых сигналов возобновлён.</b>", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_setbank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
@@ -170,7 +175,6 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         max_steps = getattr(pos, "max_steps", (len(getattr(pos, "step_margins", [])) or scanner_engine.CONFIG.DCA_LEVELS))
         lev_show = getattr(pos, "leverage", getattr(scanner_engine.CONFIG, "LEVERAGE", "N/A"))
         
-        # ИЗМЕНЕНО: Добавлена расширенная информация о резерве
         reserved = getattr(pos, "reserved_one", False)
         remaining = max(0, getattr(pos, "max_steps", 0) - getattr(pos, "steps_filled", 0))
         
@@ -194,7 +198,6 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"<b>Статус сканера:</b> {scanner_status}\n\n"
         f"<b><u>Риск/банк:</u></b>\n"
         f"• Банк позиции: <b>{bank:.2f} USDT</b>\n"
-        # ИЗМЕНЕНО: Уточнено, что буфер не используется
         f"• Буфер за границей: <b>{buf:.2%}</b> (неактивно в MARGIN-режиме)\n"
         f"• Депозит на шаг: <b>{step:.2f} USDT</b> (неактивно при bank-first)\n"
         f"• DCA: 4 внутр. + 1 резерв\n\n"
@@ -205,7 +208,6 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 if __name__ == "__main__":
-    # ИЗМЕНЕНО: Убран лишний аргумент для совместимости с PTB v20+
     persistence = PicklePersistence(filepath="bot_persistence")
     app = ApplicationBuilder().token(BOT_TOKEN).persistence(persistence).post_init(post_init).build()
 
@@ -217,8 +219,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("setbank", cmd_setbank))
     app.add_handler(CommandHandler("setbuf", cmd_setbuf))
-    # Команда /setstep временно отключена
-    # app.add_handler(CommandHandler("setstep", cmd_setstep))
 
     log.info(f"Bot {BOT_VERSION} starting...")
     app.run_polling()
