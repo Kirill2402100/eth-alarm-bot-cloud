@@ -36,6 +36,7 @@ async def post_init(app: Application):
         task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
         app.bot_data['main_loop_task'] = task
 
+    # ИЗМЕНЕНО: Используем BotCommand и скрываем /setstep
     await app.bot.set_my_commands([
         BotCommand("start", "Запустить/перезапустить бота"),
         BotCommand("run", "Запустить сканер"),
@@ -64,6 +65,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     bd.setdefault('run_loop_on_startup', False)
     bd.setdefault('scan_paused', False)
     log.info(f"Пользователь {chat_id} запустил бота.")
+    # ИЗМЕНЕНО: Убрана лишняя 'v'
     await update.message.reply_text(
         f"✅ <b>Бот {BOT_VERSION} запущен.</b>\nИспользуйте /run для запуска сканера.",
         parse_mode=constants.ParseMode.HTML
@@ -80,7 +82,8 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     app.bot_data['run_loop_on_startup'] = True
     app.bot_data['scan_paused'] = False
     log.info("Команда /run: запускаем основной цикл.")
-    await update.message.reply_text("🚀 <b>Запускаю сканер...</b>")
+    # ИЗМЕНЕНО: Добавлен parse_mode=HTML
+    await update.message.reply_text("🚀 <b>Запускаю сканер...</b>", parse_mode=constants.ParseMode.HTML)
     task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
     app.bot_data['main_loop_task'] = task
 
@@ -92,6 +95,7 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     app.bot_data['bot_on'] = False
+    # ИЗМЕНЕНО: Аккуратное завершение цикла
     if app.bot_data.get('main_loop_task'):
         task = app.bot_data['main_loop_task']
         task.cancel()
@@ -156,7 +160,6 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if is_running:
         scanner_status = "⏸️ НА ПАУЗЕ" if is_paused else "⚡️ РАБОТАЕТ"
 
-    # ИЗМЕНЕНО: Весь блок заменен на отказоустойчивый
     position_status = "Нет активной позиции."
     if active_position:
         pos = active_position
@@ -164,20 +167,24 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tp_show = f"{pos.tp_price:.6f}" if getattr(pos, "tp_price", None) else "N/A"
         avg_show = f"{pos.avg:.6f}" if getattr(pos, "avg", None) else "N/A"
 
-        # безопасные значения для max_steps и плеча
         max_steps = getattr(pos, "max_steps", (len(getattr(pos, "step_margins", [])) or scanner_engine.CONFIG.DCA_LEVELS))
         lev_show = getattr(pos, "leverage", getattr(scanner_engine.CONFIG, "LEVERAGE", "N/A"))
-
+        
+        # ИЗМЕНЕНО: Добавлена расширенная информация о резерве
+        reserved = getattr(pos, "reserved_one", False)
+        remaining = max(0, getattr(pos, "max_steps", 0) - getattr(pos, "steps_filled", 0))
+        
         position_status = (
             f"• <b>Сигнал ID:</b> {pos.signal_id}\n"
             f"• <b>Сторона:</b> {pos.side}\n"
             f"• <b>Плечо:</b> {lev_show}x\n"
             f"• <b>Ступеней:</b> {pos.steps_filled} / {max_steps}\n"
             f"• <b>Средняя цена:</b> <code>{avg_show}</code>\n"
-            f"• <b>TP/SL:</b> <code>{tp_show}</code> / <code>{sl_show}</code>"
+            f"• <b>TP/SL:</b> <code>{tp_show}</code> / <code>{sl_show}</code>\n"
+            f"• <b>Резерв активирован:</b> {'Да' if reserved else 'Нет'}\n"
+            f"• <b>Осталось (обычных | резерв):</b> {remaining if not reserved else 0} | {1 if reserved and remaining > 0 else (1 if not reserved else 0)}"
         )
     
-    # безопасные дефолты для bank / buffer / step
     bank = bot_data.get("safety_bank_usdt", getattr(cfg, "SAFETY_BANK_USDT", DEFAULT_BANK_USDT))
     buf  = bot_data.get("buffer_over_edge", getattr(cfg, "BUFFER_OVER_EDGE", DEFAULT_BUFFER_OVER_EDGE))
     step = bot_data.get("base_step_margin", getattr(cfg, "BASE_STEP_MARGIN", 10.0))
@@ -187,7 +194,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"<b>Статус сканера:</b> {scanner_status}\n\n"
         f"<b><u>Риск/банк:</u></b>\n"
         f"• Банк позиции: <b>{bank:.2f} USDT</b>\n"
-        f"• Буфер за границей: <b>{buf:.2%}</b>\n"
+        # ИЗМЕНЕНО: Уточнено, что буфер не используется
+        f"• Буфер за границей: <b>{buf:.2%}</b> (неактивно в MARGIN-режиме)\n"
         f"• Депозит на шаг: <b>{step:.2f} USDT</b> (неактивно при bank-first)\n"
         f"• DCA: 4 внутр. + 1 резерв\n\n"
         f"<b><u>Активная позиция:</u></b>\n{position_status}"
@@ -197,7 +205,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 if __name__ == "__main__":
-    persistence = PicklePersistence(filepath="bot_persistence")
+    # ИЗМЕНЕНО: Явно включаем сохранение bot_data
+    persistence = PicklePersistence(filepath="bot_persistence", store_bot_data=True)
     app = ApplicationBuilder().token(BOT_TOKEN).persistence(persistence).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -208,7 +217,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("setbank", cmd_setbank))
     app.add_handler(CommandHandler("setbuf", cmd_setbuf))
-    # Команда /setstep временно отключена, т.к. логика bank-first ее не использует
+    # Команда /setstep временно отключена
     # app.add_handler(CommandHandler("setstep", cmd_setstep))
 
     log.info(f"Bot {BOT_VERSION} starting...")
