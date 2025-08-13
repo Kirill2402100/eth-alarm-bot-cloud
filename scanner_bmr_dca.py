@@ -53,6 +53,8 @@ class CONFIG:
     MAX_LEVERAGE = 50
     BREAK_EPS = 0.0025
     REENTRY_BAND = 0.003
+    MAINT_MMR = 0.004
+    LIQ_FEE_BUFFER = 1.0
 
 assert len(CONFIG.ATR_MULTS) >= CONFIG.DCA_LEVELS, "ATR_MULTS must cover all DCA levels"
 
@@ -60,7 +62,7 @@ assert len(CONFIG.ATR_MULTS) >= CONFIG.DCA_LEVELS, "ATR_MULTS must cover all DCA
 # Helper Functions
 # ---------------------------------------------------------------------------
 def fmt(p: float) -> str:
-    if p is None: return "N/A"
+    if p is None or pd.isna(p): return "N/A"
     if p < 0.01: return f"{p:.6f}"
     if p < 1.0:  return f"{p:.5f}"
     return f"{p:.4f}"
@@ -73,12 +75,22 @@ def plan_margins_bank_first(bank: float, levels: int, growth: float) -> list[flo
     base = bank * (growth - 1.0) / (growth**levels - 1.0)
     return [base * (growth**i) for i in range(levels)]
 
-def approx_liq_price(avg: float, side: str, lev: int) -> float:
-    k = 1.0 / max(lev, 1)
+def approx_liq_price_cross(avg: float, side: str, qty: float, equity: float, mmr: float, fees_paid: float = 0.0) -> float:
+    if qty <= 0 or equity <= 0:
+        return float('nan')
+    eq = max(0.0, equity - fees_paid)
     if side == "LONG":
-        return avg * (1.0 - k)
+        denom = max(qty * (1.0 - mmr), 1e-12)
+        return (avg * qty - eq) / denom
     else:
-        return avg * (1.0 + k)
+        denom = max(qty * (1.0 + mmr), 1e-12)
+        return (avg * qty + eq) / denom
+
+# ДОБАВЛЕНО: Хелпер для расчета дистанции до ликвидации в %
+def liq_distance_pct(side: str, px: float, liq: float) -> float:
+    if px is None or liq is None or px <= 0 or np.isnan(liq):
+        return float('nan')
+    return (liq / px - 1.0) * 100 if side == "SHORT" else (1.0 - liq / px) * 100
 
 def trend_reversal_confirmed(side: str, ind: dict) -> bool:
     return (side=="SHORT" and ind["supertrend"] in ("up_to_down_near","down")) or \
@@ -141,10 +153,10 @@ async def build_range(exchange, symbol: str):
 def compute_indicators_5m(df: pd.DataFrame) -> dict:
     atr5m = ta.atr(df["high"], df["low"], df["close"], length=14).iloc[-1]
     rsi = ta.rsi(df["close"], length=CONFIG.RSI_LEN).iloc[-1]
-    # ИЗМЕНЕНО: Более надежный выбор колонки ADX
+    # ИЗМЕНЕНО: Исправлена опечатка и сделан более надежный выбор колонки
     adx_df = ta.adx(df["high"], df["low"], df["close"], length=CONFIG.ADX_LEN)
     adx_cols = adx_df.filter(like=f"ADX_{CONFIG.ADX_LEN}").columns
-    if not adx_cols.empty:
+    if len(adx_cols) > 0:
         adx = adx_df[adx_cols[0]].iloc[-1]
     else:
         raise ValueError(f"Could not find ADX column for length {CONFIG.ADX_LEN}")
@@ -172,7 +184,6 @@ def compute_indicators_5m(df: pd.DataFrame) -> dict:
 # Position State Manager
 # ---------------------------------------------------------------------------
 class Position:
-    # ИЗМЕНЕНО: Убран неиспользуемый atr_extra
     def __init__(self, side: str, signal_id: str, leverage: int | None=None):
         self.side = side
         self.signal_id = signal_id
@@ -331,14 +342,18 @@ async def scanner_main_loop(app: Application, broadcast):
                     margin, _ = pos.add_step(px)
                     app.bot_data["position"] = pos
                     
-                    liq = approx_liq_price(pos.avg, pos.side, pos.leverage)
-                    dist_to_liq_pct = abs(liq / pos.avg - 1) * 100
+                    cum_margin = sum(pos.step_margins[:pos.steps_filled])
+                    cum_notional = cum_margin * pos.leverage
+                    fees_paid_est = cum_notional * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
+                    liq = approx_liq_price_cross(
+                        avg=pos.avg, side=pos.side, qty=pos.qty,
+                        equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
+                    )
+                    dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
                     liq_arrow = "↓" if pos.side == "LONG" else "↑"
 
                     nxt = pos.next_dca_price(ind["atr5m"])
                     nxt_txt = fmt(nxt)
-                    cum_margin = sum(pos.step_margins[:pos.steps_filled])
-                    fee_est = margin * pos.leverage * CONFIG.FEE_TAKER
                     remaining = pos.max_steps - pos.steps_filled
 
                     if bc := app.bot_data.get('broadcast_func'):
@@ -347,7 +362,7 @@ async def scanner_main_loop(app: Application, broadcast):
                             f"Вход: <code>{fmt(px)}</code>\n"
                             f"Депозит (старт): <b>{cum_margin:.2f} USDT</b> | Плечо: <b>{pos.leverage}x</b>\n"
                             f"TP: <code>{fmt(pos.tp_price)}</code> (+{CONFIG.TP_PCT*100:.2f}%)\n"
-                            f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_to_liq_pct:+.2f}%)\n"
+                            f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_to_liq_pct:.2f}%)\n"
                             f"След. усреднение по цене: <code>{nxt_txt}</code> (осталось усреднений: {remaining} из 5)"
                         )
                     await trade_executor.bmr_log_event({
@@ -359,7 +374,7 @@ async def scanner_main_loop(app: Application, broadcast):
                         "TP_Pct": CONFIG.TP_PCT, "TP_Price": pos.tp_price, "Liq_Est_Price": liq,
                         "Next_DCA_Price": nxt or "",
                         "Fee_Rate_Maker": CONFIG.FEE_MAKER, "Fee_Rate_Taker": CONFIG.FEE_TAKER,
-                        "Fee_Est_USDT": fee_est, "ATR_5m": ind["atr5m"], "ATR_1h": rng["atr1h"],
+                        "Fee_Est_USDT": fees_paid_est / CONFIG.LIQ_FEE_BUFFER, "ATR_5m": ind["atr5m"], "ATR_1h": rng["atr1h"],
                         "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
                         "Range_Lower": rng["lower"], "Range_Upper": rng["upper"], "Range_Width": rng["width"]
                     })
@@ -374,17 +389,22 @@ async def scanner_main_loop(app: Application, broadcast):
                         if need_retest and can_add and trend_reversal_confirmed(pos.side, ind):
                             margin, _ = pos.add_step(px)
                             pos.max_steps = pos.steps_filled
-                            liq = approx_liq_price(pos.avg, pos.side, pos.leverage)
-                            dist_to_liq_pct = abs(liq / pos.avg - 1) * 100
-                            liq_arrow = "↓" if pos.side == "LONG" else "↑"
                             cum_margin = sum(pos.step_margins[:pos.steps_filled])
+                            cum_notional = cum_margin * pos.leverage
+                            fees_paid_est = cum_notional * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
+                            liq = approx_liq_price_cross(
+                                avg=pos.avg, side=pos.side, qty=pos.qty,
+                                equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
+                            )
+                            dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
+                            liq_arrow = "↓" if pos.side == "LONG" else "↑"
                             if bc := app.bot_data.get('broadcast_func'):
                                 await bc(app,
                                     f"↩️ Ретест — резервный добор\n"
                                     f"Цена: <code>{fmt(px)}</code>\n"
                                     f"Добор (резерв): <b>{margin:.2f} USDT</b> | Депозит (текущий): <b>{cum_margin:.2f} USDT</b>\n"
                                     f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
-                                    f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_to_liq_pct:+.2f}%)")
+                                    f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_to_liq_pct:.2f}%)")
                             await trade_executor.bmr_log_event({
                                 "Event_ID": f"RETEST_ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
                                 "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -396,13 +416,17 @@ async def scanner_main_loop(app: Application, broadcast):
                         nxt = pos.next_dca_price(ind["atr5m"])
                         if nxt and ((pos.side=="LONG" and px <= nxt) or (pos.side=="SHORT" and px >= nxt)):
                             margin, _ = pos.add_step(px)
-                            liq = approx_liq_price(pos.avg, pos.side, pos.leverage)
-                            dist_to_liq_pct = abs(liq / pos.avg - 1) * 100
+                            cum_margin = sum(pos.step_margins[:pos.steps_filled])
+                            cum_notional = cum_margin * pos.leverage
+                            fees_paid_est = cum_notional * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
+                            liq = approx_liq_price_cross(
+                                avg=pos.avg, side=pos.side, qty=pos.qty,
+                                equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
+                            )
+                            dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
                             liq_arrow = "↓" if pos.side == "LONG" else "↑"
                             nxt2 = pos.next_dca_price(ind["atr5m"])
                             nxt2_txt = fmt(nxt2)
-                            cum_margin = sum(pos.step_margins[:pos.steps_filled])
-                            fee_est = margin * pos.leverage * CONFIG.FEE_TAKER
                             remaining = pos.max_steps - pos.steps_filled
                             if bc := app.bot_data.get('broadcast_func'):
                                 await bc(app,
@@ -410,7 +434,7 @@ async def scanner_main_loop(app: Application, broadcast):
                                     f"Цена: <code>{fmt(px)}</code>\n"
                                     f"Добор: <b>{margin:.2f} USDT</b> | Депозит (текущий): <b>{cum_margin:.2f} USDT</b>\n"
                                     f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
-                                    f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_to_liq_pct:+.2f}%)\n"
+                                    f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_to_liq_pct:.2f}%)\n"
                                     f"След. усреднение по цене: <code>{nxt2_txt}</code> (осталось: {remaining} из 5)")
                             await trade_executor.bmr_log_event({
                                 "Event_ID": f"ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
@@ -421,7 +445,7 @@ async def scanner_main_loop(app: Application, broadcast):
                                 "TP_Price": pos.tp_price, "SL_Price": pos.sl_price or "",
                                 "Liq_Est_Price": liq, "Next_DCA_Price": nxt2 or "",
                                 "Fee_Rate_Maker": CONFIG.FEE_MAKER, "Fee_Rate_Taker": CONFIG.FEE_TAKER,
-                                "Fee_Est_USDT": fee_est, "ATR_5m": ind["atr5m"], "ATR_1h": rng["atr1h"],
+                                "Fee_Est_USDT": fees_paid_est / CONFIG.LIQ_FEE_BUFFER, "ATR_5m": ind["atr5m"], "ATR_1h": rng["atr1h"],
                                 "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
                                 "Range_Lower": rng["lower"], "Range_Upper": rng["upper"], "Range_Width": rng["width"]
                             })
