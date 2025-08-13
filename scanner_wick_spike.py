@@ -43,15 +43,17 @@ class CONFIG:
     GATE_VOL_Z = 1.2
     GATE_BODY_ATR_MIN = 0.03
     GATE_ATR_SPIKE_MAX = 2.5
+    # <<< ИЗМЕНЕНО: Добавляем XAUT в список исключений
     EXCLUDE_STABLE_BASES = {
         "USDC", "USDT", "BUSD", "FDUSD", "DAI", "TUSD", "USDD", "PYUSD",
-        "USDE", "USDP", "GUSD", "USD+", "USDX", "EOSDT"
+        "USDE", "USDP", "GUSD", "USD+", "USDX", "EOSDT", "XAUT"
     }
     MAX_POSITIONS_PER_SYMBOL = 1
 
     HTF_STRONG_TREND = 1.0
     BTC_5M_TREND_BLOCK = 0.006
-    GATE_WICK_RATIO_LONG = 1.7
+    # <<< ИЗМЕНЕНО: Смягчаем гейт для лонгов
+    GATE_WICK_RATIO_LONG = 1.6
     GATE_ATR_SPIKE_MAX_LONG = 2.4
 
     ENTRY_TAIL_FRACTION = 0.3
@@ -186,8 +188,11 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         return
     
     active_symbol_counts = Counter(t["Pair"] for t in bt.get("active_trades", []) if t.get("Status") == "ACTIVE")
-        
-    opened_this_scan = 0
+    
+    # <<< ИЗМЕНЕНО: Инициализация раздельных счётчиков
+    bt['open_attempts'] = 0
+    bt['open_success'] = 0
+    
     total_passed_gate = 0
     all_scores = []
 
@@ -353,8 +358,6 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                     tot_chunk["long_atr_hi_reject"] += 1; continue
             
             pass_wick = (wick_ratio >= CONFIG.GATE_WICK_RATIO)
-            
-            # <<< ИЗМЕНЕНО: Исправлена логика мягкого гейта ATR
             pass_atr = (
                 CONFIG.GATE_ATR_SPIKE_MULT <= spike_atr_mult <= CONFIG.GATE_ATR_SPIKE_MAX
             ) or (
@@ -487,7 +490,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                     final_thr += 0.10
                 
                 if score >= final_thr and symbol not in opened_syms_in_chunk:
-                    if len(bt.get("active_trades", [])) + opened_this_scan >= CONFIG.MAX_CONCURRENT_POSITIONS:
+                    if len(bt.get("active_trades", [])) + bt.get('open_attempts', 0) >= CONFIG.MAX_CONCURRENT_POSITIONS:
                         log.info(f"Skip open {symbol}: would exceed MAX_CONCURRENT_POSITIONS (reserved).")
                         continue
                     
@@ -504,7 +507,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
                                          'Vol_Z': round(vol_z, 2), 'Dist_Mean': round(dist_from_mean, 2), 'HTF_Slope': round(htf_m5_slope, 2), 
                                          'BTC_5m': round(btc_ret_5m * 100, 3), 'ATR_last': last_atr}}
                     
-                    opened_this_scan += 1
+                    bt['open_attempts'] = bt.get('open_attempts', 0) + 1
                     task = asyncio.create_task(_open_trade(cand, exchange, app))
                     
                     def _cleanup_reservation(t, sym=cand['symbol']):
@@ -517,13 +520,13 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
 
                     await asyncio.sleep(0) 
 
-                    if opened_this_scan >= CONFIG.MAX_TRADES_PER_SCAN:
+                    if bt.get('open_attempts', 0) >= CONFIG.MAX_TRADES_PER_SCAN:
                         if time.time() - bt.get('last_thr_bump_at', 0) > 10:
                             bt['score_threshold'] = min(CONFIG.SCORE_MAX, bt.get('score_threshold', CONFIG.SCORE_BASE) + (CONFIG.SCORE_ADAPT_STEP / 2))
                             bt['last_thr_bump_at'] = time.time()
-                            log.info(f"Early stop & thr bump: opened {opened_this_scan} trades; thr -> {bt['score_threshold']:.2f}")
+                            log.info(f"Early stop & thr bump: opened {bt.get('open_attempts', 0)} trades; thr -> {bt['score_threshold']:.2f}")
                         else:
-                            log.info(f"Early stop: opened {opened_this_scan} trades; threshold bump skipped due to anti-jitter.")
+                            log.info(f"Early stop: opened {bt.get('open_attempts', 0)} trades; threshold bump skipped due to anti-jitter.")
                         
                         if len(liquid) > 0:
                             bt["scan_offset"] = (offset + processed_symbols_count) % len(liquid)
@@ -554,7 +557,7 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         f"micro={tot_scan['micro_body']}, strong_ctr_reject={tot_scan['strong_ctr_reject']}, btc_block_reject={tot_scan['btc_block_reject']}, "
         f"long_wick_reject={tot_scan['long_wick_reject']}, long_atr_hi_reject={tot_scan['long_atr_hi_reject']}, "
         f"atr_rejects(H/L)={tot_scan['atr_too_high']}/{tot_scan['atr_too_low']}, "
-        f"passed_total(ATR_req)={total_passed_gate}, opened={opened_this_scan}, "
+        f"passed_total(ATR_req)={total_passed_gate}, "
         f"no_touch_rejects={bt.get('stat_no_touch',0)}"
     )
     if all_scores:
@@ -592,16 +595,16 @@ async def _run_scan(exchange: ccxt.Exchange, app: Application):
         else:
             hard_rejects = tot_scan['strong_ctr_reject'] + tot_scan['btc_block_reject'] \
                          + tot_scan['long_wick_reject'] + tot_scan['long_atr_hi_reject']
-            if opened_this_scan == 0 and hard_rejects < 3:
+            if bt.get('open_success', 0) == 0 and hard_rejects < 3:
                 bt['score_threshold'] = max(CONFIG.SCORE_MIN, old_thr - CONFIG.SCORE_ADAPT_STEP)
                 log.info(f"Thr(step-fallback): few samples (n={n}). thr -> {bt['score_threshold']:.2f}")
             else:
                 log.info(f"Thr(step-fallback): skip lowering (n={n}, hard_rejects={hard_rejects})")
     
-    log.info(f"Scan finished: opened={opened_this_scan}, thr_now={bt.get('score_threshold', CONFIG.SCORE_BASE):.2f}")
+    log.info(f"Scan finished: attempts={bt.get('open_attempts',0)}, effective={bt.get('open_success',0)}, thr_now={bt.get('score_threshold', CONFIG.SCORE_BASE):.2f}")
 
 
-# ... (Функции _open_trade и _monitor_trades остаются в идеальном состоянии) ...
+# ---------------------------------------------------------------------------
 async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application):
     bt = app.bot_data
     symbol, side, score = candidate['symbol'], candidate['side'], candidate['score']
@@ -653,7 +656,18 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
         min_tick = (((m.get('limits') or {}).get('price') or {}).get('min')) or 0.0
 
         tol_abs = max(min_tick * 1.1, 0.10 * tail, 0.10 * safe_atr)
-        touch_tol_pct = max(0.03, min(0.30, (tol_abs / entry_price_q * 100) if entry_price_q > 0 else 0))
+        
+        atr_rel = safe_atr / max(entry_price_q, 1e-9)
+        base_min_pct = 0.03
+        if entry_price_q < 0.05:
+            base_min_pct = 0.15
+        elif atr_rel < 0.004:
+            base_min_pct = 0.10
+
+        touch_tol_pct = max(
+            base_min_pct,
+            min(0.30, (tol_abs / entry_price_q * 100) if entry_price_q > 0 else 0)
+        )
 
         tk = await exchange.fetch_ticker(symbol)
         last_px = tk.get('last') or tk.get('close') or ((tk.get('bid', 0) + tk.get('ask', 0)) / 2)
@@ -700,6 +714,8 @@ async def _open_trade(candidate: dict, exchange: ccxt.Exchange, app: Application
         "MFE_Price": entry_price_q, "MAE_Price": entry_price_q
     }
     bt.setdefault("active_trades", []).append(trade)
+    bt['open_success'] = bt.get('open_success', 0) + 1
+    
     bt["symbol_cooldown"][symbol] = time.time() + CONFIG.SYMBOL_COOLDOWN_SEC
     log.info(f"Opened {side} {symbol} @ {entry_price_q} with score {trade['Score']:.2f}. Cooldown until {datetime.fromtimestamp(bt['symbol_cooldown'][symbol]).strftime('%H:%M:%S')}")
 
