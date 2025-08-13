@@ -21,7 +21,6 @@ class CONFIG:
     SYMBOL = "EURC/USDT:USDT"
     TF_ENTRY = "5m"
     TF_RANGE = "1h"
-    # ИЗМЕНЕНО: Уменьшена нагрузка
     RANGE_LOOKBACK_DAYS = 60
     FETCH_TIMEOUT = 15
     BASE_STEP_MARGIN = 10.0
@@ -47,6 +46,15 @@ class CONFIG:
     TRAIL_LOCK = 0.6
     SCAN_INTERVAL_SEC = 3
     REBUILD_RANGE_EVERY_MIN = 15
+    SAFETY_BANK_USDT = 1000.0
+    BUFFER_OVER_EDGE = 0.30
+    AUTO_LEVERAGE = True
+    MIN_LEVERAGE = 2
+    MAX_LEVERAGE = 50
+    BREAK_EPS = 0.0025
+    REENTRY_BAND = 0.003
+
+assert len(CONFIG.ATR_MULTS) >= CONFIG.DCA_LEVELS, "ATR_MULTS must cover all DCA levels"
 
 # ---------------------------------------------------------------------------
 # Helper Functions
@@ -57,6 +65,45 @@ def fmt(p: float) -> str:
     if p < 1.0:  return f"{p:.5f}"
     return f"{p:.4f}"
 
+def plan_margins_bank_first(bank: float, levels: int, growth: float) -> list[float]:
+    if levels <= 0 or bank <= 0: return []
+    if abs(growth - 1.0) < 1e-9:
+        per = bank / levels
+        return [per] * levels
+    base = bank * (growth - 1.0) / (growth**levels - 1.0)
+    return [base * (growth**i) for i in range(levels)]
+
+def planned_grid_prices(side: str, p0: float, atr: float, atr_mults: list[float], atr_extra: float=0.0) -> list[float]:
+    offs = [(m + atr_extra) * atr for m in atr_mults]
+    return [p0] + ([p0 + o for o in offs] if side=="SHORT" else [p0 - o for o in offs])
+
+def avg_after_full_grid(prices: list[float], margins: list[float]) -> float:
+    n = min(len(prices), len(margins))
+    num = sum(margins[:n])
+    den = sum(margins[i] / max(prices[i], 1e-9) for i in range(n))
+    return num / max(den, 1e-12)
+
+def lev_from_buffer_short(avg_full: float, upper: float, buf: float) -> int:
+    need = max(upper * (1.0 + buf) / max(avg_full,1e-9) - 1.0, 1e-3)
+    L = int(1.0 / min(need, 0.49))
+    return max(CONFIG.MIN_LEVERAGE, min(L, CONFIG.MAX_LEVERAGE))
+
+def lev_from_buffer_long(avg_full: float, lower: float, buf: float) -> int:
+    need = max(1.0 - lower * (1.0 - buf) / max(avg_full,1e-9), 1e-3)
+    L = int(1.0 / min(need, 0.49))
+    return max(CONFIG.MIN_LEVERAGE, min(L, CONFIG.MAX_LEVERAGE))
+
+def pick_leverage_from_bank(side: str, p0: float, rng: dict, atr5m: float, atr_extra: float, bank: float, buf: float) -> int:
+    margins = plan_margins_bank_first(bank, CONFIG.DCA_LEVELS, CONFIG.DCA_GROWTH)
+    prices  = planned_grid_prices(side, p0, atr5m, CONFIG.ATR_MULTS, atr_extra)
+    avg_full = avg_after_full_grid(prices, margins)
+    return lev_from_buffer_short(avg_full, rng["upper"], buf) if side=="SHORT" \
+           else lev_from_buffer_long(avg_full, rng["lower"], buf)
+
+def trend_reversal_confirmed(side: str, ind: dict) -> bool:
+    return (side=="SHORT" and ind["supertrend"] in ("up_to_down_near","down")) or \
+           (side=="LONG"  and ind["supertrend"] in ("down_to_up_near","up"))
+
 async def fetch_ohlcv_safe(exchange, symbol, timeframe, limit, retries=3, timeout=None):
     for attempt in range(retries):
         try:
@@ -64,14 +111,12 @@ async def fetch_ohlcv_safe(exchange, symbol, timeframe, limit, retries=3, timeou
                 exchange.fetch_ohlcv(symbol, timeframe, limit=limit),
                 timeout or CONFIG.FETCH_TIMEOUT
             )
-        # ИЗМЕНЕНО: Добавлено исключение RequestTimeout
         except (asyncio.TimeoutError, ccxt_sync.RequestTimeout, ccxt_sync.NetworkError,
                 ccxt_sync.DDoSProtection, ccxt_sync.ExchangeNotAvailable) as e:
             wait = 1.5 ** attempt
             log.warning(f"OHLCV timeout {symbol} {timeframe} lim={limit} "
                         f"try {attempt+1}/{retries}: {e}; retry in {wait:.1f}s")
             await asyncio.sleep(wait)
-
     small = max(240, min(500, (limit or 500)//2))
     try:
         log.warning(f"Retries failed for limit={limit}. Falling back to limit={small}.")
@@ -95,32 +140,13 @@ def next_dca_price(side: str, avg: float, atr5m: float, level_idx: int):
     step = CONFIG.ATR_MULTS[level_idx] * atr5m
     return (avg - step) if side == "LONG" else (avg + step)
 
-def weighted_score(side: str, px: float, rng: dict, ind: dict) -> float:
-    lower, upper = rng["lower"], rng["upper"]
-    width = max(upper - lower, 1e-9)
-    if side == "LONG":
-        border = 1.0 - max(0.0, min(1.0, (px - lower) / (0.20*width)))
-    else:
-        border = max(0.0, min(1.0, (upper - px) / (0.20*width)))
-    rsi_term = (50 - ind["rsi"]) / 50.0 if side=="LONG" else (ind["rsi"]-50)/50.0
-    ema_dev = min(ind["ema_dev_atr"]/2.0, 1.0)
-    st_term = 1.0 if ((side=="LONG" and ind["supertrend"]=="down_to_up_near") or
-                      (side=="SHORT" and ind["supertrend"]=="up_to_down_near")) else 0.0
-    vol_term = max(0.0, min((ind["vol_z"]-0.6)/1.0, 1.0))
-    w = CONFIG.WEIGHTS
-    score = (w["border"]*border + w["rsi"]*rsi_term + w["ema_dev"]*ema_dev +
-             w["supertrend"]*st_term + w["vol"]*vol_term)
-    return max(0.0, min(1.0, score))
-
 # ---------------------------------------------------------------------------
 # Core Logic Functions
 # ---------------------------------------------------------------------------
 async def build_range(exchange, symbol: str):
     limit_h = min(int(CONFIG.RANGE_LOOKBACK_DAYS * 24), 1500)
     ohlc = await fetch_ohlcv_safe(exchange, symbol, CONFIG.TF_RANGE, limit_h)
-    if not ohlc:
-        return None
-    
+    if not ohlc: return None
     df = pd.DataFrame(ohlc, columns=["ts","open","high","low","close","volume"])
     ema = ta.ema(df["close"], length=50)
     atr = ta.atr(df["high"], df["low"], df["close"], length=14)
@@ -139,7 +165,11 @@ async def build_range(exchange, symbol: str):
 def compute_indicators_5m(df: pd.DataFrame) -> dict:
     atr5m = ta.atr(df["high"], df["low"], df["close"], length=14).iloc[-1]
     rsi = ta.rsi(df["close"], length=CONFIG.RSI_LEN).iloc[-1]
-    adx = ta.adx(df["high"], df["low"], df["close"], length=CONFIG.ADX_LEN)["ADX_14"].iloc[-1]
+    # ИЗМЕНЕНО: Более надежный выбор колонки ADX
+    adx_df = ta.adx(df["high"], df["low"], df["close"], length=CONFIG.ADX_LEN)
+    adx_col = adx_df.filter(like=f"ADX_{CONFIG.ADX_LEN}").columns[0]
+    adx = adx_df[adx_col].iloc[-1]
+    
     ema20 = ta.ema(df["close"], length=20).iloc[-1]
     vol_z = (df["volume"].iloc[-1] - df["volume"].rolling(CONFIG.VOL_WIN).mean().iloc[-1]) / \
             max(df["volume"].rolling(CONFIG.VOL_WIN).std().iloc[-1], 1e-9)
@@ -150,6 +180,11 @@ def compute_indicators_5m(df: pd.DataFrame) -> dict:
     st_state = "up_to_down_near" if st_prev=="up" and st_dir=="down" else \
                "down_to_up_near" if st_prev=="down" and st_dir=="up" else st_dir
     ema_dev_atr = abs(df["close"].iloc[-1] - ema20) / max(float(atr5m), 1e-9)
+
+    for v in (atr5m, rsi, adx, ema20, vol_z, ema_dev_atr):
+        if pd.isna(v) or np.isinf(v):
+            raise ValueError("Indicators contain NaN/Inf")
+
     return {
         "atr5m": float(atr5m), "rsi": float(rsi), "adx": float(adx),
         "ema20": float(ema20), "vol_z": float(vol_z),
@@ -160,7 +195,7 @@ def compute_indicators_5m(df: pd.DataFrame) -> dict:
 # Position State Manager
 # ---------------------------------------------------------------------------
 class Position:
-    def __init__(self, side: str, signal_id: str):
+    def __init__(self, side: str, signal_id: str, leverage: int | None=None, atr_extra: float=0.0):
         self.side = side
         self.signal_id = signal_id
         self.steps_filled = 0
@@ -171,14 +206,17 @@ class Position:
         self.tp_price = 0.0
         self.sl_price = None
         self.open_ts = time.time()
+        self.leverage = leverage or CONFIG.LEVERAGE
+        self.atr_extra = atr_extra
+        self.max_steps = CONFIG.DCA_LEVELS
+        self.reserved_one = False
 
-    def plan_margins(self):
-        m = CONFIG.BASE_STEP_MARGIN
-        self.step_margins = [m*(CONFIG.DCA_GROWTH**i) for i in range(CONFIG.DCA_LEVELS)]
+    def plan_margins(self, bank: float):
+        self.step_margins = plan_margins_bank_first(bank, CONFIG.DCA_LEVELS, CONFIG.DCA_GROWTH)
 
     def add_step(self, price: float):
         margin = self.step_margins[self.steps_filled]
-        notional = margin * CONFIG.LEVERAGE
+        notional = margin * self.leverage
         new_qty = notional / max(price,1e-9)
         self.avg = (self.avg*self.qty + price*new_qty) / max(self.qty+new_qty,1e-9) if self.qty>0 else price
         self.qty += new_qty
@@ -187,8 +225,10 @@ class Position:
         return margin, notional
 
     def next_dca_price(self, atr5m: float):
-        if self.steps_filled >= CONFIG.DCA_LEVELS: return None
-        return next_dca_price(self.side, self.avg, atr5m, self.steps_filled)
+        if self.steps_filled >= min(self.max_steps, len(self.step_margins)):
+            return None
+        step = CONFIG.ATR_MULTS[self.steps_filled] * atr5m
+        return (self.avg - step) if self.side == "LONG" else (self.avg + step)
 
 # ---------------------------------------------------------------------------
 # Main Loop
@@ -217,7 +257,6 @@ async def scanner_main_loop(app: Application, broadcast):
     })
     await exchange.load_markets(True)
     
-    # ИЗМЕНЕНО: Фолбэк-поиск символа по списку кандидатов
     candidates = [CONFIG.SYMBOL, "EUR/USDT:USDT", "EUR/USDT", "EURC/USDT", "EURUSDT"]
     symbol = None
     for s in candidates:
@@ -239,6 +278,9 @@ async def scanner_main_loop(app: Application, broadcast):
 
     while app.bot_data.get("bot_on", False):
         try:
+            bank = float(app.bot_data.get("safety_bank_usdt", CONFIG.SAFETY_BANK_USDT))
+            buf = float(app.bot_data.get("buffer_over_edge", CONFIG.BUFFER_OVER_EDGE))
+            
             now = time.time()
             manage_only = app.bot_data.get("scan_paused", False)
 
@@ -248,11 +290,12 @@ async def scanner_main_loop(app: Application, broadcast):
                     rng = tmp_rng
                     app.bot_data["last_range_build"] = now
                     log.info(f"[RANGE] New range built: lower={fmt(rng['lower'])} upper={fmt(rng['upper'])} width={fmt(rng['width'])}")
+                    app.bot_data["intro_done"] = False
                 else:
                     log.warning("[RANGE] Failed to build new range; using previous one if available.")
             
             if not rng:
-                log.error("Range is not available. Cannot proceed with the trading cycle.")
+                log.error("Range is not available. Cannot proceed.")
                 await asyncio.sleep(10)
                 continue
 
@@ -264,96 +307,148 @@ async def scanner_main_loop(app: Application, broadcast):
                 continue
             
             df5 = pd.DataFrame(ohlc5, columns=["ts","open","high","low","close","volume"])
-            ind = compute_indicators_5m(df5)
+            try:
+                ind = compute_indicators_5m(df5)
+            except ValueError as e:
+                log.warning(f"Indicator calculation failed: {e}. Skipping cycle.")
+                await asyncio.sleep(2)
+                continue
+
             px = float(df5["close"].iloc[-1])
 
-            if not manage_only:
-                long_zone  = px <= rng["lower"] * (1+0.0015)
-                short_zone = px >= rng["upper"] * (1-0.0015)
-                side_cand = "LONG" if long_zone else "SHORT" if short_zone else None
-                
-                if side_cand and app.bot_data.get("position") is None:
-                    sc = weighted_score(side_cand, px, rng, ind)
-                    if sc >= CONFIG.SCORE_THR:
-                        pos = Position(side_cand, signal_id=f"{symbol.split('/')[0]}_{int(now)}")
-                        pos.plan_margins()
-                        margin, _ = pos.add_step(px)
-                        app.bot_data["position"] = pos
-                        
-                        liq = approx_liq_price(pos.avg, pos.side, CONFIG.LEVERAGE)
-                        nxt = pos.next_dca_price(ind["atr5m"])
-                        nxt_txt = fmt(nxt)
-                        cum_margin = sum(pos.step_margins[:pos.steps_filled])
-                        fee_est = margin * CONFIG.LEVERAGE * CONFIG.FEE_TAKER
-                        next_mult = CONFIG.ATR_MULTS[pos.steps_filled] if pos.steps_filled < CONFIG.DCA_LEVELS else ""
-
-                        if bc := app.bot_data.get('broadcast_func'):
-                            await bc(app,
-                                f"⚡ <b>BMR-DCA {pos.side} ({symbol.split('/')[0]})</b>\n"
-                                f"Вход: <code>{fmt(px)}</code>\n"
-                                f"Шаговая маржа: <b>{margin:.2f} USDT</b> | Депозит: <b>{cum_margin:.2f} USDT</b> | Плечо: <b>{CONFIG.LEVERAGE}x</b>\n"
-                                f"TP: <code>{fmt(pos.tp_price)}</code> (+{CONFIG.TP_PCT*100:.2f}%)\n"
-                                f"Ликвидация≈ <code>{fmt(liq)}</code>\n"
-                                f"След. усреднение: <code>{nxt_txt}</code>"
-                            )
-                        await trade_executor.bmr_log_event({
-                            "Event_ID": f"OPEN_{pos.signal_id}", "Signal_ID": pos.signal_id,
-                            "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                            "Pair": symbol, "Side": pos.side, "Event": "OPEN",
-                            "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
-                            "Cum_Margin_USDT": cum_margin, "Leverage": CONFIG.LEVERAGE,
-                            "Entry_Price": px, "Avg_Price": pos.avg,
-                            "TP_Pct": CONFIG.TP_PCT, "TP_Price": pos.tp_price, "Liq_Est_Price": liq,
-                            "Next_DCA_ATR_mult": next_mult, "Next_DCA_Price": nxt or "",
-                            "Fee_Rate_Maker": CONFIG.FEE_MAKER, "Fee_Rate_Taker": CONFIG.FEE_TAKER,
-                            "Fee_Est_USDT": fee_est,
-                            "ATR_5m": ind["atr5m"], "ATR_1h": rng["atr1h"],
-                            "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
-                            "Range_Lower": rng["lower"], "Range_Upper": rng["upper"], "Range_Width": rng["width"]
-                        })
+            if not app.bot_data.get("intro_done"):
+                p30 = rng["lower"] + 0.30 * rng["width"]
+                p70 = rng["lower"] + 0.70 * rng["width"]
+                d_to_long  = max(0.0, px - p30)
+                d_to_short = max(0.0, p70 - px)
+                # ИЗМЕНЕНО: Добавлены проценты в интро-сообщение
+                pct_to_long  = (d_to_long / max(px, 1e-9)) * 100
+                pct_to_short = (d_to_short / max(px, 1e-9)) * 100
+                if bc := app.bot_data.get('broadcast_func'):
+                    await bc(app, (f"🎯 Пороги входа: LONG ≤ <code>{fmt(p30)}</code> (30%), "
+                                   f"SHORT ≥ <code>{fmt(p70)}</code> (70%).\n"
+                                   f"Текущая: <code>{fmt(px)}</code>. "
+                                   f"До LONG: {fmt(d_to_long)} ({pct_to_long:.2f}%), до SHORT: {fmt(d_to_short)} ({pct_to_short:.2f}%)"))
+                app.bot_data["intro_done"] = True
 
             pos: Position | None = app.bot_data.get("position")
+
+            if pos:
+                if px >= rng["upper"] * (1 + CONFIG.BREAK_EPS) or px <= rng["lower"] * (1 - CONFIG.BREAK_EPS):
+                    tmp_rng = await build_range(exchange, symbol)
+                    if tmp_rng:
+                        rng = tmp_rng
+                        app.bot_data["last_range_build"] = now
+                        if bc := app.bot_data.get('broadcast_func'):
+                            await bc(app, f"📈 Диапазон пересчитан: низ <code>{fmt(rng['lower'])}</code> верх <code>{fmt(rng['upper'])}</code>")
+                    if not pos.reserved_one:
+                        pos.max_steps = min(pos.steps_filled + 1, CONFIG.DCA_LEVELS)
+                        pos.reserved_one = True
+                        if bc := app.bot_data.get('broadcast_func'):
+                            await bc(app, "📌 Пробой: DCA заморожен, оставлена 1 резервная ступень на ретест.")
+
+            if not manage_only and not pos:
+                pos_in = max(0.0, min(1.0, (px - rng["lower"]) / max(rng["width"], 1e-9)))
+                side_cand = "LONG" if pos_in <= 0.30 else ("SHORT" if pos_in >= 0.70 else None)
+                
+                if side_cand:
+                    atr_extra = 0.25 if (pos_in <= 0.20 or pos_in >= 0.80) else 0.0
+                    pos = Position(side_cand, signal_id=f"{symbol.split('/')[0]}_{int(now)}", atr_extra=atr_extra)
+                    pos.plan_margins(bank)
+                    # ИЗМЕНЕНО: Вход + 4 усреднения внутри
+                    pos.max_steps = min(5, CONFIG.DCA_LEVELS)
+                    pos.reserved_one = False
+
+                    if CONFIG.AUTO_LEVERAGE:
+                        pos.leverage = pick_leverage_from_bank(pos.side, px, rng, ind["atr5m"], atr_extra, bank, buf)
+
+                    margin, _ = pos.add_step(px)
+                    app.bot_data["position"] = pos
+                    
+                    liq = approx_liq_price(pos.avg, pos.side, pos.leverage)
+                    nxt = pos.next_dca_price(ind["atr5m"])
+                    nxt_txt = fmt(nxt)
+                    cum_margin = sum(pos.step_margins[:pos.steps_filled])
+                    fee_est = margin * pos.leverage * CONFIG.FEE_TAKER
+                    next_mult = ""
+                    if nxt is not None and pos.steps_filled < CONFIG.DCA_LEVELS:
+                        next_mult = CONFIG.ATR_MULTS[pos.steps_filled]
+
+                    if bc := app.bot_data.get('broadcast_func'):
+                        await bc(app,
+                            f"⚡ <b>BMR-DCA {pos.side} ({symbol.split('/')[0]})</b>\n"
+                            f"Вход: <code>{fmt(px)}</code>\n"
+                            f"Шаговая маржа: <b>{margin:.2f} USDT</b> | Депозит: <b>{cum_margin:.2f} USDT</b> | Плечо: <b>{pos.leverage}x</b>\n"
+                            f"TP: <code>{fmt(pos.tp_price)}</code> (+{CONFIG.TP_PCT*100:.2f}%)\n"
+                            f"Ликвидация≈ <code>{fmt(liq)}</code>\n"
+                            f"След. усреднение: <code>{nxt_txt}</code> (всего внутри: {pos.max_steps} из {CONFIG.DCA_LEVELS}, 1 резерв)")
+                    await trade_executor.bmr_log_event({
+                        "Event_ID": f"OPEN_{pos.signal_id}", "Signal_ID": pos.signal_id, "Leverage": pos.leverage,
+                        "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                        "Pair": symbol, "Side": pos.side, "Event": "OPEN",
+                        "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
+                        "Cum_Margin_USDT": cum_margin, "Entry_Price": px, "Avg_Price": pos.avg,
+                        "TP_Pct": CONFIG.TP_PCT, "TP_Price": pos.tp_price, "Liq_Est_Price": liq,
+                        "Next_DCA_ATR_mult": next_mult, "Next_DCA_Price": nxt or "",
+                        "Fee_Rate_Maker": CONFIG.FEE_MAKER, "Fee_Rate_Taker": CONFIG.FEE_TAKER,
+                        "Fee_Est_USDT": fee_est, "ATR_5m": ind["atr5m"], "ATR_1h": rng["atr1h"],
+                        "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
+                        "Range_Lower": rng["lower"], "Range_Upper": rng["upper"], "Range_Width": rng["width"]
+                    })
+
+            pos = app.bot_data.get("position")
             if pos:
                 if not manage_only:
-                    nxt = pos.next_dca_price(ind["atr5m"])
-                    if nxt and ((pos.side=="LONG" and px <= nxt) or (pos.side=="SHORT" and px >= nxt)):
-                        margin, _ = pos.add_step(px)
-                        liq = approx_liq_price(pos.avg, pos.side, CONFIG.LEVERAGE)
-                        nxt2 = pos.next_dca_price(ind["atr5m"])
-                        nxt2_txt = fmt(nxt2)
-                        cum_margin = sum(pos.step_margins[:pos.steps_filled])
-                        fee_est = margin * CONFIG.LEVERAGE * CONFIG.FEE_TAKER
-                        next_mult = CONFIG.ATR_MULTS[pos.steps_filled] if pos.steps_filled < CONFIG.DCA_LEVELS else ""
-                        
-                        if bc := app.bot_data.get('broadcast_func'):
-                            await bc(app,
-                                f"➕ Усреднение #{pos.steps_filled}: {margin:.2f} USDT\n"
-                                f"Новый депозит: <b>{cum_margin:.2f} USDT</b>\n"
-                                f"Новая средняя: <code>{fmt(pos.avg)}</code> | Новый TP: <code>{fmt(pos.tp_price)}</code>\n"
-                                f"Новая ликвидация≈ <code>{fmt(liq)}</code>\n"
-                                f"След. усреднение: <code>{nxt2_txt}</code>"
-                            )
-                        await trade_executor.bmr_log_event({
-                            "Event_ID": f"ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
-                            "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                            "Pair": symbol, "Side": pos.side, "Event": "ADD",
-                            "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
-                            "Cum_Margin_USDT": cum_margin,
-                            "Entry_Price": px, "Avg_Price": pos.avg,
-                            "TP_Price": pos.tp_price, "SL_Price": pos.sl_price or "",
-                            "Liq_Est_Price": liq,
-                            "Next_DCA_ATR_mult": next_mult, "Next_DCA_Price": nxt2 or "",
-                            "Fee_Rate_Maker": CONFIG.FEE_MAKER, "Fee_Rate_Taker": CONFIG.FEE_TAKER,
-                            "Fee_Est_USDT": fee_est,
-                            "ATR_5m": ind["atr5m"], "ATR_1h": rng["atr1h"],
-                            "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
-                            "Range_Lower": rng["lower"], "Range_Upper": rng["upper"], "Range_Width": rng["width"]
-                        })
+                    if pos.reserved_one:
+                        need_retest = (pos.side=="SHORT" and px <= rng["upper"] * (1 - CONFIG.REENTRY_BAND)) or \
+                                      (pos.side=="LONG"  and px >= rng["lower"] * (1 + CONFIG.REENTRY_BAND))
+                        can_add = pos.steps_filled < pos.max_steps
+                        if need_retest and can_add and trend_reversal_confirmed(pos.side, ind):
+                            margin, _ = pos.add_step(px)
+                            pos.max_steps = pos.steps_filled
+                            liq = approx_liq_price(pos.avg, pos.side, pos.leverage)
+                            if bc := app.bot_data.get('broadcast_func'):
+                                await bc(app, f"↩️ Ретест: добор {margin:.2f} USDT по <code>{fmt(px)}</code> | средняя <code>{fmt(pos.avg)}</code> | лик≈ <code>{fmt(liq)}</code>")
+                            await trade_executor.bmr_log_event({
+                                "Event_ID": f"RETEST_ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
+                                "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                                "Pair": symbol, "Side": pos.side, "Event": "RETEST_ADD",
+                                "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
+                                "Entry_Price": px, "Avg_Price": pos.avg
+                            })
+                    else:
+                        nxt = pos.next_dca_price(ind["atr5m"])
+                        if nxt and ((pos.side=="LONG" and px <= nxt) or (pos.side=="SHORT" and px >= nxt)):
+                            margin, _ = pos.add_step(px)
+                            liq = approx_liq_price(pos.avg, pos.side, pos.leverage)
+                            nxt2 = pos.next_dca_price(ind["atr5m"])
+                            nxt2_txt = fmt(nxt2)
+                            cum_margin = sum(pos.step_margins[:pos.steps_filled])
+                            fee_est = margin * pos.leverage * CONFIG.FEE_TAKER
+                            next_mult = ""
+                            if nxt2 is not None and pos.steps_filled < CONFIG.DCA_LEVELS:
+                                next_mult = CONFIG.ATR_MULTS[pos.steps_filled]
+                            if bc := app.bot_data.get('broadcast_func'):
+                                await bc(app,
+                                    f"➕ Усреднение #{pos.steps_filled}: {margin:.2f} USDT | депозит {cum_margin:.2f}\n"
+                                    f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code> | Ликвидация≈ <code>{fmt(liq)}</code>\n"
+                                    f"След. усреднение: <code>{nxt2_txt}</code>")
+                            await trade_executor.bmr_log_event({
+                                "Event_ID": f"ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
+                                "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                                "Pair": symbol, "Side": pos.side, "Event": "ADD",
+                                "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
+                                "Cum_Margin_USDT": cum_margin, "Entry_Price": px, "Avg_Price": pos.avg,
+                                "TP_Price": pos.tp_price, "SL_Price": pos.sl_price or "",
+                                "Liq_Est_Price": liq, "Next_DCA_ATR_mult": next_mult, "Next_DCA_Price": nxt2 or "",
+                                "Fee_Rate_Maker": CONFIG.FEE_MAKER, "Fee_Rate_Taker": CONFIG.FEE_TAKER,
+                                "Fee_Est_USDT": fee_est, "ATR_5m": ind["atr5m"], "ATR_1h": rng["atr1h"],
+                                "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
+                                "Range_Lower": rng["lower"], "Range_Upper": rng["upper"], "Range_Width": rng["width"]
+                            })
 
-                if pos.side == "LONG":
-                    gain_to_tp = max(0.0, (px / max(pos.avg,1e-9) - 1.0) / CONFIG.TP_PCT)
-                else:
-                    gain_to_tp = max(0.0, (pos.avg / max(px,1e-9) - 1.0) / CONFIG.TP_PCT)
+                if pos.side == "LONG": gain_to_tp = max(0.0, (px / max(pos.avg,1e-9) - 1.0) / CONFIG.TP_PCT)
+                else: gain_to_tp = max(0.0, (pos.avg / max(px,1e-9) - 1.0) / CONFIG.TP_PCT)
 
                 if gain_to_tp >= CONFIG.TRAIL_ARM:
                     lock_pct = CONFIG.TRAIL_LOCK * CONFIG.TP_PCT
@@ -378,7 +473,7 @@ async def scanner_main_loop(app: Application, broadcast):
                     reason = "TP_HIT" if tp_hit else "SL_HIT"
                     exit_p = pos.tp_price if tp_hit else pos.sl_price
                     time_min = (time.time()-pos.open_ts)/60.0
-                    pnl_pct = (abs(exit_p/pos.avg-1) * (1 if tp_hit else -1)) * 100 * CONFIG.LEVERAGE
+                    pnl_pct = (abs(exit_p/pos.avg-1) * (1 if tp_hit else -1)) * 100 * pos.leverage
                     pnl_usd = sum(pos.step_margins[:pos.steps_filled]) * (pnl_pct/100.0)
                     atr_now = ind["atr5m"]
                     if bc := app.bot_data.get('broadcast_func'):
