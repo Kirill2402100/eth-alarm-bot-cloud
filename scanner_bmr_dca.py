@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pandas_ta as ta
 import ccxt.async_support as ccxt
+import ccxt as ccxt_sync
 from telegram.ext import Application
 import gspread
 
@@ -17,11 +18,12 @@ log = logging.getLogger("bmr_dca_engine")
 # CONFIG
 # ---------------------------------------------------------------------------
 class CONFIG:
-    SYMBOL = "EUR/USDT:USDT"
+    SYMBOL = "EURC/USDT:USDT"
     TF_ENTRY = "5m"
     TF_RANGE = "1h"
-    RANGE_LOOKBACK_DAYS = 90
-    FETCH_TIMEOUT = 8
+    # ИЗМЕНЕНО: Уменьшена нагрузка
+    RANGE_LOOKBACK_DAYS = 60
+    FETCH_TIMEOUT = 15
     BASE_STEP_MARGIN = 10.0
     DCA_LEVELS = 5
     DCA_GROWTH = 2.0
@@ -54,6 +56,32 @@ def fmt(p: float) -> str:
     if p < 0.01: return f"{p:.6f}"
     if p < 1.0:  return f"{p:.5f}"
     return f"{p:.4f}"
+
+async def fetch_ohlcv_safe(exchange, symbol, timeframe, limit, retries=3, timeout=None):
+    for attempt in range(retries):
+        try:
+            return await asyncio.wait_for(
+                exchange.fetch_ohlcv(symbol, timeframe, limit=limit),
+                timeout or CONFIG.FETCH_TIMEOUT
+            )
+        # ИЗМЕНЕНО: Добавлено исключение RequestTimeout
+        except (asyncio.TimeoutError, ccxt_sync.RequestTimeout, ccxt_sync.NetworkError,
+                ccxt_sync.DDoSProtection, ccxt_sync.ExchangeNotAvailable) as e:
+            wait = 1.5 ** attempt
+            log.warning(f"OHLCV timeout {symbol} {timeframe} lim={limit} "
+                        f"try {attempt+1}/{retries}: {e}; retry in {wait:.1f}s")
+            await asyncio.sleep(wait)
+
+    small = max(240, min(500, (limit or 500)//2))
+    try:
+        log.warning(f"Retries failed for limit={limit}. Falling back to limit={small}.")
+        return await asyncio.wait_for(
+            exchange.fetch_ohlcv(symbol, timeframe, limit=small),
+            (timeout or CONFIG.FETCH_TIMEOUT) * 2
+        )
+    except Exception as e:
+        log.error(f"OHLCV final fail {symbol} {timeframe}: {e}")
+        return None
 
 def approx_liq_price(entry: float, side: str, lev: int) -> float:
     k = 1.0/lev
@@ -89,8 +117,10 @@ def weighted_score(side: str, px: float, rng: dict, ind: dict) -> float:
 # ---------------------------------------------------------------------------
 async def build_range(exchange, symbol: str):
     limit_h = min(int(CONFIG.RANGE_LOOKBACK_DAYS * 24), 1500)
-    ohlc = await asyncio.wait_for(exchange.fetch_ohlcv(symbol, CONFIG.TF_RANGE, limit=limit_h),
-                                  timeout=CONFIG.FETCH_TIMEOUT)
+    ohlc = await fetch_ohlcv_safe(exchange, symbol, CONFIG.TF_RANGE, limit_h)
+    if not ohlc:
+        return None
+    
     df = pd.DataFrame(ohlc, columns=["ts","open","high","low","close","volume"])
     ema = ta.ema(df["close"], length=50)
     atr = ta.atr(df["high"], df["low"], df["close"], length=14)
@@ -179,12 +209,28 @@ async def scanner_main_loop(app: Application, broadcast):
     except Exception as e:
         log.error(f"Sheets init error: {e}", exc_info=True)
 
-    exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 150})
+    exchange = ccxt.mexc({
+        'options': {'defaultType': 'swap'},
+        'enableRateLimit': True,
+        'rateLimit': 150,
+        'timeout': 20000,
+    })
     await exchange.load_markets(True)
     
-    symbol = CONFIG.SYMBOL
-    if symbol not in exchange.markets:
-        log.critical(f"Символ {symbol} не найден у биржи. Проверьте, что EURC/USDT swap доступен на выбранной бирже.")
+    # ИЗМЕНЕНО: Фолбэк-поиск символа по списку кандидатов
+    candidates = [CONFIG.SYMBOL, "EUR/USDT:USDT", "EUR/USDT", "EURC/USDT", "EURUSDT"]
+    symbol = None
+    for s in candidates:
+        if s in exchange.markets:
+            symbol = s
+            if s != CONFIG.SYMBOL:
+                log.warning(f"Requested {CONFIG.SYMBOL}, but using available symbol {s} on the exchange.")
+            else:
+                log.info(f"Successfully found primary symbol {s} on the exchange.")
+            break
+
+    if not symbol:
+        log.critical(f"None of the candidate symbols were found on the exchange: {candidates}")
         await exchange.close()
         return
 
@@ -197,13 +243,26 @@ async def scanner_main_loop(app: Application, broadcast):
             manage_only = app.bot_data.get("scan_paused", False)
 
             if (not rng) or (now - app.bot_data.get("last_range_build", 0) > CONFIG.REBUILD_RANGE_EVERY_MIN*60):
-                rng = await build_range(exchange, symbol)
-                # ИСПРАВЛЕНО: Обновляем метку времени после перестроения диапазона
-                app.bot_data["last_range_build"] = now
-                log.info(f"[RANGE] lower={fmt(rng['lower'])} upper={fmt(rng['upper'])} width={fmt(rng['width'])}")
+                tmp_rng = await build_range(exchange, symbol)
+                if tmp_rng:
+                    rng = tmp_rng
+                    app.bot_data["last_range_build"] = now
+                    log.info(f"[RANGE] New range built: lower={fmt(rng['lower'])} upper={fmt(rng['upper'])} width={fmt(rng['width'])}")
+                else:
+                    log.warning("[RANGE] Failed to build new range; using previous one if available.")
+            
+            if not rng:
+                log.error("Range is not available. Cannot proceed with the trading cycle.")
+                await asyncio.sleep(10)
+                continue
 
-            ohlc5 = await asyncio.wait_for(exchange.fetch_ohlcv(symbol, CONFIG.TF_ENTRY, limit=max(60, CONFIG.VOL_WIN+CONFIG.ADX_LEN+20)),
-                                           timeout=CONFIG.FETCH_TIMEOUT)
+            ohlc5 = await fetch_ohlcv_safe(exchange, symbol, CONFIG.TF_ENTRY,
+                                           limit=max(60, CONFIG.VOL_WIN+CONFIG.ADX_LEN+20))
+            if not ohlc5:
+                log.warning("Could not fetch 5m OHLCV data. Skipping this cycle.")
+                await asyncio.sleep(2)
+                continue
+            
             df5 = pd.DataFrame(ohlc5, columns=["ts","open","high","low","close","volume"])
             ind = compute_indicators_5m(df5)
             px = float(df5["close"].iloc[-1])
