@@ -26,7 +26,7 @@ class CONFIG:
     BASE_STEP_MARGIN = 10.0
     DCA_LEVELS = 6
     DCA_GROWTH = 2.0
-    LEVERAGE = 10
+    LEVERAGE = 50
     FEE_MAKER = 0.0005
     FEE_TAKER = 0.0005
     Q_LOWER = 0.025
@@ -55,6 +55,7 @@ class CONFIG:
     REENTRY_BAND = 0.003
     MAINT_MMR = 0.004
     LIQ_FEE_BUFFER = 1.0
+    SL_NOTIFY_MIN_TICK_STEP = 1
 
 assert len(CONFIG.ATR_MULTS) >= CONFIG.DCA_LEVELS, "ATR_MULTS must cover all DCA levels"
 
@@ -127,15 +128,12 @@ def next_dca_price(side: str, avg: float, atr5m: float, level_idx: int):
     step = CONFIG.ATR_MULTS[level_idx] * atr5m
     return (avg - step) if side == "LONG" else (avg + step)
 
-# ДОБАВЛЕНО: Новые хелперы для CAP-логики и пробоев
 def break_levels(rng: dict) -> tuple[float, float]:
-    """Уровни пробоя вверх/вниз с учётом BREAK_EPS."""
     up = rng["upper"] * (1.0 + CONFIG.BREAK_EPS)
     dn = rng["lower"] * (1.0 - CONFIG.BREAK_EPS)
     return up, dn
 
 def break_distance_pcts(px: float, up: float, dn: float) -> tuple[float, float]:
-    """Сколько % до пробоя вверх/вниз от текущей цены px."""
     if px is None or px <= 0 or any(v is None or np.isnan(v) for v in (up, dn)):
         return float('nan'), float('nan')
     up_pct = max(0.0, (up / px - 1.0) * 100.0)
@@ -143,25 +141,34 @@ def break_distance_pcts(px: float, up: float, dn: float) -> tuple[float, float]:
     return up_pct, dn_pct
 
 def cap_next_price(side: str, avg: float, target_raw: float | None, atr5m: float, rng: dict) -> tuple[float | None, bool, bool]:
-    """Режим CAP: подрезает цель усреднения по уровню пробоя с небольшим буфером."""
     if target_raw is None or np.isnan(target_raw):
         return None, False, False
-
     brk_up, brk_dn = break_levels(rng)
     buf = max(1e-9, 0.05 * max(atr5m, 1e-9))
-
     if side == "SHORT":
         cap_price = brk_up - buf
         if cap_price <= avg * (1.0 + 1e-9):
             return None, False, True
         clipped = target_raw > cap_price
         return (min(target_raw, cap_price), clipped, False)
-    else:  # LONG
+    else:
         cap_price = brk_dn + buf
         if cap_price >= avg * (1.0 - 1e-9):
             return None, False, True
         clipped = target_raw < cap_price
         return (max(target_raw, cap_price), clipped, False)
+
+def sl_moved_enough(prev: float|None, new: float, side: str, tick: float, min_steps: int) -> bool:
+    if prev is None:
+        return True
+    step = max(tick * max(1, min_steps), 1e-12)
+    return (new > prev + step) if side == "LONG" else (new < prev - step)
+
+# ДОБАВЛЕНО: Хелпер для квантования цены к тику
+def quantize_to_tick(x: float | None, tick: float) -> float | None:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return x
+    return round(round(x / tick) * tick, 10)
 
 # ---------------------------------------------------------------------------
 # Core Logic Functions
@@ -232,6 +239,7 @@ class Position:
         self.leverage = leverage or CONFIG.LEVERAGE
         self.max_steps = CONFIG.DCA_LEVELS
         self.reserved_one = False
+        self.last_sl_notified_price = None
 
     def plan_margins(self, bank: float):
         total_target = bank * CONFIG.CUM_DEPOSIT_FRAC_AT_FULL
@@ -294,6 +302,21 @@ async def scanner_main_loop(app: Application, broadcast):
         log.critical(f"None of the candidate symbols were found on the exchange: {candidates}")
         await exchange.close()
         return
+
+    # ИЗМЕНЕНО: Более надежное определение тика цены
+    market = exchange.markets[symbol]
+    tick = None
+    p_prec = market.get("precision", {}).get("price")
+    if isinstance(p_prec, (int, float)):
+        if 0 < float(p_prec) < 1:
+            tick = float(p_prec)
+        elif int(p_prec) >= 0:
+            tick = 10 ** (-int(p_prec))
+    if not tick:
+        tick = market.get("limits", {}).get("price", {}).get("min")
+    if not tick or tick <= 0:
+        tick = 1e-4
+    app.bot_data["price_tick"] = float(tick)
 
     rng = None
     last_flush = 0
@@ -527,16 +550,29 @@ async def scanner_main_loop(app: Application, broadcast):
                     locked = pos.avg*(1+lock_pct) if pos.side=="LONG" else pos.avg*(1-lock_pct)
                     chand = chandelier_stop(pos.side, px, ind["atr5m"])
                     new_sl = max(locked, chand) if pos.side=="LONG" else min(locked, chand)
-                    if (pos.sl_price is None) or (pos.side=="LONG" and new_sl>pos.sl_price) or (pos.side=="SHORT" and new_sl<pos.sl_price):
-                        pos.sl_price = new_sl
-                        if broadcast:
-                            await broadcast(app, f"🔒 Трейлинг-SL установлен: <code>{fmt(pos.sl_price)}</code>")
-                        await trade_executor.bmr_log_event({
-                            "Event_ID": f"TRAIL_SET_{pos.signal_id}_{int(now)}", "Signal_ID": pos.signal_id,
-                            "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                            "Pair": symbol, "Side": pos.side, "Event": "TRAIL_SET",
-                            "SL_Price": pos.sl_price, "Avg_Price": pos.avg
-                        })
+                    
+                    tick = app.bot_data.get("price_tick", 1e-4)
+                    new_sl_q = quantize_to_tick(new_sl, tick)
+                    curr_sl_q = quantize_to_tick(pos.sl_price, tick)
+                    last_notif_q = quantize_to_tick(pos.last_sl_notified_price, tick)
+
+                    improves = (curr_sl_q is None) or \
+                               (pos.side == "LONG" and new_sl_q > curr_sl_q) or \
+                               (pos.side == "SHORT" and new_sl_q < curr_sl_q)
+
+                    if improves:
+                        pos.sl_price = new_sl_q
+                        if sl_moved_enough(last_notif_q, pos.sl_price,
+                                           pos.side, tick, CONFIG.SL_NOTIFY_MIN_TICK_STEP):
+                            if broadcast:
+                                await broadcast(app, f"🔒 Трейлинг-SL установлен: <code>{fmt(pos.sl_price)}</code>")
+                            pos.last_sl_notified_price = pos.sl_price
+                            await trade_executor.bmr_log_event({
+                                "Event_ID": f"TRAIL_SET_{pos.signal_id}_{int(now)}", "Signal_ID": pos.signal_id,
+                                "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                                "Pair": symbol, "Side": pos.side, "Event": "TRAIL_SET",
+                                "SL_Price": pos.sl_price, "Avg_Price": pos.avg
+                            })
 
                 tp_hit = (pos.side=="LONG" and px>=pos.tp_price) or (pos.side=="SHORT" and px<=pos.tp_price)
                 sl_hit = pos.sl_price and ((pos.side=="LONG" and px<=pos.sl_price) or (pos.side=="SHORT" and px>=pos.sl_price))
@@ -563,6 +599,7 @@ async def scanner_main_loop(app: Application, broadcast):
                         "Time_In_Trade_min": time_min,
                         "ATR_5m": atr_now
                     })
+                    pos.last_sl_notified_price = None
                     app.bot_data["position"] = None
 
             if trade_executor.PENDING_TRADES and (time.time() - last_flush >= 10):
