@@ -26,6 +26,7 @@ class CONFIG:
     BASE_STEP_MARGIN = 10.0
     DCA_LEVELS = 6
     DCA_GROWTH = 2.0
+    # ИЗМЕНЕНО: Плечо зафиксировано на 50x
     LEVERAGE = 50
     FEE_MAKER = 0.0005
     FEE_TAKER = 0.0005
@@ -42,12 +43,14 @@ class CONFIG:
     SCORE_THR = 0.55
     ATR_MULTS = [0, 1, 2, 3, 4, 5]
     TP_PCT = 0.010
-    TRAIL_ARM = 0.8
-    TRAIL_LOCK = 0.6
+    # ИЗМЕНЕНО: Новые пороги для трейлинга
+    TRAIL_ARM = 0.6
+    TRAIL_LOCK = 0.5
     SCAN_INTERVAL_SEC = 3
     REBUILD_RANGE_EVERY_MIN = 15
     SAFETY_BANK_USDT = 1000.0
-    CUM_DEPOSIT_FRAC_AT_FULL = 0.32
+    # ИЗМЕНЕНО: Увеличена доля банка
+    CUM_DEPOSIT_FRAC_AT_FULL = 0.64
     AUTO_LEVERAGE = False
     MIN_LEVERAGE = 2
     MAX_LEVERAGE = 50
@@ -164,7 +167,6 @@ def sl_moved_enough(prev: float|None, new: float, side: str, tick: float, min_st
     step = max(tick * max(1, min_steps), 1e-12)
     return (new > prev + step) if side == "LONG" else (new < prev - step)
 
-# ДОБАВЛЕНО: Хелпер для квантования цены к тику
 def quantize_to_tick(x: float | None, tick: float) -> float | None:
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return x
@@ -303,7 +305,6 @@ async def scanner_main_loop(app: Application, broadcast):
         await exchange.close()
         return
 
-    # ИЗМЕНЕНО: Более надежное определение тика цены
     market = exchange.markets[symbol]
     tick = None
     p_prec = market.get("precision", {}).get("price")
@@ -375,6 +376,33 @@ async def scanner_main_loop(app: Application, broadcast):
                                    f"Текущая: <code>{fmt(px)}</code>. "
                                    f"До LONG: {fmt(d_to_long)} ({pct_to_long:.2f}%), до SHORT: {fmt(d_to_short)} ({pct_to_short:.2f}%)"))
                 app.bot_data["intro_done"] = True
+
+            pos = app.bot_data.get("position")
+            
+            # ДОБАВЛЕНО: Обработка ручного закрытия
+            if pos and app.bot_data.get("force_close"):
+                exit_p = px
+                time_min = (time.time()-pos.open_ts)/60.0
+                raw_pnl = (exit_p / pos.avg - 1.0) * (1 if pos.side == "LONG" else -1)
+                pnl_pct = raw_pnl * 100 * pos.leverage
+                pnl_usd = sum(pos.step_margins[:pos.steps_filled]) * (pnl_pct/100.0)
+
+                if broadcast:
+                    await broadcast(app, f"🧰 <b>MANUAL_CLOSE</b>\n"
+                                          f"Цена выхода: <code>{fmt(exit_p)}</code>\n"
+                                          f"P&L≈ {pnl_usd:+.2f} USDT ({pnl_pct:+.2f}%)\n"
+                                          f"Время в сделке: {time_min:.1f} мин")
+                await trade_executor.bmr_log_event({
+                    "Event_ID": f"MANUAL_CLOSE_{pos.signal_id}", "Signal_ID": pos.signal_id,
+                    "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                    "Pair": symbol, "Side": pos.side, "Event": "MANUAL_CLOSE",
+                    "PNL_Realized_USDT": pnl_usd, "PNL_Realized_Pct": pnl_pct,
+                    "Time_In_Trade_min": time_min
+                })
+                app.bot_data["force_close"] = False
+                pos.last_sl_notified_price = None
+                app.bot_data["position"] = None
+                continue
 
             if pos:
                 brk_up, brk_dn = break_levels(rng)
