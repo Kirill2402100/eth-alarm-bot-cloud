@@ -66,8 +66,6 @@ class CONFIG:
         "growth_B": 2.2,
     }
 
-ORDINARY_STEPS = 5
-
 # ---------------------------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------------------------
@@ -87,8 +85,6 @@ async def log_event_safely(payload: dict):
     data = {k: v for k, v in payload.items() if k in SAFE_LOG_KEYS}
     try:
         await trade_executor.bmr_log_event(data)
-        # Безусловный сброс убран из этой функции, чтобы не замедлять основной цикл.
-        # flush_log_buffers вызывается периодически в основном цикле.
     except Exception:
         log.exception("[SHEETS] log_event_safely failed")
 
@@ -737,8 +733,12 @@ async def scanner_main_loop(app: Application, broadcast):
                     pos.last_sl_notified_price = None
                     app.bot_data["position"] = None
 
-            if trade_executor.PENDING_TRADES and (time.time() - last_flush >= 10):
-                await trade_executor.flush_log_buffers()
+            # ИЗМЕНЕНО: Безусловный сброс буфера
+            if (time.time() - last_flush) >= 10:
+                try:
+                    await trade_executor.flush_log_buffers()
+                except Exception:
+                    log.exception("flush_log_buffers failed")
                 last_flush = time.time()
             
             await asyncio.sleep(CONFIG.SCAN_INTERVAL_SEC)
