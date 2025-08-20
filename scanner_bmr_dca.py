@@ -71,6 +71,26 @@ ORDINARY_STEPS = 5
 # ---------------------------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------------------------
+# ДОБАВЛЕНО: Безопасный логгер
+SAFE_LOG_KEYS = {
+    "Event_ID","Signal_ID","Leverage","Timestamp_UTC","Pair","Side","Event",
+    "Step_No","Step_Margin_USDT","Cum_Margin_USDT","Entry_Price","Avg_Price",
+    "TP_Pct","TP_Price","SL_Price","Liq_Est_Price","Next_DCA_Price",
+    "Fee_Rate_Maker","Fee_Rate_Taker","Fee_Est_USDT",
+    "ATR_5m","ATR_1h","RSI_5m","ADX_5m","Supertrend","Vol_z",
+    "Range_Lower","Range_Upper","Range_Width",
+    "PNL_Realized_USDT","PNL_Realized_Pct","Time_In_Trade_min","Trail_Stage",
+    "Next_DCA_Label", "Triggered_Label" # Добавляем новые поля в безопасный список
+}
+
+async def log_event_safely(payload: dict):
+    data = {k: v for k, v in payload.items() if k in SAFE_LOG_KEYS}
+    try:
+        await trade_executor.bmr_log_event(data)
+        await trade_executor.flush_log_buffers()
+    except Exception:
+        log.exception("[SHEETS] log_event_safely failed")
+
 def fmt(p: float) -> str:
     if p is None or pd.isna(p): return "N/A"
     if p < 0.01: return f"{p:.6f}"
@@ -145,6 +165,24 @@ def break_distance_pcts(px: float, up: float, dn: float) -> tuple[float, float]:
     dn_pct = max(0.0, (1.0 - dn / px) * 100.0)
     return up_pct, dn_pct
 
+def cap_next_price(side: str, avg: float, target_raw: float | None, atr5m: float, rng: dict) -> tuple[float | None, bool, bool]:
+    if target_raw is None or np.isnan(target_raw):
+        return None, False, False
+    brk_up, brk_dn = break_levels(rng)
+    buf = max(1e-9, 0.05 * max(atr5m, 1e-9))
+    if side == "SHORT":
+        cap_price = brk_up - buf
+        if cap_price <= avg * (1.0 + 1e-9):
+            return None, False, True
+        clipped = target_raw > cap_price
+        return (min(target_raw, cap_price), clipped, False)
+    else:
+        cap_price = brk_dn + buf
+        if cap_price >= avg * (1.0 - 1e-9):
+            return None, False, True
+        clipped = target_raw < cap_price
+        return (max(target_raw, cap_price), clipped, False)
+
 def sl_moved_enough(prev: float|None, new: float, side: str, tick: float, min_steps: int) -> bool:
     if prev is None:
         return True
@@ -156,9 +194,7 @@ def quantize_to_tick(x: float | None, tick: float) -> float | None:
         return x
     return round(round(x / tick) * tick, 10)
 
-# ИСПРАВЛЕНО: Возвращена недостающая функция
 def compute_pct_targets(entry: float, side: str, rng: dict, tick: float, pcts: list[float]) -> list[float]:
-    """Возвращает абсолютные цены усреднений по долям пути до границы rng."""
     if side == "SHORT":
         cap = rng["upper"]
         path = max(0.0, cap - entry)
@@ -457,7 +493,7 @@ async def scanner_main_loop(app: Application, broadcast):
                                           f"Цена выхода: <code>{fmt(exit_p)}</code>\n"
                                           f"P&L≈ {pnl_usd:+.2f} USDT ({pnl_pct:+.2f}%)\n"
                                           f"Время в сделке: {time_min:.1f} мин")
-                await trade_executor.bmr_log_event({
+                await log_event_safely({
                     "Event_ID": f"MANUAL_CLOSE_{pos.signal_id}", "Signal_ID": pos.signal_id,
                     "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                     "Pair": symbol, "Side": pos.side, "Event": "MANUAL_CLOSE",
@@ -528,7 +564,7 @@ async def scanner_main_loop(app: Application, broadcast):
                             f"{brk_line}\n"
                             f"След. усреднение: <code>{nxt_txt}</code> (осталось: {remaining} из {ord_total})"
                         )
-                    await trade_executor.bmr_log_event({
+                    await log_event_safely({
                         "Event_ID": f"OPEN_{pos.signal_id}", "Signal_ID": pos.signal_id, "Leverage": pos.leverage,
                         "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                         "Pair": symbol, "Side": pos.side, "Event": "OPEN",
@@ -577,7 +613,7 @@ async def scanner_main_loop(app: Application, broadcast):
                                     f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
                                     f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_txt})\n"
                                     f"{brk_line}")
-                            await trade_executor.bmr_log_event({
+                            await log_event_safely({
                                 "Event_ID": f"RETEST_ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
                                 "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                                 "Pair": symbol, "Side": pos.side, "Event": "RETEST_ADD",
@@ -624,7 +660,7 @@ async def scanner_main_loop(app: Application, broadcast):
                                     f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_txt})\n"
                                     f"{brk_line}\n"
                                     f"След. усреднение: <code>{nxt2_txt}</code> (осталось: {remaining} из {ord_total})")
-                            await trade_executor.bmr_log_event({
+                            await log_event_safely({
                                 "Event_ID": f"ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
                                 "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                                 "Pair": symbol, "Side": pos.side, "Event": "ADD",
@@ -665,7 +701,7 @@ async def scanner_main_loop(app: Application, broadcast):
                             if broadcast:
                                 await broadcast(app, f"🛡️ Трейлинг-SL (стадия {stage_idx+1}) → <code>{fmt(pos.sl_price)}</code>")
                             pos.last_sl_notified_price = pos.sl_price
-                            await trade_executor.bmr_log_event({
+                            await log_event_safely({
                                 "Event_ID": f"TRAIL_SET_{pos.signal_id}_{int(now)}", "Signal_ID": pos.signal_id,
                                 "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                                 "Pair": symbol, "Side": pos.side, "Event": "TRAIL_SET",
@@ -689,7 +725,7 @@ async def scanner_main_loop(app: Application, broadcast):
                                       f"P&L≈ {pnl_usd:+.2f} USDT ({pnl_pct:+.2f}%)\n"
                                       f"ATR(5m): {atr_now:.6f}\n"
                                       f"Время в сделке: {time_min:.1f} мин")
-                    await trade_executor.bmr_log_event({
+                    await log_event_safely({
                         "Event_ID": f"{reason}_{pos.signal_id}", "Signal_ID": pos.signal_id,
                         "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                         "Pair": symbol, "Side": pos.side, "Event": reason,
