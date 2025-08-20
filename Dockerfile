@@ -8,11 +8,13 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Устанавливаем зависимости из requirements.txt
-# Шаг с 'build-essential' убран для ускорения сборки
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Копируем все остальные файлы проекта в контейнер
 COPY . .
 
-# Команда для запуска бота будет взята из вашего Procfile,
-# поэтому CMD здесь не нужен.
+# Чтобы логи сразу шли в Railway и не буферизировались
+ENV PYTHONUNBUFFERED=1
+
+# Запуск вашего приложения (указываем правильный файл main_bot.py)
+CMD ["python", "-u", "main_bot.py"]
