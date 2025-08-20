@@ -42,6 +42,7 @@ async def post_init(app: Application):
         BotCommand("status", "Показать текущий статус и параметры"),
         BotCommand("pause", "Приостановить поиск новых сигналов"),
         BotCommand("resume", "Возобновить поиск новых сигналов"),
+        BotCommand("close", "Закрыть текущую позицию по рынку"),
         BotCommand("setbank", "Установить общий банк позиции, USDT"),
         BotCommand("setbuf", "Установить буфер за границей (напр. 0.3 или 30%)"),
     ])
@@ -49,13 +50,11 @@ async def post_init(app: Application):
 async def broadcast(app: Application, txt: str):
     """Отправляет сообщение всем подписанным пользователям с очисткой заблокировавших."""
     chat_ids = set(app.bot_data.get('chat_ids', set()))
-    # ИЗМЕНЕНО: Итерируемся по копии, чтобы безопасно удалять элементы
     for cid in list(chat_ids):
         try:
             await app.bot.send_message(chat_id=cid, text=txt, parse_mode=constants.ParseMode.HTML)
         except Exception as e:
             log.error(f"Не удалось отправить сообщение в чат {cid}: {e}")
-            # Опционально: удаляем пользователя, который заблокировал бота
             if "bot was blocked" in str(e):
                 chat_ids.discard(cid)
                 log.info(f"Чат {cid} удален из списка рассылки (бот заблокирован).")
@@ -85,9 +84,9 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     app.bot_data['run_loop_on_startup'] = True
     app.bot_data['scan_paused'] = False
     log.info("Команда /run: запускаем основной цикл.")
-    await update.message.reply_text("🚀 <b>Запускаю сканер...</b>", parse_mode=constants.ParseMode.HTML)
     task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
     setattr(app, "_main_loop_task", task)
+    await update.message.reply_text("🚀 <b>Запускаю сканер...</b>", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /stop."""
@@ -127,6 +126,14 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.bot_data["scan_paused"] = False
     log.info("Команда /resume: поиск новых сигналов возобновлен.")
     await update.message.reply_text("▶️ <b>Поиск новых сигналов возобновлён.</b>", parse_mode=constants.ParseMode.HTML)
+
+# ИСПРАВЛЕНО: Добавлена недостающая функция
+async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.bot_data.get("position"):
+        await update.message.reply_text("ℹ️ Нет активной позиции.")
+        return
+    ctx.bot_data["force_close"] = True
+    await update.message.reply_text("🧰 Закрываю позицию по рынку на ближайшем цикле…")
 
 async def cmd_setbank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
@@ -204,7 +211,6 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 if __name__ == "__main__":
-    # ИЗМЕНЕНО: Убран лишний аргумент для совместимости с PTB v20+
     persistence = PicklePersistence(filepath="bot_persistence")
     app = ApplicationBuilder().token(BOT_TOKEN).persistence(persistence).post_init(post_init).build()
 
