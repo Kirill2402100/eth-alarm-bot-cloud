@@ -1,6 +1,5 @@
 from __future__ import annotations
 import asyncio, time, logging, json, os, inspect, numbers
-# ИСПРАВЛЕНО: Возвращены недостающие импорты
 from datetime import datetime, timezone
 
 import numpy as np
@@ -66,8 +65,6 @@ class CONFIG:
         "growth_A": 1.6,
         "growth_B": 2.2,
     }
-
-ORDINARY_STEPS = 5
 
 # ---------------------------------------------------------------------------
 # Helper Functions
@@ -286,6 +283,7 @@ async def build_ranges(exchange, symbol: str):
     tac   = await build_range_for_days(exchange, symbol, CONFIG.TACTICAL_LOOKBACK_DAYS)
     return strat, tac
 
+# ИЗМЕНЕНО: Более надежный расчет Supertrend
 def compute_indicators_5m(df: pd.DataFrame) -> dict:
     atr5m = ta.atr(df["high"], df["low"], df["close"], length=14).iloc[-1]
     rsi = ta.rsi(df["close"], length=CONFIG.RSI_LEN).iloc[-1]
@@ -299,12 +297,20 @@ def compute_indicators_5m(df: pd.DataFrame) -> dict:
     ema20 = ta.ema(df["close"], length=20).iloc[-1]
     vol_z = (df["volume"].iloc[-1] - df["volume"].rolling(CONFIG.VOL_WIN).mean().iloc[-1]) / \
             max(df["volume"].rolling(CONFIG.VOL_WIN).std().iloc[-1], 1e-9)
+    
     st = ta.supertrend(df["high"], df["low"], df["close"], length=10, multiplier=3.0)
-    st_up = st["SUPERT_10_3.0"].iloc[-1]
-    st_dir = "up" if df["close"].iloc[-1] > st_up else "down"
-    st_prev = "up" if df["close"].iloc[-2] > st["SUPERT_10_3.0"].iloc[-2] else "down"
-    st_state = "up_to_down_near" if st_prev=="up" and st_dir=="down" else \
-               "down_to_up_near" if st_prev=="down" and st_dir=="up" else st_dir
+    d_col = next((c for c in st.columns if c.startswith("SUPERTd_")), None)
+    if d_col is None:
+        raise ValueError("Supertrend direction column not found")
+    
+    dir_now  = int(st[d_col].iloc[-1])
+    dir_prev = int(st[d_col].iloc[-2])
+    st_state = (
+        "down_to_up_near" if (dir_prev == -1 and dir_now == 1) else
+        "up_to_down_near" if (dir_prev == 1 and dir_now == -1) else
+        ("up" if dir_now == 1 else "down")
+    )
+
     ema_dev_atr = abs(df["close"].iloc[-1] - ema20) / max(float(atr5m), 1e-9)
     for v in (atr5m, rsi, adx, ema20, vol_z, ema_dev_atr):
         if pd.isna(v) or np.isinf(v):
@@ -357,8 +363,7 @@ class Position:
 async def scanner_main_loop(app: Application, broadcast):
     log.info("BMR-DCA loop starting…")
     app.bot_data.setdefault("position", None)
-    app.bot_data.setdefault("last_range_build", 0.0)
-
+    
     try:
         creds_json = os.environ.get("GOOGLE_CREDENTIALS")
         sheet_key  = os.environ.get("SHEET_ID")
@@ -514,18 +519,34 @@ async def scanner_main_loop(app: Application, broadcast):
                         if broadcast:
                             await broadcast(app, "📌 Пробой коридора — обычные усреднения заморожены. Оставлен 1 резерв на ретест.")
 
-            if not manage_only and not pos:
-                pos_in = max(0.0, min(1.0, (px - rng_tac["lower"]) / max(rng_tac["width"], 1e-9)))
-                side_cand = "LONG" if pos_in <= 0.30 else ("SHORT" if pos_in >= 0.70 else None)
+            # ИСПРАВЛЕНО: Логика ручного входа
+            manual = app.bot_data.get("manual_open")
+            if not pos and (manual is not None or not manage_only):
+                manual = app.bot_data.pop("manual_open", None)
+                if manual:
+                    side_cand = manual.get("side")
+                else:
+                    pos_in = max(0.0, min(1.0, (px - rng_tac["lower"]) / max(rng_tac["width"], 1e-9)))
+                    side_cand = "LONG" if pos_in <= 0.30 else ("SHORT" if pos_in >= 0.70 else None)
                 
                 if side_cand:
                     pos = Position(side_cand, signal_id=f"{symbol.split('/')[0]}_{int(now)}")
+                    
+                    if manual and manual.get("leverage") is not None:
+                        pos.leverage = max(CONFIG.MIN_LEVERAGE, min(CONFIG.MAX_LEVERAGE, int(manual["leverage"])))
+                    else:
+                        pos.leverage = CONFIG.LEVERAGE
+
                     growth = choose_growth(ind, rng_strat, rng_tac)
                     pos.plan_margins(bank, growth)
-                    pos.max_steps = min(6, CONFIG.DCA_LEVELS)
+
+                    if manual and manual.get("max_steps") is not None:
+                        pos.max_steps = max(1, min(CONFIG.DCA_LEVELS, int(manual["max_steps"])))
+                    else:
+                        pos.max_steps = min(6, CONFIG.DCA_LEVELS)
+                    
                     pos.ordinary_targets = compute_mixed_targets(entry=px, side=pos.side, rng_strat=rng_strat, rng_tac=rng_tac, tick=tick)
                     pos.reserved_one = False
-                    pos.leverage = CONFIG.LEVERAGE
 
                     margin, _ = pos.add_step(px)
                     app.bot_data["position"] = pos
@@ -554,9 +575,10 @@ async def scanner_main_loop(app: Application, broadcast):
                     brk_line = (f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
                                 f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)")
 
+                    hdr = f"BMR-DCA {pos.side} ({symbol.split('/')[0]})" + (" [MANUAL]" if manual else "")
                     if broadcast:
                         await broadcast(app,
-                            f"⚡ <b>BMR-DCA {pos.side} ({symbol.split('/')[0]})</b>\n"
+                            f"⚡ <b>{hdr}</b>\n"
                             f"Вход: <code>{fmt(px)}</code>\n"
                             f"Депозит (старт): <b>{cum_margin:.2f} USDT</b> | Плечо: <b>{pos.leverage}x</b>\n"
                             f"TP: <code>{fmt(pos.tp_price)}</code> (+{CONFIG.TP_PCT*100:.2f}%)\n"
@@ -572,6 +594,7 @@ async def scanner_main_loop(app: Application, broadcast):
                         "Cum_Margin_USDT": cum_margin, "Entry_Price": px, "Avg_Price": pos.avg,
                         "TP_Pct": CONFIG.TP_PCT, "TP_Price": pos.tp_price, "Liq_Est_Price": liq,
                         "Next_DCA_Price": (nxt and nxt["price"]) or "", "Next_DCA_Label": (nxt and nxt["label"]) or "",
+                        "Triggered_Label": ("MANUAL" if manual else ""),
                         "Fee_Rate_Maker": CONFIG.FEE_MAKER, "Fee_Rate_Taker": CONFIG.FEE_TAKER,
                         "Fee_Est_USDT": fees_paid_est / CONFIG.LIQ_FEE_BUFFER, "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
                         "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
