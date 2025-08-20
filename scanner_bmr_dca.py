@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, time, logging, json, os
+import asyncio, time, logging, json, os, inspect
 from datetime import datetime, timezone
 
 import numpy as np
@@ -69,7 +69,13 @@ class CONFIG:
 # ---------------------------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------------------------
-# ИСПРАВЛЕНО: Добавлен недостающий хелпер для безопасного логирования
+async def maybe_await(func, *args, **kwargs):
+    """Executes a function that could be sync or async."""
+    if inspect.iscoroutinefunction(func):
+        return await func(*args, **kwargs)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+
 SAFE_LOG_KEYS = {
     "Event_ID","Signal_ID","Leverage","Timestamp_UTC","Pair","Side","Event",
     "Step_No","Step_Margin_USDT","Cum_Margin_USDT","Entry_Price","Avg_Price",
@@ -84,7 +90,7 @@ SAFE_LOG_KEYS = {
 async def log_event_safely(payload: dict):
     data = {k: v for k, v in payload.items() if k in SAFE_LOG_KEYS}
     try:
-        await trade_executor.bmr_log_event(data)
+        await maybe_await(trade_executor.bmr_log_event, data)
     except Exception:
         log.exception("[SHEETS] log_event_safely failed")
 
@@ -162,24 +168,6 @@ def break_distance_pcts(px: float, up: float, dn: float) -> tuple[float, float]:
     dn_pct = max(0.0, (1.0 - dn / px) * 100.0)
     return up_pct, dn_pct
 
-def cap_next_price(side: str, avg: float, target_raw: float | None, atr5m: float, rng: dict) -> tuple[float | None, bool, bool]:
-    if target_raw is None or np.isnan(target_raw):
-        return None, False, False
-    brk_up, brk_dn = break_levels(rng)
-    buf = max(1e-9, 0.05 * max(atr5m, 1e-9))
-    if side == "SHORT":
-        cap_price = brk_up - buf
-        if cap_price <= avg * (1.0 + 1e-9):
-            return None, False, True
-        clipped = target_raw > cap_price
-        return (min(target_raw, cap_price), clipped, False)
-    else:
-        cap_price = brk_dn + buf
-        if cap_price >= avg * (1.0 - 1e-9):
-            return None, False, True
-        clipped = target_raw < cap_price
-        return (max(target_raw, cap_price), clipped, False)
-
 def sl_moved_enough(prev: float|None, new: float, side: str, tick: float, min_steps: int) -> bool:
     if prev is None:
         return True
@@ -241,7 +229,8 @@ def compute_mixed_targets(entry: float, side: str, rng_strat: dict, rng_tac: dic
     strs = compute_pct_targets_labeled(entry, side, rng_strat, tick, CONFIG.STRATEGIC_PCTS, "STRAT")
     return merge_targets_sorted(side, tick, tacs + strs)
 
-def next_pct_target(pos, tick: float):
+# ИЗМЕНЕНО: Убран лишний аргумент tick
+def next_pct_target(pos):
     idx = pos.steps_filled - 1
     if not getattr(pos, "ordinary_targets", None):
         return None
@@ -362,7 +351,7 @@ async def scanner_main_loop(app: Application, broadcast):
         if creds_json and sheet_key:
             gc = gspread.service_account_from_dict(json.loads(creds_json))
             sheet = gc.open_by_key(sheet_key)
-            await trade_executor.ensure_bmr_log_sheet(sheet, title="BMR_DCA_Log")
+            await maybe_await(trade_executor.ensure_bmr_log_sheet, sheet, title="BMR_DCA_Log")
     except Exception as e:
         log.error(f"Sheets init error: {e}", exc_info=True)
 
@@ -539,7 +528,7 @@ async def scanner_main_loop(app: Application, broadcast):
                     dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
                     liq_arrow = "↓" if pos.side == "LONG" else "↑"
 
-                    nxt = next_pct_target(pos, tick)
+                    nxt = next_pct_target(pos)
                     nxt_txt = "N/A" if nxt is None else f"{fmt(nxt['price'])} ({nxt['label']})"
                     
                     ord_total = len(pos.ordinary_targets)
@@ -618,7 +607,7 @@ async def scanner_main_loop(app: Application, broadcast):
                                 "Entry_Price": px, "Avg_Price": pos.avg
                             })
                     else:
-                        nxt = next_pct_target(pos, tick)
+                        nxt = next_pct_target(pos)
                         trigger = (nxt is not None) and ((pos.side=="LONG" and px <= nxt["price"]) or (pos.side=="SHORT" and px >= nxt["price"]))
                         if trigger and pos.steps_filled < pos.max_steps:
                             margin, _ = pos.add_step(px)
@@ -634,7 +623,7 @@ async def scanner_main_loop(app: Application, broadcast):
                             dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
                             liq_arrow = "↓" if pos.side == "LONG" else "↑"
                             
-                            nxt2 = next_pct_target(pos, tick)
+                            nxt2 = next_pct_target(pos)
                             nxt2_txt = "N/A" if nxt2 is None else f"{fmt(nxt2['price'])} ({nxt2['label']})"
                             
                             ord_total = len(pos.ordinary_targets)
@@ -733,10 +722,9 @@ async def scanner_main_loop(app: Application, broadcast):
                     pos.last_sl_notified_price = None
                     app.bot_data["position"] = None
 
-            # ИЗМЕНЕНО: Безусловный сброс буфера
             if (time.time() - last_flush) >= 10:
                 try:
-                    await trade_executor.flush_log_buffers()
+                    await maybe_await(trade_executor.flush_log_buffers)
                 except Exception:
                     log.exception("flush_log_buffers failed")
                 last_flush = time.time()
