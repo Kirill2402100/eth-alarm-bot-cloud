@@ -1,6 +1,5 @@
 from __future__ import annotations
-import asyncio, time, logging, json, os, inspect
-from datetime import datetime, timezone
+import asyncio, time, logging, json, os, inspect, numbers
 
 import numpy as np
 import pandas as pd
@@ -70,7 +69,6 @@ class CONFIG:
 # Helper Functions
 # ---------------------------------------------------------------------------
 async def maybe_await(func, *args, **kwargs):
-    """Executes a function that could be sync or async."""
     if inspect.iscoroutinefunction(func):
         return await func(*args, **kwargs)
     loop = asyncio.get_running_loop()
@@ -87,10 +85,24 @@ SAFE_LOG_KEYS = {
     "Next_DCA_Label", "Triggered_Label"
 }
 
+# ИСПРАВЛЕНО: Улучшенный санитайзер для JSON-совместимости
+def _clean(v):
+    if v is None:
+        return ""
+    if isinstance(v, (np.generic,)):
+        v = v.item()
+    if isinstance(v, numbers.Real):
+        if not np.isfinite(v):
+            return ""
+        return float(v)
+    return v
+
+def _clean_payload(d: dict) -> dict:
+    return {k: _clean(v) for k, v in d.items() if k in SAFE_LOG_KEYS}
+
 async def log_event_safely(payload: dict):
-    data = {k: v for k, v in payload.items() if k in SAFE_LOG_KEYS}
     try:
-        await maybe_await(trade_executor.bmr_log_event, data)
+        await maybe_await(trade_executor.bmr_log_event, _clean_payload(payload))
     except Exception:
         log.exception("[SHEETS] log_event_safely failed")
 
@@ -229,7 +241,6 @@ def compute_mixed_targets(entry: float, side: str, rng_strat: dict, rng_tac: dic
     strs = compute_pct_targets_labeled(entry, side, rng_strat, tick, CONFIG.STRATEGIC_PCTS, "STRAT")
     return merge_targets_sorted(side, tick, tacs + strs)
 
-# ИЗМЕНЕНО: Убран лишний аргумент tick
 def next_pct_target(pos):
     idx = pos.steps_filled - 1
     if not getattr(pos, "ordinary_targets", None):
@@ -523,7 +534,7 @@ async def scanner_main_loop(app: Application, broadcast):
                         avg=pos.avg, side=pos.side, qty=pos.qty,
                         equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
                     )
-                    if liq <= 0: liq = float('nan')
+                    if not np.isfinite(liq) or liq <= 0: liq = None
                     dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
                     dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
                     liq_arrow = "↓" if pos.side == "LONG" else "↑"
@@ -581,7 +592,7 @@ async def scanner_main_loop(app: Application, broadcast):
                                 avg=pos.avg, side=pos.side, qty=pos.qty,
                                 equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
                             )
-                            if liq <= 0: liq = float('nan')
+                            if not np.isfinite(liq) or liq <= 0: liq = None
                             dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
                             dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
                             liq_arrow = "↓" if pos.side == "LONG" else "↑"
@@ -618,7 +629,7 @@ async def scanner_main_loop(app: Application, broadcast):
                                 avg=pos.avg, side=pos.side, qty=pos.qty,
                                 equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
                             )
-                            if liq <= 0: liq = float('nan')
+                            if not np.isfinite(liq) or liq <= 0: liq = None
                             dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
                             dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
                             liq_arrow = "↓" if pos.side == "LONG" else "↑"
