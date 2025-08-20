@@ -1,5 +1,7 @@
 from __future__ import annotations
 import asyncio, time, logging, json, os, inspect, numbers
+# ИСПРАВЛЕНО: Возвращены недостающие импорты
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -65,6 +67,8 @@ class CONFIG:
         "growth_B": 2.2,
     }
 
+ORDINARY_STEPS = 5
+
 # ---------------------------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------------------------
@@ -85,7 +89,6 @@ SAFE_LOG_KEYS = {
     "Next_DCA_Label", "Triggered_Label"
 }
 
-# ИСПРАВЛЕНО: Улучшенный санитайзер для JSON-совместимости
 def _clean(v):
     if v is None:
         return ""
