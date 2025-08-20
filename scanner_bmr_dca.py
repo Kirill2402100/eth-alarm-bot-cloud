@@ -21,7 +21,8 @@ class CONFIG:
     SYMBOL = "EURC/USDT:USDT"
     TF_ENTRY = "5m"
     TF_RANGE = "1h"
-    RANGE_LOOKBACK_DAYS = 60
+    STRATEGIC_LOOKBACK_DAYS = 60
+    TACTICAL_LOOKBACK_DAYS = 3
     FETCH_TIMEOUT = 15
     BASE_STEP_MARGIN = 10.0
     DCA_LEVELS = 7
@@ -40,14 +41,14 @@ class CONFIG:
         "supertrend": 0.10, "vol": 0.10
     }
     SCORE_THR = 0.55
-    # ИЗМЕНЕНО: Длина списка исправлена для assert
     ATR_MULTS = [0, 1, 2, 3, 4, 5, 6]
-    DCA_PCTS = [0.10, 0.25, 0.45, 0.70, 0.90]
+    STRATEGIC_PCTS = [0.10, 0.45, 0.90]
+    TACTICAL_PCTS = [0.40, 0.80]
     TP_PCT = 0.010
-    TRAIL_ARM = 0.6
-    TRAIL_LOCK = 0.5
+    TRAILING_STAGES = [(0.35, 0.25), (0.60, 0.50), (0.85, 0.75)]
     SCAN_INTERVAL_SEC = 3
     REBUILD_RANGE_EVERY_MIN = 15
+    REBUILD_TACTICAL_EVERY_MIN = 5
     SAFETY_BANK_USDT = 1500.0
     CUM_DEPOSIT_FRAC_AT_FULL = 2/3
     AUTO_LEVERAGE = False
@@ -58,11 +59,12 @@ class CONFIG:
     MAINT_MMR = 0.004
     LIQ_FEE_BUFFER = 1.0
     SL_NOTIFY_MIN_TICK_STEP = 1
-
-assert len(CONFIG.ATR_MULTS) >= CONFIG.DCA_LEVELS, "ATR_MULTS must cover all DCA levels"
-
-# ДОБАВЛЕНО: Константа для сообщений
-ORDINARY_STEPS = 5
+    AUTO_ALLOC = {
+        "thin_tac_vs_strat": 0.35,
+        "low_vol_z": 0.5,
+        "growth_A": 1.6,
+        "growth_B": 2.2,
+    }
 
 # ---------------------------------------------------------------------------
 # Helper Functions
@@ -141,24 +143,6 @@ def break_distance_pcts(px: float, up: float, dn: float) -> tuple[float, float]:
     dn_pct = max(0.0, (1.0 - dn / px) * 100.0)
     return up_pct, dn_pct
 
-def cap_next_price(side: str, avg: float, target_raw: float | None, atr5m: float, rng: dict) -> tuple[float | None, bool, bool]:
-    if target_raw is None or np.isnan(target_raw):
-        return None, False, False
-    brk_up, brk_dn = break_levels(rng)
-    buf = max(1e-9, 0.05 * max(atr5m, 1e-9))
-    if side == "SHORT":
-        cap_price = brk_up - buf
-        if cap_price <= avg * (1.0 + 1e-9):
-            return None, False, True
-        clipped = target_raw > cap_price
-        return (min(target_raw, cap_price), clipped, False)
-    else:
-        cap_price = brk_dn + buf
-        if cap_price >= avg * (1.0 - 1e-9):
-            return None, False, True
-        clipped = target_raw < cap_price
-        return (max(target_raw, cap_price), clipped, False)
-
 def sl_moved_enough(prev: float|None, new: float, side: str, tick: float, min_steps: int) -> bool:
     if prev is None:
         return True
@@ -192,17 +176,46 @@ def compute_pct_targets(entry: float, side: str, rng: dict, tick: float, pcts: l
             out.append(q)
     return out
 
+# ИЗМЕНЕНО: Корректное слияние и сортировка сеток
+def merge_targets_sorted(side: str, tick: float, targets: list[float]) -> list[float]:
+    if side == "SHORT":
+        targets = sorted([t for t in targets if t is not None])
+    else:
+        targets = sorted([t for t in targets if t is not None], reverse=True)
+    dedup = []
+    for x in targets:
+        if not dedup:
+            dedup.append(x)
+        else:
+            if (side == "SHORT" and x > dedup[-1] + tick) or (side == "LONG" and x < dedup[-1] - tick):
+                dedup.append(x)
+    return dedup
+
+def compute_mixed_targets(entry: float, side: str, rng_strat: dict, rng_tac: dict, tick: float) -> list[float]:
+    tacs = compute_pct_targets(entry, side, rng_tac,   tick, CONFIG.TACTICAL_PCTS)
+    strs = compute_pct_targets(entry, side, rng_strat, tick, CONFIG.STRATEGIC_PCTS)
+    return merge_targets_sorted(side, tick, tacs + strs)
+
 def next_pct_target(pos, tick: float):
     idx = pos.steps_filled - 1
     if not getattr(pos, "ordinary_targets", None):
         return None
     return pos.ordinary_targets[idx] if 0 <= idx < len(pos.ordinary_targets) else None
 
+def choose_growth(ind: dict, rng_strat: dict, rng_tac: dict) -> float:
+    try:
+        width_ratio = (rng_tac["width"] / max(rng_strat["width"], 1e-9))
+    except Exception:
+        width_ratio = 1.0
+    thin = width_ratio <= CONFIG.AUTO_ALLOC["thin_tac_vs_strat"]
+    low_vol = abs(ind.get("vol_z", 0.0)) <= CONFIG.AUTO_ALLOC["low_vol_z"]
+    return CONFIG.AUTO_ALLOC["growth_A"] if (thin and low_vol) else CONFIG.AUTO_ALLOC["growth_B"]
+
 # ---------------------------------------------------------------------------
 # Core Logic Functions
 # ---------------------------------------------------------------------------
-async def build_range(exchange, symbol: str):
-    limit_h = min(int(CONFIG.RANGE_LOOKBACK_DAYS * 24), 1500)
+async def build_range_for_days(exchange, symbol: str, lookback_days: int):
+    limit_h = min(int(lookback_days * 24), 1500)
     ohlc = await fetch_ohlcv_safe(exchange, symbol, CONFIG.TF_RANGE, limit_h)
     if not ohlc: return None
     df = pd.DataFrame(ohlc, columns=["ts","open","high","low","close","volume"])
@@ -219,6 +232,11 @@ async def build_range(exchange, symbol: str):
         atr1h = 0.0
         mid = float(df["close"].iloc[-1])
     return {"lower": lower, "upper": upper, "mid": mid, "atr1h": atr1h, "width": upper-lower}
+
+async def build_ranges(exchange, symbol: str):
+    strat = await build_range_for_days(exchange, symbol, CONFIG.STRATEGIC_LOOKBACK_DAYS)
+    tac   = await build_range_for_days(exchange, symbol, CONFIG.TACTICAL_LOOKBACK_DAYS)
+    return strat, tac
 
 def compute_indicators_5m(df: pd.DataFrame) -> dict:
     atr5m = ta.atr(df["high"], df["low"], df["close"], length=14).iloc[-1]
@@ -269,10 +287,11 @@ class Position:
         self.reserved_one = False
         self.last_sl_notified_price = None
         self.ordinary_targets: list[float] = []
+        self.trail_stage: int = -1
 
-    def plan_margins(self, bank: float):
+    def plan_margins(self, bank: float, growth: float):
         total_target = bank * CONFIG.CUM_DEPOSIT_FRAC_AT_FULL
-        self.step_margins = plan_margins_bank_first(total_target, CONFIG.DCA_LEVELS, CONFIG.DCA_GROWTH)
+        self.step_margins = plan_margins_bank_first(total_target, CONFIG.DCA_LEVELS, growth)
 
     def add_step(self, price: float):
         margin = self.step_margins[self.steps_filled]
@@ -340,8 +359,10 @@ async def scanner_main_loop(app: Application, broadcast):
         tick = 1e-4
     app.bot_data["price_tick"] = float(tick)
 
-    rng = None
+    rng_strat, rng_tac = None, None
     last_flush = 0
+    last_build_strat = 0.0
+    last_build_tac = 0.0
 
     while app.bot_data.get("bot_on", False):
         try:
@@ -351,18 +372,23 @@ async def scanner_main_loop(app: Application, broadcast):
             manage_only = app.bot_data.get("scan_paused", False)
             pos: Position | None = app.bot_data.get("position")
 
-            need_build = (rng is None) or ((now - app.bot_data.get("last_range_build", 0) > CONFIG.REBUILD_RANGE_EVERY_MIN*60) and (pos is None))
-            if need_build:
-                tmp_rng = await build_range(exchange, symbol)
-                if tmp_rng:
-                    rng = tmp_rng
-                    app.bot_data["last_range_build"] = now
-                    log.info(f"[RANGE] New range built: lower={fmt(rng['lower'])} upper={fmt(rng['upper'])} width={fmt(rng['width'])}")
+            # ИЗМЕНЕНО: Оптимизированный вызов для построения коридоров
+            need_build_strat = (rng_strat is None) or ((now - last_build_strat > CONFIG.REBUILD_RANGE_EVERY_MIN*60) and (pos is None))
+            need_build_tac   = (rng_tac is None) or ((now - last_build_tac > CONFIG.REBUILD_TACTICAL_EVERY_MIN*60) and (pos is None))
+            if need_build_strat or need_build_tac:
+                s, t = await build_ranges(exchange, symbol)
+                if need_build_strat and s:
+                    rng_strat = s
+                    last_build_strat = now
                     app.bot_data["intro_done"] = False
-                else:
-                    log.warning("[RANGE] Failed to build new range; using previous one if available.")
+                    log.info(f"[RANGE-STRAT] lower={fmt(rng_strat['lower'])} upper={fmt(rng_strat['upper'])} width={fmt(rng_strat['width'])}")
+                if need_build_tac and t:
+                    rng_tac = t
+                    last_build_tac = now
+                    app.bot_data["intro_done"] = False
+                    log.info(f"[RANGE-TAC]   lower={fmt(rng_tac['lower'])} upper={fmt(rng_tac['upper'])} width={fmt(rng_tac['width'])}")
             
-            if not rng:
+            if not (rng_strat and rng_tac):
                 log.error("Range is not available. Cannot proceed.")
                 await asyncio.sleep(10)
                 continue
@@ -385,8 +411,8 @@ async def scanner_main_loop(app: Application, broadcast):
             px = float(df5["close"].iloc[-1])
 
             if (not app.bot_data.get("intro_done")) and (pos is None):
-                p30 = rng["lower"] + 0.30 * rng["width"]
-                p70 = rng["lower"] + 0.70 * rng["width"]
+                p30 = rng_strat["lower"] + 0.30 * rng_strat["width"]
+                p70 = rng_strat["lower"] + 0.70 * rng_strat["width"]
                 d_to_long  = max(0.0, px - p30)
                 d_to_short = max(0.0, p70 - px)
                 pct_to_long  = (d_to_long / max(px, 1e-9)) * 100
@@ -425,7 +451,7 @@ async def scanner_main_loop(app: Application, broadcast):
                 continue
 
             if pos:
-                brk_up, brk_dn = break_levels(rng)
+                brk_up, brk_dn = break_levels(rng_strat)
                 if px >= brk_up or px <= brk_dn:
                     if not pos.reserved_one:
                         pos.max_steps = min(pos.steps_filled + 1, CONFIG.DCA_LEVELS)
@@ -434,14 +460,18 @@ async def scanner_main_loop(app: Application, broadcast):
                             await broadcast(app, "📌 Пробой коридора — обычные усреднения заморожены. Оставлен 1 резерв на ретест.")
 
             if not manage_only and not pos:
-                pos_in = max(0.0, min(1.0, (px - rng["lower"]) / max(rng["width"], 1e-9)))
+                pos_in = max(0.0, min(1.0, (px - rng_strat["lower"]) / max(rng_strat["width"], 1e-9)))
                 side_cand = "LONG" if pos_in <= 0.30 else ("SHORT" if pos_in >= 0.70 else None)
                 
                 if side_cand:
                     pos = Position(side_cand, signal_id=f"{symbol.split('/')[0]}_{int(now)}")
-                    pos.plan_margins(bank)
+                    growth = choose_growth(ind, rng_strat, rng_tac)
+                    pos.plan_margins(bank, growth)
+                    log.info(f"[BUDGET] steps={len(pos.step_margins)}, sum={sum(pos.step_margins):.2f}, "
+                             f"first6={sum(pos.step_margins[:6]):.2f}, last(reserve)={pos.step_margins[6]:.2f}")
+
                     pos.max_steps = min(6, CONFIG.DCA_LEVELS)
-                    pos.ordinary_targets = compute_pct_targets(entry=px, side=pos.side, rng=rng, tick=tick, pcts=CONFIG.DCA_PCTS)
+                    pos.ordinary_targets = compute_mixed_targets(entry=px, side=pos.side, rng_strat=rng_strat, rng_tac=rng_tac, tick=tick)
                     pos.reserved_one = False
                     pos.leverage = CONFIG.LEVERAGE
 
@@ -462,9 +492,12 @@ async def scanner_main_loop(app: Application, broadcast):
 
                     nxt = next_pct_target(pos, tick)
                     nxt_txt = "N/A" if nxt is None else fmt(nxt)
-                    remaining = pos.max_steps - pos.steps_filled
                     
-                    brk_up, brk_dn = break_levels(rng)
+                    ord_total = len(pos.ordinary_targets)
+                    remaining = min(pos.max_steps - pos.steps_filled, ord_total - (pos.steps_filled - 1))
+                    remaining = max(0, remaining)
+                    
+                    brk_up, brk_dn = break_levels(rng_strat)
                     brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
                     brk_line = (f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
                                 f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)")
@@ -477,7 +510,7 @@ async def scanner_main_loop(app: Application, broadcast):
                             f"TP: <code>{fmt(pos.tp_price)}</code> (+{CONFIG.TP_PCT*100:.2f}%)\n"
                             f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_txt})\n"
                             f"{brk_line}\n"
-                            f"След. усреднение по цене: <code>{nxt_txt}</code> (осталось усреднений: {remaining} из 5)"
+                            f"След. усреднение по цене: <code>{nxt_txt}</code> (осталось усреднений: {remaining} из {ord_total})"
                         )
                     await trade_executor.bmr_log_event({
                         "Event_ID": f"OPEN_{pos.signal_id}", "Signal_ID": pos.signal_id, "Leverage": pos.leverage,
@@ -488,17 +521,17 @@ async def scanner_main_loop(app: Application, broadcast):
                         "TP_Pct": CONFIG.TP_PCT, "TP_Price": pos.tp_price, "Liq_Est_Price": liq,
                         "Next_DCA_Price": nxt or "",
                         "Fee_Rate_Maker": CONFIG.FEE_MAKER, "Fee_Rate_Taker": CONFIG.FEE_TAKER,
-                        "Fee_Est_USDT": fees_paid_est / CONFIG.LIQ_FEE_BUFFER, "ATR_5m": ind["atr5m"], "ATR_1h": rng["atr1h"],
+                        "Fee_Est_USDT": fees_paid_est / CONFIG.LIQ_FEE_BUFFER, "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
                         "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
-                        "Range_Lower": rng["lower"], "Range_Upper": rng["upper"], "Range_Width": rng["width"]
+                        "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"]
                     })
 
             pos = app.bot_data.get("position")
             if pos:
                 if not manage_only:
                     if pos.reserved_one:
-                        need_retest = (pos.side=="SHORT" and px <= rng["upper"] * (1 - CONFIG.REENTRY_BAND)) or \
-                                      (pos.side=="LONG"  and px >= rng["lower"] * (1 + CONFIG.REENTRY_BAND))
+                        need_retest = (pos.side=="SHORT" and px <= rng_strat["upper"] * (1 - CONFIG.REENTRY_BAND)) or \
+                                      (pos.side=="LONG"  and px >= rng_strat["lower"] * (1 + CONFIG.REENTRY_BAND))
                         can_add = pos.steps_filled < pos.max_steps
                         if need_retest and can_add and trend_reversal_confirmed(pos.side, ind):
                             margin, _ = pos.add_step(px)
@@ -515,7 +548,7 @@ async def scanner_main_loop(app: Application, broadcast):
                             dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
                             liq_arrow = "↓" if pos.side == "LONG" else "↑"
                             
-                            brk_up, brk_dn = break_levels(rng)
+                            brk_up, brk_dn = break_levels(rng_strat)
                             brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
                             brk_line = (f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
                                         f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)")
@@ -554,9 +587,12 @@ async def scanner_main_loop(app: Application, broadcast):
                             
                             nxt2 = next_pct_target(pos, tick)
                             nxt2_txt = "N/A" if nxt2 is None else fmt(nxt2)
-                            remaining = pos.max_steps - pos.steps_filled
+                            
+                            ord_total = len(pos.ordinary_targets)
+                            remaining = min(pos.max_steps - pos.steps_filled, ord_total - (pos.steps_filled - 1))
+                            remaining = max(0, remaining)
 
-                            brk_up, brk_dn = break_levels(rng)
+                            brk_up, brk_dn = break_levels(rng_strat)
                             brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
                             brk_line = (f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
                                         f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)")
@@ -569,7 +605,7 @@ async def scanner_main_loop(app: Application, broadcast):
                                     f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
                                     f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_txt})\n"
                                     f"{brk_line}\n"
-                                    f"След. усреднение по цене: <code>{nxt2_txt}</code> (осталось: {remaining} из 5)")
+                                    f"След. усреднение по цене: <code>{nxt2_txt}</code> (осталось: {remaining} из {ord_total})")
                             await trade_executor.bmr_log_event({
                                 "Event_ID": f"ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
                                 "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -579,41 +615,43 @@ async def scanner_main_loop(app: Application, broadcast):
                                 "TP_Price": pos.tp_price, "SL_Price": pos.sl_price or "",
                                 "Liq_Est_Price": liq, "Next_DCA_Price": nxt2 or "",
                                 "Fee_Rate_Maker": CONFIG.FEE_MAKER, "Fee_Rate_Taker": CONFIG.FEE_TAKER,
-                                "Fee_Est_USDT": fees_paid_est / CONFIG.LIQ_FEE_BUFFER, "ATR_5m": ind["atr5m"], "ATR_1h": rng["atr1h"],
+                                "Fee_Est_USDT": fees_paid_est / CONFIG.LIQ_FEE_BUFFER, "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
                                 "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
-                                "Range_Lower": rng["lower"], "Range_Upper": rng["upper"], "Range_Width": rng["width"]
+                                "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"]
                             })
 
                 if pos.side == "LONG": gain_to_tp = max(0.0, (px / max(pos.avg,1e-9) - 1.0) / CONFIG.TP_PCT)
                 else: gain_to_tp = max(0.0, (pos.avg / max(px,1e-9) - 1.0) / CONFIG.TP_PCT)
 
-                if gain_to_tp >= CONFIG.TRAIL_ARM:
-                    lock_pct = CONFIG.TRAIL_LOCK * CONFIG.TP_PCT
+                for stage_idx, (arm, lock) in enumerate(CONFIG.TRAILING_STAGES):
+                    if pos.trail_stage >= stage_idx:
+                        continue
+                    if gain_to_tp < arm:
+                        break
+                    lock_pct = lock * CONFIG.TP_PCT
                     locked = pos.avg*(1+lock_pct) if pos.side=="LONG" else pos.avg*(1-lock_pct)
                     chand = chandelier_stop(pos.side, px, ind["atr5m"])
                     new_sl = max(locked, chand) if pos.side=="LONG" else min(locked, chand)
                     
                     tick = app.bot_data.get("price_tick", 1e-4)
-                    new_sl_q = quantize_to_tick(new_sl, tick)
+                    new_sl_q  = quantize_to_tick(new_sl, tick)
                     curr_sl_q = quantize_to_tick(pos.sl_price, tick)
                     last_notif_q = quantize_to_tick(pos.last_sl_notified_price, tick)
-
                     improves = (curr_sl_q is None) or \
-                               (pos.side == "LONG" and new_sl_q > curr_sl_q) or \
+                               (pos.side == "LONG"  and new_sl_q > curr_sl_q) or \
                                (pos.side == "SHORT" and new_sl_q < curr_sl_q)
-
                     if improves:
                         pos.sl_price = new_sl_q
-                        if sl_moved_enough(last_notif_q, pos.sl_price,
-                                           pos.side, tick, CONFIG.SL_NOTIFY_MIN_TICK_STEP):
+                        pos.trail_stage = stage_idx
+                        if sl_moved_enough(last_notif_q, pos.sl_price, pos.side, tick, CONFIG.SL_NOTIFY_MIN_TICK_STEP):
                             if broadcast:
-                                await broadcast(app, f"🛡️ Трейлинг-SL установлен: <code>{fmt(pos.sl_price)}</code>")
+                                await broadcast(app, f"🛡️ Трейлинг-SL (стадия {stage_idx+1}) → <code>{fmt(pos.sl_price)}</code>")
                             pos.last_sl_notified_price = pos.sl_price
                             await trade_executor.bmr_log_event({
                                 "Event_ID": f"TRAIL_SET_{pos.signal_id}_{int(now)}", "Signal_ID": pos.signal_id,
                                 "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                                 "Pair": symbol, "Side": pos.side, "Event": "TRAIL_SET",
-                                "SL_Price": pos.sl_price, "Avg_Price": pos.avg
+                                "SL_Price": pos.sl_price, "Avg_Price": pos.avg, "Trail_Stage": stage_idx+1
                             })
 
                 tp_hit = (pos.side=="LONG" and px>=pos.tp_price) or (pos.side=="SHORT" and px<=pos.tp_price)
