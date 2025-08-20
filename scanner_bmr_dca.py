@@ -66,7 +66,6 @@ class CONFIG:
         "growth_B": 2.2,
     }
 
-# ДОБАВЛЕНО: Константа для сообщений
 ORDINARY_STEPS = 5
 
 # ---------------------------------------------------------------------------
@@ -146,24 +145,6 @@ def break_distance_pcts(px: float, up: float, dn: float) -> tuple[float, float]:
     dn_pct = max(0.0, (1.0 - dn / px) * 100.0)
     return up_pct, dn_pct
 
-def cap_next_price(side: str, avg: float, target_raw: float | None, atr5m: float, rng: dict) -> tuple[float | None, bool, bool]:
-    if target_raw is None or np.isnan(target_raw):
-        return None, False, False
-    brk_up, brk_dn = break_levels(rng)
-    buf = max(1e-9, 0.05 * max(atr5m, 1e-9))
-    if side == "SHORT":
-        cap_price = brk_up - buf
-        if cap_price <= avg * (1.0 + 1e-9):
-            return None, False, True
-        clipped = target_raw > cap_price
-        return (min(target_raw, cap_price), clipped, False)
-    else:
-        cap_price = brk_dn + buf
-        if cap_price >= avg * (1.0 - 1e-9):
-            return None, False, True
-        clipped = target_raw < cap_price
-        return (max(target_raw, cap_price), clipped, False)
-
 def sl_moved_enough(prev: float|None, new: float, side: str, tick: float, min_steps: int) -> bool:
     if prev is None:
         return True
@@ -175,7 +156,9 @@ def quantize_to_tick(x: float | None, tick: float) -> float | None:
         return x
     return round(round(x / tick) * tick, 10)
 
+# ИСПРАВЛЕНО: Возвращена недостающая функция
 def compute_pct_targets(entry: float, side: str, rng: dict, tick: float, pcts: list[float]) -> list[float]:
+    """Возвращает абсолютные цены усреднений по долям пути до границы rng."""
     if side == "SHORT":
         cap = rng["upper"]
         path = max(0.0, cap - entry)
@@ -197,23 +180,32 @@ def compute_pct_targets(entry: float, side: str, rng: dict, tick: float, pcts: l
             out.append(q)
     return out
 
-def merge_targets_sorted(side: str, tick: float, targets: list[float]) -> list[float]:
+def compute_pct_targets_labeled(entry, side, rng, tick, pcts, label):
+    prices = compute_pct_targets(entry, side, rng, tick, pcts)
+    out = []
+    for i, pr in enumerate(prices):
+        pct = int(round(pcts[min(i, len(pcts)-1)] * 100))
+        out.append({"price": pr, "label": f"{label} {pct}%"})
+    return out
+
+def merge_targets_sorted(side: str, tick: float, targets: list[dict]) -> list[dict]:
     if side == "SHORT":
-        targets = sorted([t for t in targets if t is not None])
+        targets = sorted(targets, key=lambda t: t["price"])
     else:
-        targets = sorted([t for t in targets if t is not None], reverse=True)
+        targets = sorted(targets, key=lambda t: t["price"], reverse=True)
     dedup = []
-    for x in targets:
+    for t in targets:
         if not dedup:
-            dedup.append(x)
+            dedup.append(t)
         else:
-            if (side == "SHORT" and x > dedup[-1] + tick) or (side == "LONG" and x < dedup[-1] - tick):
-                dedup.append(x)
+            if (side=="SHORT" and t["price"] > dedup[-1]["price"] + tick) or \
+               (side=="LONG"  and t["price"] < dedup[-1]["price"] - tick):
+                dedup.append(t)
     return dedup
 
-def compute_mixed_targets(entry: float, side: str, rng_strat: dict, rng_tac: dict, tick: float) -> list[float]:
-    tacs = compute_pct_targets(entry, side, rng_tac,   tick, CONFIG.TACTICAL_PCTS)
-    strs = compute_pct_targets(entry, side, rng_strat, tick, CONFIG.STRATEGIC_PCTS)
+def compute_mixed_targets(entry: float, side: str, rng_strat: dict, rng_tac: dict, tick: float) -> list[dict]:
+    tacs = compute_pct_targets_labeled(entry, side, rng_tac,   tick, CONFIG.TACTICAL_PCTS,  "TAC")
+    strs = compute_pct_targets_labeled(entry, side, rng_strat, tick, CONFIG.STRATEGIC_PCTS, "STRAT")
     return merge_targets_sorted(side, tick, tacs + strs)
 
 def next_pct_target(pos, tick: float):
@@ -306,7 +298,7 @@ class Position:
         self.max_steps = CONFIG.DCA_LEVELS
         self.reserved_one = False
         self.last_sl_notified_price = None
-        self.ordinary_targets: list[float] = []
+        self.ordinary_targets: list[dict] = []
         self.trail_stage: int = -1
 
     def plan_margins(self, bank: float, growth: float):
@@ -430,29 +422,23 @@ async def scanner_main_loop(app: Application, broadcast):
             px = float(df5["close"].iloc[-1])
 
             if (not app.bot_data.get("intro_done")) and (pos is None):
-                p30 = rng_strat["lower"] + 0.30 * rng_strat["width"]
-                p70 = rng_strat["lower"] + 0.70 * rng_strat["width"]
-                d_to_long  = max(0.0, px - p30)
-                d_to_short = max(0.0, p70 - px)
-                pct_to_long  = (d_to_long / max(px, 1e-9)) * 100
+                p30_t = rng_tac["lower"] + 0.30 * rng_tac["width"]
+                p70_t = rng_tac["lower"] + 0.70 * rng_tac["width"]
+                d_to_long  = max(0.0, px - p30_t)
+                d_to_short = max(0.0, p70_t - px)
+                pct_to_long  = (d_to_long  / max(px, 1e-9)) * 100
                 pct_to_short = (d_to_short / max(px, 1e-9)) * 100
                 brk_up, brk_dn = break_levels(rng_strat)
                 width_ratio = (rng_tac["width"] / max(rng_strat["width"], 1e-9)) * 100.0
                 if broadcast:
                     msg = (
-                        f"🎯 Пороги входа (стратегический): "
-                        f"LONG ≤ <code>{fmt(p30)}</code> (30%), "
-                        f"SHORT ≥ <code>{fmt(p70)}</code> (70%).\n"
+                        f"🎯 Пороги входа (<b>TAC 30/70</b>): LONG ≤ <code>{fmt(p30_t)}</code>, SHORT ≥ <code>{fmt(p70_t)}</code>\n"
                         f"📏 Диапазоны:\n"
-                        f"• STRAT: [<code>{fmt(rng_strat['lower'])}</code> … <code>{fmt(rng_strat['upper'])}</code>] "
-                        f"w=<code>{fmt(rng_strat['width'])}</code>\n"
-                        f"• TAC (3d): [<code>{fmt(rng_tac['lower'])}</code> … <code>{fmt(rng_tac['upper'])}</code>] "
-                        f"w=<code>{fmt(rng_tac['width'])}</code> (≈{width_ratio:.0f}% от STRAT)\n"
-                        f"🔓 Пробой STRAT: ↑<code>{fmt(brk_up)}</code> | ↓<code>{fmt(brk_dn)}</code>\n"
-                        f"Текущая: <code>{fmt(px)}</code>. "
-                        f"До LONG: {fmt(d_to_long)} ({pct_to_long:.2f}%), "
-                        f"до SHORT: {fmt(d_to_short)} ({pct_to_short:.2f}%).\n"
-                        f"ℹ️ Усреднения: 2 внутри TAC (40/80%), 3 по STRAT (10/45/90%) + резерв после пробоя."
+                        f"• STRAT: [{fmt(rng_strat['lower'])} … {fmt(rng_strat['upper'])}] w={fmt(rng_strat['width'])}\n"
+                        f"• TAC (3d): [{fmt(rng_tac['lower'])} … {fmt(rng_tac['upper'])}] w={fmt(rng_tac['width'])}\n"
+                        f"🔓 Пробой STRAT: ↑{fmt(brk_up)} | ↓{fmt(brk_dn)}\n"
+                        f"Текущая: {fmt(px)}. До LONG: {fmt(d_to_long)} ({pct_to_long:.2f}%), "
+                        f"до SHORT: {fmt(d_to_short)} ({pct_to_short:.2f}%)."
                     )
                     await broadcast(app, msg)
                 app.bot_data["intro_done"] = True
@@ -493,7 +479,7 @@ async def scanner_main_loop(app: Application, broadcast):
                             await broadcast(app, "📌 Пробой коридора — обычные усреднения заморожены. Оставлен 1 резерв на ретест.")
 
             if not manage_only and not pos:
-                pos_in = max(0.0, min(1.0, (px - rng_strat["lower"]) / max(rng_strat["width"], 1e-9)))
+                pos_in = max(0.0, min(1.0, (px - rng_tac["lower"]) / max(rng_tac["width"], 1e-9)))
                 side_cand = "LONG" if pos_in <= 0.30 else ("SHORT" if pos_in >= 0.70 else None)
                 
                 if side_cand:
@@ -521,7 +507,7 @@ async def scanner_main_loop(app: Application, broadcast):
                     liq_arrow = "↓" if pos.side == "LONG" else "↑"
 
                     nxt = next_pct_target(pos, tick)
-                    nxt_txt = "N/A" if nxt is None else fmt(nxt)
+                    nxt_txt = "N/A" if nxt is None else f"{fmt(nxt['price'])} ({nxt['label']})"
                     
                     ord_total = len(pos.ordinary_targets)
                     remaining = min(pos.max_steps - pos.steps_filled, ord_total - (pos.steps_filled - 1))
@@ -540,7 +526,7 @@ async def scanner_main_loop(app: Application, broadcast):
                             f"TP: <code>{fmt(pos.tp_price)}</code> (+{CONFIG.TP_PCT*100:.2f}%)\n"
                             f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_txt})\n"
                             f"{brk_line}\n"
-                            f"След. усреднение по цене: <code>{nxt_txt}</code> (осталось усреднений: {remaining} из {ord_total})"
+                            f"След. усреднение: <code>{nxt_txt}</code> (осталось: {remaining} из {ord_total})"
                         )
                     await trade_executor.bmr_log_event({
                         "Event_ID": f"OPEN_{pos.signal_id}", "Signal_ID": pos.signal_id, "Leverage": pos.leverage,
@@ -549,7 +535,7 @@ async def scanner_main_loop(app: Application, broadcast):
                         "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
                         "Cum_Margin_USDT": cum_margin, "Entry_Price": px, "Avg_Price": pos.avg,
                         "TP_Pct": CONFIG.TP_PCT, "TP_Price": pos.tp_price, "Liq_Est_Price": liq,
-                        "Next_DCA_Price": nxt or "",
+                        "Next_DCA_Price": (nxt and nxt["price"]) or "", "Next_DCA_Label": (nxt and nxt["label"]) or "",
                         "Fee_Rate_Maker": CONFIG.FEE_MAKER, "Fee_Rate_Taker": CONFIG.FEE_TAKER,
                         "Fee_Est_USDT": fees_paid_est / CONFIG.LIQ_FEE_BUFFER, "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
                         "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
@@ -600,7 +586,7 @@ async def scanner_main_loop(app: Application, broadcast):
                             })
                     else:
                         nxt = next_pct_target(pos, tick)
-                        trigger = (nxt is not None) and ((pos.side=="LONG" and px <= nxt) or (pos.side=="SHORT" and px >= nxt))
+                        trigger = (nxt is not None) and ((pos.side=="LONG" and px <= nxt["price"]) or (pos.side=="SHORT" and px >= nxt["price"]))
                         if trigger and pos.steps_filled < pos.max_steps:
                             margin, _ = pos.add_step(px)
                             cum_margin = sum(pos.step_margins[:pos.steps_filled])
@@ -616,11 +602,13 @@ async def scanner_main_loop(app: Application, broadcast):
                             liq_arrow = "↓" if pos.side == "LONG" else "↑"
                             
                             nxt2 = next_pct_target(pos, tick)
-                            nxt2_txt = "N/A" if nxt2 is None else fmt(nxt2)
+                            nxt2_txt = "N/A" if nxt2 is None else f"{fmt(nxt2['price'])} ({nxt2['label']})"
                             
                             ord_total = len(pos.ordinary_targets)
                             remaining = min(pos.max_steps - pos.steps_filled, ord_total - (pos.steps_filled - 1))
                             remaining = max(0, remaining)
+                            
+                            curr_label = pos.ordinary_targets[pos.steps_filled-2]["label"] if pos.steps_filled >= 2 else ""
 
                             brk_up, brk_dn = break_levels(rng_strat)
                             brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
@@ -629,13 +617,13 @@ async def scanner_main_loop(app: Application, broadcast):
 
                             if broadcast:
                                 await broadcast(app,
-                                    f"➕ Усреднение #{pos.steps_filled-1}\n"
+                                    f"➕ Усреднение #{pos.steps_filled-1} [{curr_label}]\n"
                                     f"Цена: <code>{fmt(px)}</code>\n"
                                     f"Добор: <b>{margin:.2f} USDT</b> | Депозит (текущий): <b>{cum_margin:.2f} USDT</b>\n"
                                     f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
                                     f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_txt})\n"
                                     f"{brk_line}\n"
-                                    f"След. усреднение по цене: <code>{nxt2_txt}</code> (осталось: {remaining} из {ord_total})")
+                                    f"След. усреднение: <code>{nxt2_txt}</code> (осталось: {remaining} из {ord_total})")
                             await trade_executor.bmr_log_event({
                                 "Event_ID": f"ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
                                 "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -643,7 +631,7 @@ async def scanner_main_loop(app: Application, broadcast):
                                 "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
                                 "Cum_Margin_USDT": cum_margin, "Entry_Price": px, "Avg_Price": pos.avg,
                                 "TP_Price": pos.tp_price, "SL_Price": pos.sl_price or "",
-                                "Liq_Est_Price": liq, "Next_DCA_Price": nxt2 or "",
+                                "Liq_Est_Price": liq, "Next_DCA_Price": (nxt2 and nxt2["price"]) or "", "Next_DCA_Label": (nxt2 and nxt2["label"]) or "", "Triggered_Label": curr_label,
                                 "Fee_Rate_Maker": CONFIG.FEE_MAKER, "Fee_Rate_Taker": CONFIG.FEE_TAKER,
                                 "Fee_Est_USDT": fees_paid_est / CONFIG.LIQ_FEE_BUFFER, "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
                                 "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
