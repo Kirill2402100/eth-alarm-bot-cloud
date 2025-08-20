@@ -5,6 +5,7 @@ from telegram import Update, constants, BotCommand
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, PicklePersistence
 
 import scanner_bmr_dca as scanner_engine
+from scanner_bmr_dca import CONFIG
 import trade_executor
 
 # --- Конфигурация ---
@@ -29,6 +30,12 @@ def is_loop_running(app: Application) -> bool:
 
 async def post_init(app: Application):
     """Выполняется после запуска приложения."""
+    # ИЗМЕНЕНО: Сброс вебхука для предотвращения конфликтов
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        log.warning(f"delete_webhook failed: {e}")
+
     log.info("Бот запущен. Проверяем, нужно ли запускать основной цикл...")
     if app.bot_data.get('run_loop_on_startup', False):
         log.info("Обнаружен флаг 'run_loop_on_startup'. Запускаю основной цикл.")
@@ -43,6 +50,7 @@ async def post_init(app: Application):
         BotCommand("pause", "Приостановить поиск новых сигналов"),
         BotCommand("resume", "Возобновить поиск новых сигналов"),
         BotCommand("close", "Закрыть текущую позицию по рынку"),
+        BotCommand("open", "Открыть позицию: /open long|short [lev] [steps]"),
         BotCommand("setbank", "Установить общий банк позиции, USDT"),
         BotCommand("setbuf", "Установить буфер за границей (напр. 0.3 или 30%)"),
     ])
@@ -127,20 +135,71 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     log.info("Команда /resume: поиск новых сигналов возобновлен.")
     await update.message.reply_text("▶️ <b>Поиск новых сигналов возобновлён.</b>", parse_mode=constants.ParseMode.HTML)
 
-# ИСПРАВЛЕНО: Добавлена недостающая функция
 async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Ручное закрытие текущей позиции (по рынку в ближайшем тике сканера)."""
+    """Ручное закрытие текущей позиции."""
     if not is_loop_running(ctx.application):
         await update.message.reply_text("ℹ️ Сканер не запущен.")
         return
-
-    pos = ctx.bot_data.get("position")
-    if not pos:
+    if not ctx.bot_data.get("position"):
         await update.message.reply_text("ℹ️ Активной позиции нет.")
         return
-
     ctx.bot_data["force_close"] = True
     await update.message.reply_text("🧰 Запрошено закрытие позиции. Закрою в ближайшем цикле.")
+
+async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    app = context.application
+
+    # ИЗМЕНЕНО: Автозапуск сканера, если он остановлен
+    if not is_loop_running(app):
+        app.bot_data['bot_on'] = True
+        app.bot_data['run_loop_on_startup'] = True
+        app.bot_data['scan_paused'] = False
+        task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
+        setattr(app, "_main_loop_task", task)
+        await update.message.reply_text("🔌 Сканер был выключен — запускаю его…")
+
+    if app.bot_data.get("position"):
+        await update.message.reply_text("Уже есть открытая позиция. Сначала закройте её (/close).")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование: /open long|short [leverage] [steps]")
+        return
+
+    side = context.args[0].upper()
+    if side not in ("LONG", "SHORT"):
+        await update.message.reply_text("Укажите сторону: long или short")
+        return
+
+    lev = None
+    steps = None
+    if len(context.args) >= 2:
+        try:
+            lev = int(context.args[1])
+        except Exception:
+            lev = None
+    if len(context.args) >= 3:
+        try:
+            steps = int(context.args[2])
+        except Exception:
+            steps = None
+
+    if lev is not None:
+        lev = max(CONFIG.MIN_LEVERAGE, min(CONFIG.MAX_LEVERAGE, lev))
+    if steps is not None:
+        steps = max(1, min(CONFIG.DCA_LEVELS, steps))
+
+    app.bot_data["manual_open"] = {
+        "side": side,
+        "leverage": lev,
+        "max_steps": steps,
+    }
+
+    await update.message.reply_text(
+        f"Ок, открываю {side} по рынку текущей ценой. "
+        f"{'(левередж: '+str(lev)+') ' if lev else ''}"
+        f"{'(макс. шагов: '+str(steps)+')' if steps else ''}"
+    )
 
 async def cmd_setbank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
@@ -230,6 +289,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("setbank", cmd_setbank))
     app.add_handler(CommandHandler("setbuf", cmd_setbuf))
     app.add_handler(CommandHandler("close", cmd_close))
+    app.add_handler(CommandHandler("open", cmd_open))
 
     log.info(f"Bot {BOT_VERSION} starting...")
     app.run_polling()
