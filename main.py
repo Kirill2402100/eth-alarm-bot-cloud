@@ -129,11 +129,18 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ИСПРАВЛЕНО: Добавлена недостающая функция
 async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.bot_data.get("position"):
-        await update.message.reply_text("ℹ️ Нет активной позиции.")
+    """Ручное закрытие текущей позиции (по рынку в ближайшем тике сканера)."""
+    if not is_loop_running(ctx.application):
+        await update.message.reply_text("ℹ️ Сканер не запущен.")
         return
+
+    pos = ctx.bot_data.get("position")
+    if not pos:
+        await update.message.reply_text("ℹ️ Активной позиции нет.")
+        return
+
     ctx.bot_data["force_close"] = True
-    await update.message.reply_text("🧰 Закрываю позицию по рынку на ближайшем цикле…")
+    await update.message.reply_text("🧰 Запрошено закрытие позиции. Закрою в ближайшем цикле.")
 
 async def cmd_setbank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
