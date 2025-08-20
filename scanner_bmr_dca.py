@@ -66,6 +66,8 @@ class CONFIG:
         "growth_B": 2.2,
     }
 
+ORDINARY_STEPS = 5
+
 # ---------------------------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------------------------
@@ -143,6 +145,24 @@ def break_distance_pcts(px: float, up: float, dn: float) -> tuple[float, float]:
     dn_pct = max(0.0, (1.0 - dn / px) * 100.0)
     return up_pct, dn_pct
 
+def cap_next_price(side: str, avg: float, target_raw: float | None, atr5m: float, rng: dict) -> tuple[float | None, bool, bool]:
+    if target_raw is None or np.isnan(target_raw):
+        return None, False, False
+    brk_up, brk_dn = break_levels(rng)
+    buf = max(1e-9, 0.05 * max(atr5m, 1e-9))
+    if side == "SHORT":
+        cap_price = brk_up - buf
+        if cap_price <= avg * (1.0 + 1e-9):
+            return None, False, True
+        clipped = target_raw > cap_price
+        return (min(target_raw, cap_price), clipped, False)
+    else:
+        cap_price = brk_dn + buf
+        if cap_price >= avg * (1.0 - 1e-9):
+            return None, False, True
+        clipped = target_raw < cap_price
+        return (max(target_raw, cap_price), clipped, False)
+
 def sl_moved_enough(prev: float|None, new: float, side: str, tick: float, min_steps: int) -> bool:
     if prev is None:
         return True
@@ -176,7 +196,6 @@ def compute_pct_targets(entry: float, side: str, rng: dict, tick: float, pcts: l
             out.append(q)
     return out
 
-# ИЗМЕНЕНО: Корректное слияние и сортировка сеток
 def merge_targets_sorted(side: str, tick: float, targets: list[float]) -> list[float]:
     if side == "SHORT":
         targets = sorted([t for t in targets if t is not None])
@@ -372,7 +391,6 @@ async def scanner_main_loop(app: Application, broadcast):
             manage_only = app.bot_data.get("scan_paused", False)
             pos: Position | None = app.bot_data.get("position")
 
-            # ИЗМЕНЕНО: Оптимизированный вызов для построения коридоров
             need_build_strat = (rng_strat is None) or ((now - last_build_strat > CONFIG.REBUILD_RANGE_EVERY_MIN*60) and (pos is None))
             need_build_tac   = (rng_tac is None) or ((now - last_build_tac > CONFIG.REBUILD_TACTICAL_EVERY_MIN*60) and (pos is None))
             if need_build_strat or need_build_tac:
@@ -410,18 +428,36 @@ async def scanner_main_loop(app: Application, broadcast):
 
             px = float(df5["close"].iloc[-1])
 
+            # ИЗМЕНЕНО: Обновленное вступительное сообщение
             if (not app.bot_data.get("intro_done")) and (pos is None):
                 p30 = rng_strat["lower"] + 0.30 * rng_strat["width"]
                 p70 = rng_strat["lower"] + 0.70 * rng_strat["width"]
+
                 d_to_long  = max(0.0, px - p30)
                 d_to_short = max(0.0, p70 - px)
-                pct_to_long  = (d_to_long / max(px, 1e-9)) * 100
+                pct_to_long  = (d_to_long  / max(px, 1e-9)) * 100
                 pct_to_short = (d_to_short / max(px, 1e-9)) * 100
+
+                brk_up, brk_dn = break_levels(rng_strat)
+                width_ratio = (rng_tac["width"] / max(rng_strat["width"], 1e-9)) * 100.0
+
                 if broadcast:
-                    await broadcast(app, (f"🎯 Пороги входа: LONG ≤ <code>{fmt(p30)}</code> (30%), "
-                                   f"SHORT ≥ <code>{fmt(p70)}</code> (70%).\n"
-                                   f"Текущая: <code>{fmt(px)}</code>. "
-                                   f"До LONG: {fmt(d_to_long)} ({pct_to_long:.2f}%), до SHORT: {fmt(d_to_short)} ({pct_to_short:.2f}%)"))
+                    msg = (
+                        f"🎯 Пороги входа (стратегический): "
+                        f"LONG ≤ <code>{fmt(p30)}</code> (30%), "
+                        f"SHORT ≥ <code>{fmt(p70)}</code> (70%).\n"
+                        f"📏 Диапазоны:\n"
+                        f"• STRAT: [<code>{fmt(rng_strat['lower'])}</code> … <code>{fmt(rng_strat['upper'])}</code>] "
+                        f"w=<code>{fmt(rng_strat['width'])}</code>\n"
+                        f"• TAC (3d): [<code>{fmt(rng_tac['lower'])}</code> … <code>{fmt(rng_tac['upper'])}</code>] "
+                        f"w=<code>{fmt(rng_tac['width'])}</code> (≈{width_ratio:.0f}% от STRAT)\n"
+                        f"🔓 Пробой STRAT: ↑<code>{fmt(brk_up)}</code> | ↓<code>{fmt(brk_dn)}</code>\n"
+                        f"Текущая: <code>{fmt(px)}</code>. "
+                        f"До LONG: {fmt(d_to_long)} ({pct_to_long:.2f}%), "
+                        f"до SHORT: {fmt(d_to_short)} ({pct_to_short:.2f}%).\n"
+                        f"ℹ️ Усреднения: 2 внутри TAC (40/80%), 3 по STRAT (10/45/90%) + резерв после пробоя."
+                    )
+                    await broadcast(app, msg)
                 app.bot_data["intro_done"] = True
 
             pos = app.bot_data.get("position")
@@ -467,9 +503,6 @@ async def scanner_main_loop(app: Application, broadcast):
                     pos = Position(side_cand, signal_id=f"{symbol.split('/')[0]}_{int(now)}")
                     growth = choose_growth(ind, rng_strat, rng_tac)
                     pos.plan_margins(bank, growth)
-                    log.info(f"[BUDGET] steps={len(pos.step_margins)}, sum={sum(pos.step_margins):.2f}, "
-                             f"first6={sum(pos.step_margins[:6]):.2f}, last(reserve)={pos.step_margins[6]:.2f}")
-
                     pos.max_steps = min(6, CONFIG.DCA_LEVELS)
                     pos.ordinary_targets = compute_mixed_targets(entry=px, side=pos.side, rng_strat=rng_strat, rng_tac=rng_tac, tick=tick)
                     pos.reserved_one = False
