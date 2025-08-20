@@ -66,31 +66,9 @@ class CONFIG:
         "growth_B": 2.2,
     }
 
-ORDINARY_STEPS = 5
-
 # ---------------------------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------------------------
-# ДОБАВЛЕНО: Безопасный логгер
-SAFE_LOG_KEYS = {
-    "Event_ID","Signal_ID","Leverage","Timestamp_UTC","Pair","Side","Event",
-    "Step_No","Step_Margin_USDT","Cum_Margin_USDT","Entry_Price","Avg_Price",
-    "TP_Pct","TP_Price","SL_Price","Liq_Est_Price","Next_DCA_Price",
-    "Fee_Rate_Maker","Fee_Rate_Taker","Fee_Est_USDT",
-    "ATR_5m","ATR_1h","RSI_5m","ADX_5m","Supertrend","Vol_z",
-    "Range_Lower","Range_Upper","Range_Width",
-    "PNL_Realized_USDT","PNL_Realized_Pct","Time_In_Trade_min","Trail_Stage",
-    "Next_DCA_Label", "Triggered_Label" # Добавляем новые поля в безопасный список
-}
-
-async def log_event_safely(payload: dict):
-    data = {k: v for k, v in payload.items() if k in SAFE_LOG_KEYS}
-    try:
-        await trade_executor.bmr_log_event(data)
-        await trade_executor.flush_log_buffers()
-    except Exception:
-        log.exception("[SHEETS] log_event_safely failed")
-
 def fmt(p: float) -> str:
     if p is None or pd.isna(p): return "N/A"
     if p < 0.01: return f"{p:.6f}"
@@ -194,6 +172,7 @@ def quantize_to_tick(x: float | None, tick: float) -> float | None:
         return x
     return round(round(x / tick) * tick, 10)
 
+# ИСПРАВЛЕНО: Возвращена недостающая функция
 def compute_pct_targets(entry: float, side: str, rng: dict, tick: float, pcts: list[float]) -> list[float]:
     if side == "SHORT":
         cap = rng["upper"]
@@ -224,6 +203,7 @@ def compute_pct_targets_labeled(entry, side, rng, tick, pcts, label):
         out.append({"price": pr, "label": f"{label} {pct}%"})
     return out
 
+# ИЗМЕНЕНО: Корректное слияние и сортировка сеток
 def merge_targets_sorted(side: str, tick: float, targets: list[dict]) -> list[dict]:
     if side == "SHORT":
         targets = sorted(targets, key=lambda t: t["price"])
@@ -471,7 +451,7 @@ async def scanner_main_loop(app: Application, broadcast):
                         f"🎯 Пороги входа (<b>TAC 30/70</b>): LONG ≤ <code>{fmt(p30_t)}</code>, SHORT ≥ <code>{fmt(p70_t)}</code>\n"
                         f"📏 Диапазоны:\n"
                         f"• STRAT: [{fmt(rng_strat['lower'])} … {fmt(rng_strat['upper'])}] w={fmt(rng_strat['width'])}\n"
-                        f"• TAC (3d): [{fmt(rng_tac['lower'])} … {fmt(rng_tac['upper'])}] w={fmt(rng_tac['width'])}\n"
+                        f"• TAC (3d): [{fmt(rng_tac['lower'])} … {fmt(rng_tac['upper'])}] w={fmt(rng_tac['width'])} (≈{width_ratio:.0f}% от STRAT)\n"
                         f"🔓 Пробой STRAT: ↑{fmt(brk_up)} | ↓{fmt(brk_dn)}\n"
                         f"Текущая: {fmt(px)}. До LONG: {fmt(d_to_long)} ({pct_to_long:.2f}%), "
                         f"до SHORT: {fmt(d_to_short)} ({pct_to_short:.2f}%)."
