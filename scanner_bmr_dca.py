@@ -66,6 +66,7 @@ class CONFIG:
         "growth_B": 2.2,
     }
 
+# ДОБАВЛЕНО: Константа для сообщений
 ORDINARY_STEPS = 5
 
 # ---------------------------------------------------------------------------
@@ -428,19 +429,15 @@ async def scanner_main_loop(app: Application, broadcast):
 
             px = float(df5["close"].iloc[-1])
 
-            # ИЗМЕНЕНО: Обновленное вступительное сообщение
             if (not app.bot_data.get("intro_done")) and (pos is None):
                 p30 = rng_strat["lower"] + 0.30 * rng_strat["width"]
                 p70 = rng_strat["lower"] + 0.70 * rng_strat["width"]
-
                 d_to_long  = max(0.0, px - p30)
                 d_to_short = max(0.0, p70 - px)
-                pct_to_long  = (d_to_long  / max(px, 1e-9)) * 100
+                pct_to_long  = (d_to_long / max(px, 1e-9)) * 100
                 pct_to_short = (d_to_short / max(px, 1e-9)) * 100
-
                 brk_up, brk_dn = break_levels(rng_strat)
                 width_ratio = (rng_tac["width"] / max(rng_strat["width"], 1e-9)) * 100.0
-
                 if broadcast:
                     msg = (
                         f"🎯 Пороги входа (стратегический): "
