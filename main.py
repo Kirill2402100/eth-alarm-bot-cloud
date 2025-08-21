@@ -30,7 +30,6 @@ def is_loop_running(app: Application) -> bool:
 
 async def post_init(app: Application):
     """Выполняется после запуска приложения."""
-    # ИЗМЕНЕНО: Сброс вебхука для предотвращения конфликтов
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
@@ -53,6 +52,8 @@ async def post_init(app: Application):
         BotCommand("open", "Открыть позицию: /open long|short [lev] [steps]"),
         BotCommand("setbank", "Установить общий банк позиции, USDT"),
         BotCommand("setbuf", "Установить буфер за границей (напр. 0.3 или 30%)"),
+        BotCommand("setfees", "Установить комиссии, %: /setfees [maker] [taker]"),
+        BotCommand("fees", "Показать текущие комиссии"),
     ])
 
 async def broadcast(app: Application, txt: str):
@@ -96,6 +97,7 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     setattr(app, "_main_loop_task", task)
     await update.message.reply_text("🚀 <b>Запускаю сканер...</b>", parse_mode=constants.ParseMode.HTML)
 
+# ИСПРАВЛЕНО: Более аккуратная остановка цикла
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /stop."""
     app = ctx.application
@@ -106,15 +108,14 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     app.bot_data['bot_on'] = False
     task = getattr(app, "_main_loop_task", None)
     if task:
-        task.cancel()
         try:
             await task
         except asyncio.CancelledError:
-            log.info("Основной цикл успешно остановлен.")
+            pass
         setattr(app, "_main_loop_task", None)
-        
+
     app.bot_data['run_loop_on_startup'] = False
-    log.info("Команда /stop: останавливаем основной цикл.")
+    log.info("Команда /stop: основной цикл остановлен.")
     await update.message.reply_text("🛑 <b>Сканер остановлен.</b>", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -149,7 +150,6 @@ async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     app = context.application
 
-    # ИЗМЕНЕНО: Автозапуск сканера, если он остановлен
     if not is_loop_running(app):
         app.bot_data['bot_on'] = True
         app.bot_data['run_loop_on_startup'] = True
@@ -174,26 +174,18 @@ async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lev = None
     steps = None
     if len(context.args) >= 2:
-        try:
-            lev = int(context.args[1])
-        except Exception:
-            lev = None
+        try: lev = int(context.args[1])
+        except Exception: lev = None
     if len(context.args) >= 3:
-        try:
-            steps = int(context.args[2])
-        except Exception:
-            steps = None
+        try: steps = int(context.args[2])
+        except Exception: steps = None
 
     if lev is not None:
         lev = max(CONFIG.MIN_LEVERAGE, min(CONFIG.MAX_LEVERAGE, lev))
     if steps is not None:
         steps = max(1, min(CONFIG.DCA_LEVELS, steps))
 
-    app.bot_data["manual_open"] = {
-        "side": side,
-        "leverage": lev,
-        "max_steps": steps,
-    }
+    app.bot_data["manual_open"] = {"side": side, "leverage": lev, "max_steps": steps}
 
     await update.message.reply_text(
         f"Ок, открываю {side} по рынку текущей ценой. "
@@ -221,8 +213,43 @@ async def cmd_setbuf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except (IndexError, ValueError):
         await update.message.reply_text("Использование: /setbuf 0.30 (или 30%)")
 
+# ИСПРАВЛЕНО: Корректный парсер для комиссий
+def _parse_fee_arg(x: str) -> float:
+    s = x.strip()
+    had_pct = s.endswith('%')
+    if had_pct:
+        s = s[:-1]
+    v = float(s)
+    if had_pct:
+        return v / 100.0
+    return v if v < 0.01 else v / 100.0
+
+async def cmd_setfees(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        if len(ctx.args) == 1:
+            f = _parse_fee_arg(ctx.args[0])
+            if not (0 <= f < 0.01): raise ValueError
+            ctx.bot_data["fee_maker"] = f
+            ctx.bot_data["fee_taker"] = f
+            await update.message.reply_text(f"✅ Комиссии установлены: maker={f*100:.4f}% taker={f*100:.4f}%")
+        elif len(ctx.args) >= 2:
+            fm = _parse_fee_arg(ctx.args[0])
+            ft = _parse_fee_arg(ctx.args[1])
+            if not (0 <= fm < 0.01 and 0 <= ft < 0.01): raise ValueError
+            ctx.bot_data["fee_maker"] = fm
+            ctx.bot_data["fee_taker"] = ft
+            await update.message.reply_text(f"✅ Комиссии установлены: maker={fm*100:.4f}% taker={ft*100:.4f}%")
+        else:
+            await update.message.reply_text("Использование: /setfees 0.02 или /setfees 0.02 0.02 (в %, либо 0.0002 0.0002)")
+    except Exception:
+        await update.message.reply_text("⚠️ Неверные значения. Пример: /setfees 0.02 0.02 (это 0.02% на сторону)")
+
+async def cmd_fees(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    fm = float(ctx.bot_data.get("fee_maker", getattr(CONFIG, "FEE_MAKER", 0.0002)))
+    ft = float(ctx.bot_data.get("fee_taker", getattr(CONFIG, "FEE_TAKER", 0.0002)))
+    await update.message.reply_text(f"Текущие комиссии: maker={fm*100:.4f}%  taker={ft*100:.4f}% (round-trip ≈ {(fm+ft)*100:.4f}%)")
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Показывает текущий статус бота и параметры стратегии."""
     bot_data = ctx.bot_data
     is_running = is_loop_running(ctx.application)
     is_paused = bot_data.get("scan_paused", False)
@@ -240,12 +267,14 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sl_show = f"{pos.sl_price:.6f}" if pos.sl_price is not None else "N/A"
         tp_show = f"{pos.tp_price:.6f}" if getattr(pos, "tp_price", None) else "N/A"
         avg_show = f"{pos.avg:.6f}" if getattr(pos, "avg", None) else "N/A"
-
-        max_steps = getattr(pos, "max_steps", (len(getattr(pos, "step_margins", [])) or scanner_engine.CONFIG.DCA_LEVELS))
-        lev_show = getattr(pos, "leverage", getattr(scanner_engine.CONFIG, "LEVERAGE", "N/A"))
+        max_steps = getattr(pos, "max_steps", (len(getattr(pos, "step_margins", [])) or cfg.DCA_LEVELS))
+        lev_show = getattr(pos, "leverage", getattr(cfg, "LEVERAGE", "N/A"))
         
+        # ИСПРАВЛЕНО: Корректный расчет оставшихся шагов
+        remaining_total = max(0, getattr(pos, "max_steps", 0) - getattr(pos, "steps_filled", 0))
         reserved = getattr(pos, "reserved_one", False)
-        remaining = max(0, getattr(pos, "max_steps", 0) - getattr(pos, "steps_filled", 0))
+        reserved_left = 1 if (reserved and remaining_total > 0) else 0
+        ordinary_left = max(0, remaining_total - reserved_left)
         
         position_status = (
             f"• <b>Сигнал ID:</b> {pos.signal_id}\n"
@@ -255,21 +284,24 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"• <b>Средняя цена:</b> <code>{avg_show}</code>\n"
             f"• <b>TP/SL:</b> <code>{tp_show}</code> / <code>{sl_show}</code>\n"
             f"• <b>Резерв активирован:</b> {'Да' if reserved else 'Нет'}\n"
-            f"• <b>Осталось (обычных | резерв):</b> {remaining if not reserved else 0} | {1 if reserved and remaining > 0 else (1 if not reserved else 0)}"
+            f"• <b>Осталось (обычных | резерв):</b> {ordinary_left} | {reserved_left}"
         )
     
     bank = bot_data.get("safety_bank_usdt", getattr(cfg, "SAFETY_BANK_USDT", DEFAULT_BANK_USDT))
     buf  = bot_data.get("buffer_over_edge", getattr(cfg, "BUFFER_OVER_EDGE", DEFAULT_BUFFER_OVER_EDGE))
-    step = bot_data.get("base_step_margin", getattr(cfg, "BASE_STEP_MARGIN", 10.0))
+    fm = bot_data.get("fee_maker", getattr(cfg, "FEE_MAKER", 0.0002))
+    ft = bot_data.get("fee_taker", getattr(cfg, "FEE_TAKER", 0.0002))
     
+    dca_info = f"• DCA: max_steps={CONFIG.DCA_LEVELS} (резерв {'вкл' if active_position and getattr(active_position, 'reserved_one', False) else 'выкл'})\n"
+
     msg = (
         f"<b>Состояние бота {BOT_VERSION}</b>\n\n"
         f"<b>Статус сканера:</b> {scanner_status}\n\n"
         f"<b><u>Риск/банк:</u></b>\n"
         f"• Банк позиции: <b>{bank:.2f} USDT</b>\n"
         f"• Буфер за границей: <b>{buf:.2%}</b> (неактивно в MARGIN-режиме)\n"
-        f"• Депозит на шаг: <b>{step:.2f} USDT</b> (неактивно при bank-first)\n"
-        f"• DCA: 4 внутр. + 1 резерв\n\n"
+        f"• Комиссии: maker <b>{fm*100:.4f}%</b> / taker <b>{ft*100:.4f}%</b> (RT≈ {(fm+ft)*100:.4f}%)\n"
+        f"{dca_info}\n"
         f"<b><u>Активная позиция:</u></b>\n{position_status}"
     )
 
@@ -277,7 +309,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 if __name__ == "__main__":
-    persistence = PicklePersistence(filepath="bot_persistence")
+    persistence = PicklePersistence(filepath="bot_persistence", store_bot_data=True)
     app = ApplicationBuilder().token(BOT_TOKEN).persistence(persistence).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -290,6 +322,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("setbuf", cmd_setbuf))
     app.add_handler(CommandHandler("close", cmd_close))
     app.add_handler(CommandHandler("open", cmd_open))
+    app.add_handler(CommandHandler("setfees", cmd_setfees))
+    app.add_handler(CommandHandler("fees", cmd_fees))
 
     log.info(f"Bot {BOT_VERSION} starting...")
     app.run_polling()
