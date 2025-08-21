@@ -24,12 +24,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # --- Утилиты ---
 def is_loop_running(app: Application) -> bool:
-    """Проверяет, запущен ли основной цикл сканера."""
     task = getattr(app, "_main_loop_task", None)
     return task is not None and not task.done()
 
 async def post_init(app: Application):
-    """Выполняется после запуска приложения."""
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
@@ -57,7 +55,6 @@ async def post_init(app: Application):
     ])
 
 async def broadcast(app: Application, txt: str):
-    """Отправляет сообщение всем подписанным пользователям с очисткой заблокировавших."""
     chat_ids = set(app.bot_data.get('chat_ids', set()))
     for cid in list(chat_ids):
         try:
@@ -70,7 +67,6 @@ async def broadcast(app: Application, txt: str):
     app.bot_data['chat_ids'] = chat_ids
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start."""
     chat_id = update.effective_chat.id
     bd = ctx.bot_data
     bd.setdefault('chat_ids', set()).add(chat_id)
@@ -83,7 +79,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /run."""
     app = ctx.application
     if is_loop_running(app):
         await update.message.reply_text("ℹ️ Сканер уже запущен. Для остановки используйте /stop.")
@@ -97,9 +92,7 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     setattr(app, "_main_loop_task", task)
     await update.message.reply_text("🚀 <b>Запускаю сканер...</b>", parse_mode=constants.ParseMode.HTML)
 
-# ИСПРАВЛЕНО: Более аккуратная остановка цикла
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /stop."""
     app = ctx.application
     if not is_loop_running(app):
         await update.message.reply_text("ℹ️ Сканер уже остановлен.")
@@ -119,7 +112,6 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🛑 <b>Сканер остановлен.</b>", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Приостанавливает поиск новых сигналов."""
     if not is_loop_running(ctx.application):
         await update.message.reply_text("ℹ️ Сканер не запущен, нечего ставить на паузу.")
         return
@@ -128,7 +120,6 @@ async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏸️ <b>Поиск новых сигналов приостановлен.</b>\nСопровождение открытых сделок продолжается. Для возобновления используйте /resume.", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Возобновляет поиск новых сигналов."""
     if not is_loop_running(ctx.application):
         await update.message.reply_text("ℹ️ Сканер не запущен.")
         return
@@ -137,7 +128,6 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("▶️ <b>Поиск новых сигналов возобновлён.</b>", parse_mode=constants.ParseMode.HTML)
 
 async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Ручное закрытие текущей позиции."""
     if not is_loop_running(ctx.application):
         await update.message.reply_text("ℹ️ Сканер не запущен.")
         return
@@ -213,7 +203,6 @@ async def cmd_setbuf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except (IndexError, ValueError):
         await update.message.reply_text("Использование: /setbuf 0.30 (или 30%)")
 
-# ИСПРАВЛЕНО: Корректный парсер для комиссий
 def _parse_fee_arg(x: str) -> float:
     s = x.strip()
     had_pct = s.endswith('%')
@@ -270,7 +259,6 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         max_steps = getattr(pos, "max_steps", (len(getattr(pos, "step_margins", [])) or cfg.DCA_LEVELS))
         lev_show = getattr(pos, "leverage", getattr(cfg, "LEVERAGE", "N/A"))
         
-        # ИСПРАВЛЕНО: Корректный расчет оставшихся шагов
         remaining_total = max(0, getattr(pos, "max_steps", 0) - getattr(pos, "steps_filled", 0))
         reserved = getattr(pos, "reserved_one", False)
         reserved_left = 1 if (reserved and remaining_total > 0) else 0
@@ -309,7 +297,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 if __name__ == "__main__":
-    persistence = PicklePersistence(filepath="bot_persistence", store_bot_data=True)
+    # ИСПРАВЛЕНО: Убран лишний аргумент для совместимости с PTB v20+
+    persistence = PicklePersistence(filepath="bot_persistence")
     app = ApplicationBuilder().token(BOT_TOKEN).persistence(persistence).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
