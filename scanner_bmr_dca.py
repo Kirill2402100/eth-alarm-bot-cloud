@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio, time, logging, json, os, inspect, numbers
+# ИСПРАВЛЕНО: Возвращены недостающие импорты
 from datetime import datetime, timezone
 
 import numpy as np
@@ -28,8 +29,9 @@ class CONFIG:
     DCA_LEVELS = 7
     DCA_GROWTH = 2.0
     LEVERAGE = 50
-    FEE_MAKER = 0.0005
-    FEE_TAKER = 0.0005
+    # ИЗМЕНЕНО: Комиссии по умолчанию
+    FEE_MAKER = 0.0002
+    FEE_TAKER = 0.0002
     Q_LOWER = 0.025
     Q_UPPER = 0.975
     RANGE_MIN_ATR_MULT = 1.5
@@ -256,6 +258,19 @@ def choose_growth(ind: dict, rng_strat: dict, rng_tac: dict) -> float:
     low_vol = abs(ind.get("vol_z", 0.0)) <= CONFIG.AUTO_ALLOC["low_vol_z"]
     return CONFIG.AUTO_ALLOC["growth_A"] if (thin and low_vol) else CONFIG.AUTO_ALLOC["growth_B"]
 
+# ДОБАВЛЕНО: Хелпер для расчета чистого PnL
+def compute_net_pnl(pos, exit_p: float, fee_entry: float, fee_exit: float) -> tuple[float, float]:
+    sum_margin = sum(pos.step_margins[:pos.steps_filled]) or 1e-9
+    raw_pnl = (exit_p / pos.avg - 1.0) * (1 if pos.side == "LONG" else -1)
+    gross_usd = sum_margin * (raw_pnl * pos.leverage)
+    entry_notional = sum_margin * pos.leverage
+    exit_notional  = exit_p * pos.qty
+    fee_entry_usd = entry_notional * fee_entry
+    fee_exit_usd  = exit_notional  * fee_exit
+    net_usd = gross_usd - fee_entry_usd - fee_exit_usd
+    net_pct = (net_usd / sum_margin) * 100.0
+    return net_usd, net_pct
+
 # ---------------------------------------------------------------------------
 # Core Logic Functions
 # ---------------------------------------------------------------------------
@@ -283,7 +298,6 @@ async def build_ranges(exchange, symbol: str):
     tac   = await build_range_for_days(exchange, symbol, CONFIG.TACTICAL_LOOKBACK_DAYS)
     return strat, tac
 
-# ИЗМЕНЕНО: Более надежный расчет Supertrend
 def compute_indicators_5m(df: pd.DataFrame) -> dict:
     atr5m = ta.atr(df["high"], df["low"], df["close"], length=14).iloc[-1]
     rsi = ta.rsi(df["close"], length=CONFIG.RSI_LEN).iloc[-1]
@@ -297,7 +311,6 @@ def compute_indicators_5m(df: pd.DataFrame) -> dict:
     ema20 = ta.ema(df["close"], length=20).iloc[-1]
     vol_z = (df["volume"].iloc[-1] - df["volume"].rolling(CONFIG.VOL_WIN).mean().iloc[-1]) / \
             max(df["volume"].rolling(CONFIG.VOL_WIN).std().iloc[-1], 1e-9)
-    
     st = ta.supertrend(df["high"], df["low"], df["close"], length=10, multiplier=3.0)
     d_col = next((c for c in st.columns if c.startswith("SUPERTd_")), None)
     if d_col is None:
@@ -420,6 +433,8 @@ async def scanner_main_loop(app: Application, broadcast):
     while app.bot_data.get("bot_on", False):
         try:
             bank = float(app.bot_data.get("safety_bank_usdt", CONFIG.SAFETY_BANK_USDT))
+            fee_maker = float(app.bot_data.get("fee_maker", CONFIG.FEE_MAKER))
+            fee_taker = float(app.bot_data.get("fee_taker", CONFIG.FEE_TAKER))
             
             now = time.time()
             manage_only = app.bot_data.get("scan_paused", False)
@@ -489,20 +504,18 @@ async def scanner_main_loop(app: Application, broadcast):
             if pos and app.bot_data.get("force_close"):
                 exit_p = px
                 time_min = (time.time()-pos.open_ts)/60.0
-                raw_pnl = (exit_p / pos.avg - 1.0) * (1 if pos.side == "LONG" else -1)
-                pnl_pct = raw_pnl * 100 * pos.leverage
-                pnl_usd = sum(pos.step_margins[:pos.steps_filled]) * (pnl_pct/100.0)
+                net_usd, net_pct = compute_net_pnl(pos, exit_p, fee_taker, fee_maker)
 
                 if broadcast:
                     await broadcast(app, f"🧰 <b>MANUAL_CLOSE</b>\n"
                                           f"Цена выхода: <code>{fmt(exit_p)}</code>\n"
-                                          f"P&L≈ {pnl_usd:+.2f} USDT ({pnl_pct:+.2f}%)\n"
+                                          f"P&L (net)≈ {net_usd:+.2f} USDT ({net_pct:+.2f}%)\n"
                                           f"Время в сделке: {time_min:.1f} мин")
                 await log_event_safely({
                     "Event_ID": f"MANUAL_CLOSE_{pos.signal_id}", "Signal_ID": pos.signal_id,
                     "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                     "Pair": symbol, "Side": pos.side, "Event": "MANUAL_CLOSE",
-                    "PNL_Realized_USDT": pnl_usd, "PNL_Realized_Pct": pnl_pct,
+                    "PNL_Realized_USDT": net_usd, "PNL_Realized_Pct": net_pct,
                     "Time_In_Trade_min": time_min
                 })
                 app.bot_data["force_close"] = False
@@ -519,9 +532,7 @@ async def scanner_main_loop(app: Application, broadcast):
                         if broadcast:
                             await broadcast(app, "📌 Пробой коридора — обычные усреднения заморожены. Оставлен 1 резерв на ретест.")
 
-            # ИСПРАВЛЕНО: Логика ручного входа
-            manual = app.bot_data.get("manual_open")
-            if not pos and (manual is not None or not manage_only):
+            if not pos and (app.bot_data.get("manual_open") is not None or not manage_only):
                 manual = app.bot_data.pop("manual_open", None)
                 if manual:
                     side_cand = manual.get("side")
@@ -553,7 +564,7 @@ async def scanner_main_loop(app: Application, broadcast):
                     
                     cum_margin = sum(pos.step_margins[:pos.steps_filled])
                     cum_notional = cum_margin * pos.leverage
-                    fees_paid_est = cum_notional * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
+                    fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
                     liq = approx_liq_price_cross(
                         avg=pos.avg, side=pos.side, qty=pos.qty,
                         equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
@@ -570,6 +581,9 @@ async def scanner_main_loop(app: Application, broadcast):
                     remaining = min(pos.max_steps - pos.steps_filled, ord_total - (pos.steps_filled - 1))
                     remaining = max(0, remaining)
                     
+                    nxt_margin = pos.step_margins[pos.steps_filled] if pos.steps_filled < pos.max_steps else None
+                    nxt_dep_txt = f"{nxt_margin:.2f} USDT" if nxt_margin is not None else "N/A"
+
                     brk_up, brk_dn = break_levels(rng_strat)
                     brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
                     brk_line = (f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
@@ -584,7 +598,7 @@ async def scanner_main_loop(app: Application, broadcast):
                             f"TP: <code>{fmt(pos.tp_price)}</code> (+{CONFIG.TP_PCT*100:.2f}%)\n"
                             f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_txt})\n"
                             f"{brk_line}\n"
-                            f"След. усреднение: <code>{nxt_txt}</code> (осталось: {remaining} из {ord_total})"
+                            f"След. усреднение: <code>{nxt_txt}</code> | Плановый добор: <b>{nxt_dep_txt}</b> (осталось: {remaining} из {ord_total})"
                         )
                     await log_event_safely({
                         "Event_ID": f"OPEN_{pos.signal_id}", "Signal_ID": pos.signal_id, "Leverage": pos.leverage,
@@ -595,7 +609,7 @@ async def scanner_main_loop(app: Application, broadcast):
                         "TP_Pct": CONFIG.TP_PCT, "TP_Price": pos.tp_price, "Liq_Est_Price": liq,
                         "Next_DCA_Price": (nxt and nxt["price"]) or "", "Next_DCA_Label": (nxt and nxt["label"]) or "",
                         "Triggered_Label": ("MANUAL" if manual else ""),
-                        "Fee_Rate_Maker": CONFIG.FEE_MAKER, "Fee_Rate_Taker": CONFIG.FEE_TAKER,
+                        "Fee_Rate_Maker": fee_maker, "Fee_Rate_Taker": fee_taker,
                         "Fee_Est_USDT": fees_paid_est / CONFIG.LIQ_FEE_BUFFER, "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
                         "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
                         "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"]
@@ -613,7 +627,7 @@ async def scanner_main_loop(app: Application, broadcast):
                             pos.max_steps = pos.steps_filled
                             cum_margin = sum(pos.step_margins[:pos.steps_filled])
                             cum_notional = cum_margin * pos.leverage
-                            fees_paid_est = cum_notional * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
+                            fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
                             liq = approx_liq_price_cross(
                                 avg=pos.avg, side=pos.side, qty=pos.qty,
                                 equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
@@ -650,7 +664,7 @@ async def scanner_main_loop(app: Application, broadcast):
                             margin, _ = pos.add_step(px)
                             cum_margin = sum(pos.step_margins[:pos.steps_filled])
                             cum_notional = cum_margin * pos.leverage
-                            fees_paid_est = cum_notional * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
+                            fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
                             liq = approx_liq_price_cross(
                                 avg=pos.avg, side=pos.side, qty=pos.qty,
                                 equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
@@ -668,6 +682,9 @@ async def scanner_main_loop(app: Application, broadcast):
                             remaining = max(0, remaining)
                             
                             curr_label = pos.ordinary_targets[pos.steps_filled-2]["label"] if pos.steps_filled >= 2 else ""
+                            
+                            nxt2_margin = pos.step_margins[pos.steps_filled] if pos.steps_filled < pos.max_steps else None
+                            nxt2_dep_txt = "N/A" if nxt2_margin is None else f"{nxt2_margin:.2f} USDT"
 
                             brk_up, brk_dn = break_levels(rng_strat)
                             brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
@@ -682,7 +699,7 @@ async def scanner_main_loop(app: Application, broadcast):
                                     f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
                                     f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_txt})\n"
                                     f"{brk_line}\n"
-                                    f"След. усреднение: <code>{nxt2_txt}</code> (осталось: {remaining} из {ord_total})")
+                                    f"След. усреднение: <code>{nxt2_txt}</code> | Плановый добор: <b>{nxt2_dep_txt}</b> (осталось: {remaining} из {ord_total})")
                             await log_event_safely({
                                 "Event_ID": f"ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
                                 "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -691,7 +708,7 @@ async def scanner_main_loop(app: Application, broadcast):
                                 "Cum_Margin_USDT": cum_margin, "Entry_Price": px, "Avg_Price": pos.avg,
                                 "TP_Price": pos.tp_price, "SL_Price": pos.sl_price or "",
                                 "Liq_Est_Price": liq, "Next_DCA_Price": (nxt2 and nxt2["price"]) or "", "Next_DCA_Label": (nxt2 and nxt2["label"]) or "", "Triggered_Label": curr_label,
-                                "Fee_Rate_Maker": CONFIG.FEE_MAKER, "Fee_Rate_Taker": CONFIG.FEE_TAKER,
+                                "Fee_Rate_Maker": fee_maker, "Fee_Rate_Taker": fee_taker,
                                 "Fee_Est_USDT": fees_paid_est / CONFIG.LIQ_FEE_BUFFER, "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
                                 "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
                                 "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"]
@@ -738,21 +755,19 @@ async def scanner_main_loop(app: Application, broadcast):
                     reason = "TP_HIT" if tp_hit else "SL_HIT"
                     exit_p = pos.tp_price if tp_hit else pos.sl_price
                     time_min = (time.time()-pos.open_ts)/60.0
-                    raw_pnl = (exit_p / pos.avg - 1.0) * (1 if pos.side == "LONG" else -1)
-                    pnl_pct = raw_pnl * 100 * pos.leverage
-                    pnl_usd = sum(pos.step_margins[:pos.steps_filled]) * (pnl_pct/100.0)
+                    net_usd, net_pct = compute_net_pnl(pos, exit_p, fee_taker, fee_maker)
                     atr_now = ind["atr5m"]
                     if broadcast:
-                        await broadcast(app, f"{'✅' if pnl_usd > 0 else '❌'} <b>{reason}</b>\n"
+                        await broadcast(app, f"{'✅' if net_usd > 0 else '❌'} <b>{reason}</b>\n"
                                       f"Цена выхода: <code>{fmt(exit_p)}</code>\n"
-                                      f"P&L≈ {pnl_usd:+.2f} USDT ({pnl_pct:+.2f}%)\n"
+                                      f"P&L (net)≈ {net_usd:+.2f} USDT ({net_pct:+.2f}%)\n"
                                       f"ATR(5m): {atr_now:.6f}\n"
                                       f"Время в сделке: {time_min:.1f} мин")
                     await log_event_safely({
                         "Event_ID": f"{reason}_{pos.signal_id}", "Signal_ID": pos.signal_id,
                         "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                         "Pair": symbol, "Side": pos.side, "Event": reason,
-                        "PNL_Realized_USDT": pnl_usd, "PNL_Realized_Pct": pnl_pct,
+                        "PNL_Realized_USDT": net_usd, "PNL_Realized_Pct": net_pct,
                         "Time_In_Trade_min": time_min,
                         "ATR_5m": atr_now
                     })
